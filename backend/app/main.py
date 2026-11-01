@@ -1,0 +1,43 @@
+"""FastAPI application factory.
+
+Run with:  uvicorn app.main:create_app --factory
+`--factory` tells uvicorn to call create_app() itself, so importing this module has no side
+effects (handy for tests, which build their own app with test settings).
+"""
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app.api import health
+from app.config import Settings, get_settings
+from app.db.session import create_db_engine
+from app.observability.logging import RequestContextMiddleware, configure_logging
+from app.queue.broker import create_broker_client
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or get_settings()
+    configure_logging(settings.log_level)
+
+    # "lifespan" runs once at startup (before `yield`) and once at shutdown (after it),
+    # like setting things up before app.listen() in Express and closing them on SIGTERM.
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.db_engine = create_db_engine(settings)
+        app.state.broker_client = create_broker_client(settings)
+        app.state.check_executor = health.create_check_executor()
+        try:
+            yield
+        finally:
+            # Don't let shutdown/reload wait on a slow health check.
+            app.state.check_executor.shutdown(wait=False, cancel_futures=True)
+            app.state.broker_client.close()
+            app.state.db_engine.dispose()
+
+    app = FastAPI(title="Tasklane", version="0.1.0", lifespan=lifespan)
+    app.state.settings = settings
+    app.add_middleware(RequestContextMiddleware)
+    app.include_router(health.router)
+    return app

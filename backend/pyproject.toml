@@ -1,0 +1,38 @@
+[project]
+name = "tasklane-backend"
+version = "0.1.0"
+description = "Tasklane API and workers"
+requires-python = ">=3.13,<3.14"
+# Ranges keep us on the approved release lines; uv.lock holds the exact versions.
+dependencies = [
+    "fastapi>=0.162.0,<0.163",            # pre-1.0: minor releases may break, so stay on one
+    "uvicorn[standard]>=0.54.0,<0.55",    # [standard] adds watchfiles (used by --reload)
+    "pydantic>=2.12.5,<2.13",
+    "pydantic-settings>=2.16.2,<3",
+    "sqlalchemy>=2.0.55,<2.1",
+    "psycopg[binary]>=3.3.6,<3.4",
+    # Kept on 5.2.x because Celery 5.5 (Phase 4) caps the Redis client at 5.2.1.
+    "redis>=5.2.1,<5.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0,<10",
+    "httpx>=0.28.1,<0.29",   # used by FastAPI's TestClient
+    "ruff>=0.17.3,<0.18",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = ["--import-mode=importlib", "-p", "no:cacheprovider"]
+markers = [
+    "integration: needs the real PostgreSQL and Redis containers from compose.yaml",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

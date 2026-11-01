@@ -1,0 +1,8 @@
+# Normalize text files to LF in the repo. Files used inside Linux containers (shell scripts,
+# Dockerfiles, Python) must not get Windows CRLF line endings.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
+*.zip binary

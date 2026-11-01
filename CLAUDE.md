@@ -53,12 +53,39 @@ The full product brief is in `PROJECT_BRIEF.md`; the planned design is in `docs/
 - **Default branch is `main`.** The developer commits manually — do not commit.
 - **Local storage** for uploads and artifacts lives under `storage/` (gitignored).
 
+## Decisions made (Phase 1)
+
+- **`/health/ready` requires only PostgreSQL.** Redis is reported but never causes a `503`.
+- **Dependency checks run concurrently with a hard deadline** (`DEPENDENCY_TIMEOUT_SECONDS`,
+  default 2). Driver timeouts alone don't cover DNS, which is slow for stopped Docker containers.
+- **`pool_pre_ping=True`** on the SQLAlchemy engine replaces dead connections after a Postgres restart.
+- **Redis Python client stays on 5.2.x**: Celery 5.5's kombu caps it at 5.2.1.
+- **Dev live reload** bind-mounts `backend/app` and `backend/tests` into the container and runs
+  `uvicorn --reload` with `WATCHFILES_FORCE_POLLING=true`. Without polling, edits made on
+  Windows were not detected.
+- **Request logging** uses plain ASGI middleware (not `BaseHTTPMiddleware`), so it works with SSE.
+
+## Commands
+
+```powershell
+docker compose up --build -d                 # start (rebuild only needed after dependency changes)
+docker compose run --rm api pytest           # all tests (unit + integration)
+docker compose run --rm api ruff check app tests
+docker compose run --rm api ruff format app tests
+```
+
+Regenerate `backend/uv.lock` after editing dependencies (runs uv in a throwaway container):
+
+```powershell
+docker run --rm -v "${PWD}\backend:/src" -w /src python:3.13.18-slim sh -c "pip install -q uv==0.13.6 && uv lock"
+```
+
 ## Phase list
 
 | # | Phase | Status |
 |---|---|---|
 | 0 | Planning: architecture, versions, working rules | **Done** |
-| 1 | Compose + FastAPI skeleton + health routes | Not started |
+| 1 | Compose + FastAPI skeleton + health routes | **Done** (awaiting developer verification) |
 | 2 | Migrations + state machine | Not started |
 | 3 | Upload and job APIs with idempotency and outbox | Not started |
 | 4 | Dispatcher + Celery worker with one dummy stage | Not started |

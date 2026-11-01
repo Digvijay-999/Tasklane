@@ -1,7 +1,7 @@
 # Tasklane architecture (draft)
 
-> **Status: PLANNED — nothing in this document is implemented yet.**
-> This is a Phase 0 design draft. Each section will be revised as phases are built, and
+> **Status: mostly PLANNED.** Implemented so far (Phase 1): the Compose stack (PostgreSQL, Redis,
+> API), `/health/live`, `/health/ready`, and JSON request logging. Everything else is a design draft. Each section will be revised as phases are built, and
 > sections will be marked *implemented* only once the code and tests exist.
 
 ## 1. Goal
@@ -171,21 +171,39 @@ docs/  architecture.md  api.md  reliability.md  security.md
 
 ## 7. Versions
 
-Backend versions below are **approved**; exact patch versions are verified against the package
-indexes (not memory) when `uv.lock` is generated in Phase 1. **Frontend versions (React,
-TypeScript, Vite) are not locked yet** — they are decided at the start of Phase 9.
+**Frontend versions (React, TypeScript, Vite) are not locked yet.** They are decided at the start
+of Phase 9.
 
-| Tool | Planned | Why |
+Locked in Phase 1 (checked against PyPI and Docker Hub on 2026-11-02):
+
+| Tool | Locked | Notes |
 |---|---|---|
-| Python | 3.13 | Mature wheel support across psycopg, Celery, OpenTelemetry; matches local install |
-| FastAPI | latest 0.1xx at lock time | Pre-1.0 versioning; exact version fixed by the lock file |
-| Pydantic | 2.12.x | Pydantic v2 is what current FastAPI uses |
-| SQLAlchemy | 2.0.x | Stable 2.0-style API |
-| Alembic | 1.16+ / latest 1.x | Migrations for SQLAlchemy |
-| Postgres driver | psycopg 3.2+ (`psycopg[binary]`) | One driver for both sync (worker) and async use |
-| Celery | 5.5.x | Current stable line with Redis broker support |
-| Redis server | 7.4 | Long-proven with Celery/kombu |
-| PostgreSQL | 17 | Mature; 18 is newer but offers nothing this project needs |
+| Python | 3.13.18 (`python:3.13.18-slim`) | |
+| uv | 0.13.6 | Package manager used in the Docker build |
+| FastAPI | 0.162.0 (Starlette 1.10.0) | Pre-1.0, so pyproject restricts it to 0.162.x |
+| Uvicorn | 0.54.0 (`[standard]`, watchfiles 1.3.0) | |
+| Pydantic | 2.12.5 (pydantic-settings 2.16.2) | 2.14 exists; kept on the approved 2.12 line |
+| SQLAlchemy | 2.0.55 | |
+| psycopg | 3.3.6 (`[binary]`) | |
+| redis (Python client) | 5.2.1 | Celery 5.5's kombu caps it at 5.2.1 |
+| PostgreSQL | 17.11 (`postgres:17.11-alpine`) | |
+| Redis server | 7.4.12 (`redis:7.4.12-alpine`) | |
+| pytest / httpx / ruff | 9.2.0 / 0.28.1 / 0.17.3 | Development only |
+
+Planned for later phases: Alembic (Phase 2, latest 1.x; a trial resolution chose 1.20.1) and Celery
+5.5.x (Phase 4; a trial resolution chose 5.5.3 with kombu 5.5.4). Celery 5.6 exists, but 5.5 is
+the approved line.
+
+### Health semantics (implemented)
+
+- `/health/live`: always `200` while the process is running; touches no dependencies.
+- `/health/ready`: runs the PostgreSQL and Redis checks concurrently and waits at most
+  `DEPENDENCY_TIMEOUT_SECONDS` (default 2). Returns `503` only if PostgreSQL is unavailable.
+  Errors are logged by type only (no driver messages, which may include hosts or users).
+- Reconnection: the SQLAlchemy engine uses `pool_pre_ping`, so connections broken by a Postgres
+  restart are detected and replaced on next use. redis-py drops broken connections and reconnects
+  on the next command. Both are covered by integration tests that kill the API's server-side
+  connections.
 | Node | 24 LTS (tentative) | Active LTS; matches local install. Confirmed in Phase 9 |
 | React / TypeScript / Vite | Decided in Phase 9 | Not locked yet |
 
