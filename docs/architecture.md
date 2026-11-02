@@ -1,8 +1,10 @@
 # Tasklane architecture (draft)
 
-> **Status: mostly PLANNED.** Implemented so far (Phase 1): the Compose stack (PostgreSQL, Redis,
-> API), `/health/live`, `/health/ready`, and JSON request logging. Everything else is a design draft. Each section will be revised as phases are built, and
-> sections will be marked *implemented* only once the code and tests exist.
+> **Status: partly implemented.** Implemented so far: the Compose stack with a one-shot `migrate`
+> step, `/health/live` and `/health/ready`, JSON request logging (Phase 1), and the database
+> schema, migrations, job state machine, and the database functions that apply status changes and
+> append events (Phase 2). Sections are marked *implemented* or *planned*; anything planned is a
+> design draft with no code yet.
 
 ## 1. Goal
 
@@ -103,10 +105,11 @@ Step by step:
    The SSE endpoint replays events after `Last-Event-ID`, then polls for new ones. A client
    disconnect never cancels a job.
 
-## 4. Job state machine (planned)
+## 4. Job state machine (implemented in Phase 2; used by workers from Phase 4)
 
 States: `queued`, `running`, `retry_wait`, `cancel_requested`, `succeeded`, `failed`, `cancelled`.
-Terminal: `succeeded`, `failed`, `cancelled`.
+Terminal: `succeeded`, `failed`, `cancelled`. "Terminal" means no automatic process (worker,
+recovery, dispatcher) will ever move the job again; only a user's manual retry can reopen `failed`.
 
 ```mermaid
 stateDiagram-v2
@@ -115,38 +118,52 @@ stateDiagram-v2
     queued --> cancelled : cancel before start
     running --> succeeded
     running --> failed : permanent error / budget exhausted
-    running --> retry_wait : transient error / expired lease
+    running --> retry_wait : transient error / expired lease, attempts left
     running --> cancel_requested : user cancels
     retry_wait --> running
-    retry_wait --> failed : budget exhausted
     retry_wait --> cancelled : user cancels
-    cancel_requested --> cancelled : worker reaches stage boundary / lease expires
+    cancel_requested --> cancelled : stage boundary / transient error / lease expired
     cancel_requested --> succeeded : last stage already finished
+    cancel_requested --> failed : permanent error happened first
     failed --> queued : manual retry (new attempt, history kept)
     succeeded --> [*]
     cancelled --> [*]
 ```
 
-**Cancel vs. completion race (decided):** if a user requests cancellation while the final stage is
-already finishing, the job ends `succeeded`. The worker records an event explaining that
-cancellation was requested but the job completed first.
+**Cancel vs. outcome race (decided):** a *definite* outcome reached before the worker's next
+stage boundary wins over a pending cancel request: success ends `succeeded`, a permanent error
+ends `failed`. A transient error (which would only lead to a retry) gives way to the cancel, and
+the job ends `cancelled`. Whenever a definite outcome wins, a `job.cancel_superseded` event
+explains it.
 
-The transition table lives in `backend/app/domain/` as pure Python with no database imports, so it
-can be unit-tested exhaustively. Every transition is applied with a conditional update
-(`... WHERE status = <expected>`) so two processes cannot both make the same transition.
+The full transition table, the reasoning behind each rule, how lost races are detected, and why
+event numbers are per job are in [reliability.md](reliability.md). The code is in
+`backend/app/domain/state_machine.py` (pure Python) and `backend/app/db/repositories/jobs.py`.
 
-## 5. Persistence model (planned)
+## 5. Persistence model (implemented in Phase 2)
 
-| Table | Key columns | Notes |
-|---|---|---|
-| `uploads` | id, storage_path, original_filename (display only), sha256, size, mime, status, expires_at | Path is generated, never derived from the filename |
-| `jobs` | id, workflow_type, status, current_stage, percent, upload_id, input_hash, idempotency_key (unique), request_hash, max_attempts, cancel_requested, error_summary, timestamps | `error_summary` is user-safe text only |
-| `job_attempts` | job_id, attempt_no, worker_id, started_at, ended_at, lease_expires_at, outcome, error_class | Unique `(job_id, attempt_no)` |
-| `job_events` | job_id, seq, type, created_at, payload (JSONB) | Unique `(job_id, seq)`; seq allocated under the job row lock |
-| `artifacts` | job_id, artifact_type, storage_path, filename, size, mime, sha256, created_at | Unique `(job_id, artifact_type)` → duplicate runs upsert, not duplicate |
-| `outbox` | id, job_id, payload, created_at, available_at, published_at, dispatch_attempts | `available_at` supports delayed retries |
+The tables exist and their constraints are enforced, but nothing writes to them yet outside tests:
+uploads and jobs arrive in Phase 3, attempts and artifacts in Phases 4–5. Column definitions are
+in `backend/app/db/models.py`; the reason for each constraint is in
+[reliability.md](reliability.md#database-constraints).
 
-Schema changes are made only through Alembic migrations.
+| Table | Key guarantees |
+|---|---|
+| `uploads` | Generated storage path (unique); a `receiving` status so half-written uploads can be found |
+| `jobs` | Unique `idempotency_key`; attempt budget capped at 20; status-dependent fields (finish time, error, retry time, cancel time) always consistent; `last_event_seq` counter |
+| `job_attempts` | Lease and heartbeat live here; **at most one open attempt per job** (partial unique index) |
+| `job_events` | Primary key `(job_id, seq)`: each per-job number exists once, with no gaps |
+| `artifacts` | Unique `(job_id, artifact_type)`: a repeated stage replaces, never duplicates |
+| `outbox` | `available_at` for delayed retries; **at most one unpublished message per job** |
+
+Deleting a job also deletes its attempts, events, artifacts and outbox rows; an upload can't be
+deleted while a job references it. All timestamps are `timestamptz`. Lease checks (Phase 7) will
+compare against the database clock (`now()`), never a container's clock.
+
+**Migrations:** schema changes are made only through Alembic migrations in `backend/migrations/`.
+The one-shot `migrate` Compose service runs `alembic upgrade head` and exits; the API waits for it
+to succeed. Migrations are frozen snapshots (they spell out value lists instead of importing app
+enums), and tests check that they match the models and the enums.
 
 ## 6. Planned repository layout
 
@@ -190,11 +207,18 @@ Locked in Phase 1 (checked against PyPI and Docker Hub on 2026-11-02):
 | Redis server | 7.4.12 (`redis:7.4.12-alpine`) | |
 | pytest / httpx / ruff | 9.2.0 / 0.28.1 / 0.17.3 | Development only |
 
-Planned for later phases: Alembic (Phase 2, latest 1.x; a trial resolution chose 1.20.1) and Celery
-5.5.x (Phase 4; a trial resolution chose 5.5.3 with kombu 5.5.4). Celery 5.6 exists, but 5.5 is
-the approved line.
+| Alembic | 1.20.1 | Added in Phase 2 (checked against PyPI on 2026-11-02) |
+| Node | 24 LTS (tentative) | Confirmed in Phase 9 |
+| React / TypeScript / Vite | Decided in Phase 9 | Not locked yet |
 
-### Health semantics (implemented)
+Planned for Phase 4: Celery 5.5.x (a trial resolution chose 5.5.3 with kombu 5.5.4). Celery 5.6
+exists, but 5.5 is the approved line.
+
+Pinning: Python via `uv` (`pyproject.toml` + committed `uv.lock`); frontend via exact versions in
+`package.json` + committed `package-lock.json` installed with `npm ci`; Docker images pinned by
+specific tags.
+
+### Health semantics (implemented in Phase 1)
 
 - `/health/live`: always `200` while the process is running; touches no dependencies.
 - `/health/ready`: runs the PostgreSQL and Redis checks concurrently and waits at most
@@ -204,13 +228,6 @@ the approved line.
   restart are detected and replaced on next use. redis-py drops broken connections and reconnects
   on the next command. Both are covered by integration tests that kill the API's server-side
   connections.
-| Node | 24 LTS (tentative) | Active LTS; matches local install. Confirmed in Phase 9 |
-| React / TypeScript / Vite | Decided in Phase 9 | Not locked yet |
-
-Pinning: Python via `uv` (`pyproject.toml` + committed `uv.lock`); frontend via exact versions in
-`package.json` + committed `package-lock.json` installed with `npm ci`; Docker images pinned by
-specific tags (e.g. `postgres:17.x`, `redis:7.4.x`). Exact patch versions are recorded when the
-lock files are first generated in Phase 1.
 
 ## 8. Build phases
 
@@ -236,7 +253,12 @@ lock files are first generated in Phase 1.
   and constraint behavior differ between databases.
 - The dispatcher process hosts two independent loops: `queue/dispatcher.py` (outbox publishing)
   and `queue/recovery.py` (expired-lease recovery), each with its own tests.
-- `cancel_requested -> succeeded` is a legal transition (see §4).
+- `cancel_requested -> succeeded` and `cancel_requested -> failed` are legal: a definite outcome
+  wins over a pending cancel (see §4).
+- Manual retry reopens `failed` jobs only, grants a fresh budget of 3 automatic attempts, is not
+  offered for input errors, and is refused once it would push `max_attempts` past 20.
+- Idempotency keys live as long as their job row (to be documented with the API in Phase 3).
+- Integration tests run against `<POSTGRES_DB>_test`, never the development database.
 - Local uploads and artifacts live under `storage/`, which is gitignored.
 
 ## 10. Open questions

@@ -2,6 +2,21 @@
 # Every published port is bound to 127.0.0.1, so nothing is reachable from other machines.
 name: tasklane
 
+# Shared by every backend container (YAML anchors: &name defines, <<: *name reuses).
+x-backend-build: &backend-build
+  context: ./backend
+  target: dev
+
+x-backend-env: &backend-env
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  POSTGRES_DB: ${POSTGRES_DB}
+  POSTGRES_HOST: postgres   # the service name doubles as a hostname on the Compose network
+  POSTGRES_PORT: "5432"     # the container port, not POSTGRES_HOST_PORT
+  REDIS_URL: redis://redis:6379/0
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  DEPENDENCY_TIMEOUT_SECONDS: ${DEPENDENCY_TIMEOUT_SECONDS:-2}
+
 services:
   postgres:
     image: postgres:17.11-alpine
@@ -29,19 +44,26 @@ services:
       timeout: 3s
       retries: 10
 
+  # One-shot: applies database migrations, then exits. The api (and, later, the worker and
+  # dispatcher) wait for it to finish successfully, so only one process ever migrates.
+  migrate:
+    build: *backend-build
+    image: tasklane-backend:dev
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-env
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/migrations:/app/migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   api:
-    build:
-      context: ./backend
-      target: dev
+    build: *backend-build
+    image: tasklane-backend:dev
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_HOST: postgres   # the service name doubles as a hostname on the Compose network
-      POSTGRES_PORT: "5432"     # the container port, not POSTGRES_HOST_PORT
-      REDIS_URL: redis://redis:6379/0
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      DEPENDENCY_TIMEOUT_SECONDS: ${DEPENDENCY_TIMEOUT_SECONDS:-2}
+      <<: *backend-env
       # Docker Desktop on Windows doesn't reliably forward file-change events from the Windows
       # filesystem into Linux containers, so the reloader checks files on a timer instead.
       WATCHFILES_FORCE_POLLING: ${WATCHFILES_FORCE_POLLING:-true}
@@ -49,13 +71,17 @@ services:
       - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     volumes:
       # Live reload: the container runs your local source instead of the copy baked into the image.
+      # migrations/ is mounted too, so `alembic revision` run here writes files into your repo.
       - ./backend/app:/app/app
       - ./backend/tests:/app/tests
+      - ./backend/migrations:/app/migrations
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_started
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:

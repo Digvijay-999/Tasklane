@@ -65,13 +65,50 @@ The full product brief is in `PROJECT_BRIEF.md`; the planned design is in `docs/
   Windows were not detected.
 - **Request logging** uses plain ASGI middleware (not `BaseHTTPMiddleware`), so it works with SSE.
 
+## Decisions made (Phase 2)
+
+- **State machine** lives in `app/domain/state_machine.py` (pure; a test forbids framework/db
+  imports). 12 legal transitions; see `docs/reliability.md`.
+- **A definite outcome beats a pending cancel:** `cancel_requested -> succeeded` and
+  `cancel_requested -> failed` are legal and emit a `job.cancel_superseded` event. A transient
+  error during `cancel_requested` ends `cancelled`.
+- **Queued and retry_wait jobs cancel directly** to `cancelled`.
+- **Expired lease:** `retry_wait` if attempts remain, else `failed` (`lease_expired`);
+  `cancelled` if cancellation was requested.
+- **Manual retry** reopens the same `failed` job (`failed -> queued`), grants a fresh budget of 3
+  attempts (`max_attempts = attempt_count + 3`), is not offered for input errors, and
+  `can_manual_retry` refuses before `max_attempts` would exceed 20 (the DB cap).
+- **Idempotency keys live as long as the job row**; document this in Phase 3.
+- **Status changes only via `transition_job`** (conditional `UPDATE ... WHERE status = :from`);
+  `applied=False` means the job wasn't in `from` (treat the returned status as advice, not
+  final). Relies on READ COMMITTED. Repository functions flush pending ORM changes first, expire
+  cached `Job` objects after, and never commit. Set `Job.id` explicitly when creating a job.
+- **A manual retry starts a clean run:** it requires `max_attempts`, and clears finish time,
+  error, stage, progress and `cancel_requested_at` (`ck_jobs_no_cancel_while_active` enforces the
+  last one). Success clears errors from earlier attempts.
+- **Event numbers are per job** (`jobs.last_event_seq`, incremented under the row lock), never a
+  table-wide sequence.
+- **Value lists are `text` + CHECK**, not native Postgres enums. Migrations are frozen snapshots;
+  tests compare them with the Python enums, and strictly with the models (a `create_all` database
+  vs the migrated one: constraint, index, and column definitions must be identical).
+- **Every constraint needs a test** in `tests/integration/test_constraints.py` (a meta-test
+  enforces it). Watch NULL semantics in CHECKs: NULL counts as a pass.
+- **Migration names use `op.f(...)`**, because Alembic applies the naming convention to migration
+  operations too (without it, `ck_jobs_status` becomes `ck_jobs_ck_jobs_status`).
+- **Migrations run in the one-shot `migrate` Compose service**; never at app startup.
+- **Integration tests use `<POSTGRES_DB>_test`** (recreated per run, guarded against the dev DB)
+  and truncate all tables before each test.
+
 ## Commands
 
 ```powershell
-docker compose up --build -d                 # start (rebuild only needed after dependency changes)
+docker compose up --build -d                 # start; rebuild after dependency or alembic.ini changes
 docker compose run --rm api pytest           # all tests (unit + integration)
-docker compose run --rm api ruff check app tests
-docker compose run --rm api ruff format app tests
+docker compose run --rm api ruff check app tests migrations
+docker compose run --rm api ruff format app tests migrations
+docker compose run --rm migrate              # apply migrations
+docker compose run --rm migrate alembic check   # do models and database agree?
+docker compose run --rm api alembic revision --autogenerate --rev-id 0002 -m "describe change"
 ```
 
 Regenerate `backend/uv.lock` after editing dependencies (runs uv in a throwaway container):
@@ -85,8 +122,8 @@ docker run --rm -v "${PWD}\backend:/src" -w /src python:3.13.18-slim sh -c "pip 
 | # | Phase | Status |
 |---|---|---|
 | 0 | Planning: architecture, versions, working rules | **Done** |
-| 1 | Compose + FastAPI skeleton + health routes | **Done** (awaiting developer verification) |
-| 2 | Migrations + state machine | Not started |
+| 1 | Compose + FastAPI skeleton + health routes | **Done** |
+| 2 | Migrations + state machine | **Done** (awaiting developer verification) |
 | 3 | Upload and job APIs with idempotency and outbox | Not started |
 | 4 | Dispatcher + Celery worker with one dummy stage | Not started |
 | 5 | PDF workflow + retries | Not started |

@@ -5,6 +5,7 @@ are reused across requests (similar to the pool inside a Node `pg.Pool`).
 """
 
 from sqlalchemy import URL, Engine, create_engine, text
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings
 
@@ -50,6 +51,15 @@ def create_db_engine(settings: Settings) -> Engine:
             "tcp_user_timeout": 30_000,  # milliseconds
         },
     )
+
+
+def create_session_factory(engine: Engine) -> sessionmaker[Session]:
+    """Return a factory for ORM sessions (a session is one unit of work / one transaction).
+
+    expire_on_commit=False keeps loaded objects readable after commit, so code doesn't trigger
+    surprise extra queries when it reads an attribute after committing.
+    """
+    return sessionmaker(bind=engine, expire_on_commit=False)
 
 
 def check_database(engine: Engine) -> None:

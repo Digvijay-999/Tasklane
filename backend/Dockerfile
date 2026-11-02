@@ -21,6 +21,8 @@ COPY pyproject.toml uv.lock ./
 FROM base AS dev
 # --frozen = install exactly what uv.lock says and fail if it is out of date (like `npm ci`).
 RUN uv sync --frozen --no-install-project
+COPY alembic.ini ./
+COPY migrations ./migrations
 COPY app ./app
 COPY tests ./tests
 RUN chown -R app:app /app
@@ -32,6 +34,8 @@ CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port
 FROM base AS runtime
 RUN uv sync --frozen --no-install-project --no-dev
 # Code stays owned by root, so the server process (user "app") can read but not modify it.
+COPY alembic.ini ./
+COPY migrations ./migrations
 COPY app ./app
 USER app
 EXPOSE 8000

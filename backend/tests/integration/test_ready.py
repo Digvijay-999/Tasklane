@@ -2,8 +2,9 @@
 
 Run inside Docker:  docker compose run --rm api pytest -m integration
 
-The reconnection tests kill only the test app's *own* connections (by Postgres backend PID and
-Redis client ID), so the running `api` container and future workers are not disturbed.
+These use the test database (see conftest.py), never the development one. The reconnection
+tests kill only the test app's *own* connections (by Postgres backend PID and Redis client ID),
+so the running `api` container and future workers are not disturbed.
 """
 
 from collections.abc import Iterator
@@ -13,17 +14,14 @@ import redis
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from app.config import get_settings
 from app.db.session import create_db_engine
 from app.main import create_app
 from app.observability.logging import JsonFormatter
 
-pytestmark = pytest.mark.integration
-
 
 @pytest.fixture
-def client() -> Iterator[TestClient]:
-    with TestClient(create_app(get_settings())) as test_client:
+def client(test_settings, migrated_engine) -> Iterator[TestClient]:
+    with TestClient(create_app(test_settings)) as test_client:
         yield test_client
 
 
@@ -33,7 +31,7 @@ def test_ready_with_real_dependencies(client):
     assert response.json() == {"status": "ready", "checks": {"database": "ok", "queue": "ok"}}
 
 
-def test_ready_recovers_after_database_connections_are_killed(client):
+def test_ready_recovers_after_database_connections_are_killed(client, test_settings):
     engine = client.app.state.db_engine
     # Find the PID of the connection the app has pooled (it goes back to the pool afterwards).
     with engine.connect() as connection:
@@ -41,7 +39,7 @@ def test_ready_recovers_after_database_connections_are_killed(client):
     assert engine.pool.checkedin() == 1
 
     # Kill it on the server side, as a Postgres restart would.
-    admin = create_db_engine(get_settings())
+    admin = create_db_engine(test_settings)
     try:
         with admin.connect() as connection:
             killed = connection.execute(
@@ -57,11 +55,11 @@ def test_ready_recovers_after_database_connections_are_killed(client):
     assert response.json()["checks"]["database"] == "ok"
 
 
-def test_ready_recovers_after_redis_connections_are_killed(client):
+def test_ready_recovers_after_redis_connections_are_killed(client, test_settings):
     broker = client.app.state.broker_client
     client_id = broker.client_id()  # the ID of the app's pooled Redis connection
 
-    admin = redis.Redis.from_url(get_settings().redis_url)
+    admin = redis.Redis.from_url(test_settings.redis_url)
     try:
         assert admin.client_kill_filter(_id=client_id) == 1
     finally:
@@ -70,8 +68,8 @@ def test_ready_recovers_after_redis_connections_are_killed(client):
     assert client.get("/health/ready").json()["checks"]["queue"] == "ok"
 
 
-def test_real_driver_errors_do_not_leak_into_response_or_logs(caplog):
-    settings = get_settings().model_copy(
+def test_real_driver_errors_do_not_leak_into_response_or_logs(test_settings, caplog):
+    settings = test_settings.model_copy(
         update={
             "postgres_host": "postgres",
             "postgres_port": 1,  # nothing listens here: psycopg raises a real OperationalError
