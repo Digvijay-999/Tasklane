@@ -3,8 +3,13 @@
 > **Status: partly implemented.** Implemented so far: the Compose stack with a one-shot `migrate`
 > step, `/health/live` and `/health/ready`, JSON request logging (Phase 1), and the database
 > schema, migrations, job state machine, and the database functions that apply status changes and
-> append events (Phase 2). Sections are marked *implemented* or *planned*; anything planned is a
-> design draft with no code yet.
+> append events (Phase 2), and the upload and job APIs: streaming uploads, idempotent job
+> creation with the transactional outbox write, listing and detail (Phase 3), and the delivery
+> pipeline: outbox dispatcher, Celery worker, claim with duplicate dropping, lease renewal on
+> progress, and one placeholder stage (Phase 4). In the lifecycle below, steps 1–4 are implemented,
+> step 5 runs a single placeholder stage, step 6 handles success and fails every error permanently
+> (retries are Phase 5), and steps 7–8 are planned. The HTTP API is documented in
+> [api.md](api.md); delivery guarantees in [reliability.md](reliability.md).
 
 ## 1. Goal
 
@@ -76,22 +81,30 @@ sequenceDiagram
 
 Step by step:
 
-1. **Upload.** The API streams the file to `storage/uploads/{upload_uuid}/`, never using the
-   user's filename in the path. It enforces size limits, checks extension and file signature
-   ("magic bytes"), computes a SHA-256 hash, and records an `uploads` row.
-2. **Create job.** The client sends `workflow_type`, `upload_id`, options, and an
-   `Idempotency-Key` header. The API normalizes the request and hashes it. In **one transaction**
-   it inserts the job (`queued`), the first event, and an outbox row. A unique constraint on the
-   idempotency key makes concurrent duplicate submissions safe: same key + same request hash
-   returns the existing job; same key + different hash returns `409 Conflict`.
-3. **Dispatch.** The dispatcher claims unpublished outbox rows, publishes a Celery task containing
-   only the `job_id`, and marks the row published. If it crashes between publishing and marking,
-   the task is published again — which is acceptable because workers handle duplicates.
-4. **Execute.** The worker locks the job row and decides whether to run. If the job is terminal,
-   or another attempt holds a valid lease, the message is a duplicate and is dropped. Otherwise it
-   creates a `job_attempts` row, sets `running`, and sets a lease expiry.
-5. **Stages.** Between stages the worker checks for cancellation, records stage events and
-   progress, and renews its lease (heartbeat). Stages are repeat-safe: outputs go to deterministic
+1. **Upload (implemented).** The request body is the raw file. The API commits an `uploads` row
+   with status `receiving`, streams the body in chunks to a temporary file while hashing it and
+   counting bytes against the size limit, checks the extension, declared type, and file
+   signature ("magic bytes"), then renames the file atomically to
+   `uploads/{upload_id}/source.{pdf|zip}` and marks the row `ready`. The user's filename is never
+   used in a path. Any failure deletes the files and marks the row `rejected`.
+2. **Create job (implemented).** The client sends `workflow_type`, `upload_id`, options, and an
+   `Idempotency-Key` header. The API fingerprints the fields the client sent. In **one
+   transaction** it inserts the job (`queued`) with `INSERT ... ON CONFLICT (idempotency_key) DO
+   NOTHING`, the first event, and an outbox row. The unique index makes concurrent duplicate
+   submissions safe: same key + same fingerprint returns the existing job (`200`,
+   `Idempotent-Replayed: true`); same key + different fingerprint returns `409 Conflict`.
+3. **Dispatch (implemented).** Every second, the dispatcher locks due unpublished outbox rows
+   (`FOR UPDATE SKIP LOCKED`), publishes a Celery task containing only the `job_id`, and marks the
+   rows published in the same transaction. If it crashes between publishing and committing, the
+   task is published again, which is acceptable because workers drop duplicates. While Redis is
+   down it records the error and backs off; jobs stay `queued`.
+4. **Execute (implemented).** The worker claims the job with a conditional update: only a
+   `queued` job, or a `retry_wait` job whose retry is due, moves to `running`, together with a new
+   `job_attempts` row holding a 60 s lease. Any other state means the message is a duplicate or
+   stale, and it is dropped without writing anything.
+5. **Stages (Phase 4: one placeholder stage).** Each progress report renews the lease, records
+   progress and a `stage.progress` event, and fails if the attempt was closed by someone else
+   (fencing). Cancellation checks between stages arrive in Phase 7. Stages are repeat-safe: outputs go to deterministic
    paths under `storage/artifacts/{job_id}/`, are written via temp-file-then-rename, and artifact
    rows are unique per `(job_id, artifact_type)`.
 6. **Finish.** On success: artifacts recorded, `succeeded`. On a *transient* error (timeout,
@@ -140,16 +153,22 @@ The full transition table, the reasoning behind each rule, how lost races are de
 event numbers are per job are in [reliability.md](reliability.md). The code is in
 `backend/app/domain/state_machine.py` (pure Python) and `backend/app/db/repositories/jobs.py`.
 
-## 5. Persistence model (implemented in Phase 2)
+## 5. Persistence model (implemented in Phases 2–3)
 
-The tables exist and their constraints are enforced, but nothing writes to them yet outside tests:
-uploads and jobs arrive in Phase 3, attempts and artifacts in Phases 4–5. Column definitions are
-in `backend/app/db/models.py`; the reason for each constraint is in
+The API writes `uploads`, `jobs`, `job_events` (`job.created`), and `outbox`. The dispatcher
+reads and marks the outbox, and workers write `job_attempts`, progress, and stage events
+(Phase 4). Nothing writes `artifacts` yet (Phase 5).
+Column definitions are in `backend/app/db/models.py`; the reason for each constraint is in
 [reliability.md](reliability.md#database-constraints).
+
+Migration `0002` (Phase 3) made `uploads.sha256` and `uploads.size_bytes` nullable while an upload
+is `receiving` (required once `ready`), added `uploads.rejection_reason`, and added three indexes on
+`jobs` for newest-first keyset pagination: `(created_at DESC, id DESC)`, and the same prefixed by
+`status` or `workflow_type`.
 
 | Table | Key guarantees |
 |---|---|
-| `uploads` | Generated storage path (unique); a `receiving` status so half-written uploads can be found |
+| `uploads` | Generated storage path (unique); a `receiving` status so half-written uploads can be found; size and hash required once `ready`; a reason required when `rejected` |
 | `jobs` | Unique `idempotency_key`; attempt budget capped at 20; status-dependent fields (finish time, error, retry time, cancel time) always consistent; `last_event_seq` counter |
 | `job_attempts` | Lease and heartbeat live here; **at most one open attempt per job** (partial unique index) |
 | `job_events` | Primary key `(job_id, seq)`: each per-job number exists once, with no gaps |
@@ -165,14 +184,16 @@ The one-shot `migrate` Compose service runs `alembic upgrade head` and exits; th
 to succeed. Migrations are frozen snapshots (they spell out value lists instead of importing app
 enums), and tests check that they match the models and the enums.
 
-## 6. Planned repository layout
+## 6. Repository layout
 
 ```
 backend/
   app/
-    api/            # FastAPI routers, request/response schemas
-    domain/         # state machine, error classes, pure rules
-    db/             # SQLAlchemy models, session, repositories
+    api/            # FastAPI routers, request/response schemas, error mapping (implemented)
+    services/       # use cases: coordinate db + storage + domain, own transactions (implemented)
+    domain/         # state machine, upload and idempotency rules; pure Python (implemented)
+    db/             # SQLAlchemy models, session, repositories (implemented)
+    storage/        # local files: generated paths, temp writes, atomic renames (implemented)
     queue/          # Celery app, dispatcher, recovery loop, task entry points
     workflows/      # pdf and zip stage implementations
     providers/      # summarizer interface, stub, optional LLM
@@ -202,17 +223,18 @@ Locked in Phase 1 (checked against PyPI and Docker Hub on 2026-11-02):
 | Pydantic | 2.12.5 (pydantic-settings 2.16.2) | 2.14 exists; kept on the approved 2.12 line |
 | SQLAlchemy | 2.0.55 | |
 | psycopg | 3.3.6 (`[binary]`) | |
-| redis (Python client) | 5.2.1 | Celery 5.5's kombu caps it at 5.2.1 |
+| redis (Python client) | 6.4.0 | Upgraded in Phase 4 (kombu 5.6 allows `<6.5`) |
+| Celery | 5.6.3 (kombu 5.6.2, billiard 4.3.2) | Added in Phase 4; kombu held `<5.7` |
 | PostgreSQL | 17.11 (`postgres:17.11-alpine`) | |
 | Redis server | 7.4.12 (`redis:7.4.12-alpine`) | |
 | pytest / httpx / ruff | 9.2.0 / 0.28.1 / 0.17.3 | Development only |
-
 | Alembic | 1.20.1 | Added in Phase 2 (checked against PyPI on 2026-11-02) |
 | Node | 24 LTS (tentative) | Confirmed in Phase 9 |
 | React / TypeScript / Vite | Decided in Phase 9 | Not locked yet |
 
-Planned for Phase 4: Celery 5.5.x (a trial resolution chose 5.5.3 with kombu 5.5.4). Celery 5.6
-exists, but 5.5 is the approved line.
+Celery moved from the originally approved 5.5 line to 5.6 in Phase 4 (5.5 had no release since
+June 2025, and its kombu capped the Redis client at 5.2.1). Celery 5.6 sets no upper bound on
+kombu, so pyproject holds kombu on the 5.6 line it was released with.
 
 Pinning: Python via `uv` (`pyproject.toml` + committed `uv.lock`); frontend via exact versions in
 `package.json` + committed `package-lock.json` installed with `npm ci`; Docker images pinned by

@@ -20,16 +20,18 @@ a status change plus an outbox row) into one all-or-nothing transaction.
 """
 
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import Select, func, insert, select, tuple_, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.util import identity_key
 
-from app.db.models import Job, JobEvent
+from app.db.models import Artifact, Job, JobAttempt, JobEvent, Upload
 from app.domain.enums import EventType, JobStatus
+from app.domain.listing import JobListPosition
 from app.domain.state_machine import cancel_supersedes, ensure_transition, is_terminal
 
 jobs = Job.__table__
@@ -76,6 +78,7 @@ def transition_job(
     changes: Mapping[str, Any] | None = None,
     event_payload: Mapping[str, Any] | None = None,
     attempt_no: int | None = None,
+    only_if_retry_due: bool = False,
 ) -> TransitionResult:
     """Move a job from `from_status` to `to_status` if, and only if, it is still in `from_status`.
 
@@ -83,11 +86,18 @@ def transition_job(
     machine, and JobNotFoundError if the job doesn't exist. Returns `applied=False` if the job
     wasn't in `from_status`.
 
+    only_if_retry_due: additionally require `retry_at <= now()` (database clock). Used when a
+    worker claims a `retry_wait` job, so an old duplicate message can't start a retry before its
+    backoff has passed. If the retry isn't due, the result is `applied=False` with the current
+    status (`retry_wait`).
+
     Assumes the default READ COMMITTED isolation level. (Under REPEATABLE READ or SERIALIZABLE,
     Postgres raises a serialization error instead of returning zero rows.)
     """
     ensure_transition(from_status, to_status)
     _require_job_id(job_id)
+    if only_if_retry_due and from_status != JobStatus.RETRY_WAIT:
+        raise ValueError("only_if_retry_due applies only to transitions from retry_wait")
     values = _transition_values(from_status, to_status, dict(changes or {}))
     # These statements bypass the ORM, which only auto-flushes before ORM statements. Send any
     # pending ORM changes first (e.g. a just-added Job), so the UPDATE can see them.
@@ -98,11 +108,11 @@ def transition_job(
     events_added = 2 if superseded else 1
     values["last_event_seq"] = jobs.c.last_event_seq + events_added
 
+    conditions = [jobs.c.id == job_id, jobs.c.status == from_status.value]
+    if only_if_retry_due:
+        conditions.append(jobs.c.retry_at <= func.now())
     new_last_seq = session.execute(
-        update(jobs)
-        .where(jobs.c.id == job_id, jobs.c.status == from_status.value)
-        .values(**values)
-        .returning(jobs.c.last_event_seq)
+        update(jobs).where(*conditions).values(**values).returning(jobs.c.last_event_seq)
     ).scalar_one_or_none()
 
     if new_last_seq is None:
@@ -250,3 +260,116 @@ def _expire_cached_job(session: Session, job_id: uuid.UUID) -> None:
     cached = session.identity_map.get(identity_key(Job, job_id))
     if cached is not None:
         session.expire(cached)
+
+
+def update_progress(session: Session, job_id: uuid.UUID, *, stage: str, percent: int) -> bool:
+    """Record the current stage and progress of a job that is still executing.
+
+    Only applies while the job is `running` or `cancel_requested`; returns False otherwise (the
+    job was finished or moved by someone else, so the worker should stop).
+    """
+    _require_job_id(job_id)
+    session.flush()
+    updated = session.execute(
+        update(jobs)
+        .where(
+            jobs.c.id == job_id,
+            jobs.c.status.in_([JobStatus.RUNNING.value, JobStatus.CANCEL_REQUESTED.value]),
+        )
+        .values(current_stage=stage, progress_percent=percent, updated_at=func.now())
+        .returning(jobs.c.id)
+    ).scalar_one_or_none()
+    _expire_cached_job(session, job_id)
+    return updated is not None
+
+
+# --- Creating and reading jobs --------------------------------------------------------------------
+
+
+def insert_job_if_key_unused(session: Session, values: Mapping[str, Any]) -> uuid.UUID | None:
+    """Insert a job unless its idempotency key is already taken. Returns the new id, or None.
+
+    `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING` lets the unique index decide races:
+    if another transaction inserted the same key and hasn't finished, this statement waits for
+    it. If that transaction commits, this one inserts nothing (returns None); if it rolls back,
+    this insert goes ahead. No exception is raised, so the surrounding transaction stays usable
+    (a caught IntegrityError would abort the whole Postgres transaction).
+    """
+    if values.get("id") is None:
+        raise ValueError("insert_job_if_key_unused requires an explicit job id")
+    statement = (
+        pg_insert(jobs)
+        .values(**values)
+        .on_conflict_do_nothing(index_elements=[jobs.c.idempotency_key])
+        .returning(jobs.c.id)
+    )
+    return session.execute(statement).scalar_one_or_none()
+
+
+def get_job_by_idempotency_key(session: Session, key: str) -> Job | None:
+    return session.scalars(select(Job).where(Job.idempotency_key == key)).one_or_none()
+
+
+def list_jobs_statement(
+    *,
+    statuses: Sequence[str] = (),
+    workflow_types: Sequence[str] = (),
+    after: JobListPosition | None = None,
+    limit: int,
+) -> Select[tuple[Job]]:
+    """Newest-first job list with keyset pagination.
+
+    `(created_at, id) < (after.created_at, after.job_id)` means "strictly after the previous
+    page's last row" in this ordering. It stays correct when new jobs are inserted (they sort
+    before the cursor, so they never shift later pages), and the index can jump straight to it.
+    """
+    statement = select(Job).order_by(Job.created_at.desc(), Job.id.desc()).limit(limit)
+    if statuses:
+        statement = statement.where(Job.status.in_(list(statuses)))
+    if workflow_types:
+        statement = statement.where(Job.workflow_type.in_(list(workflow_types)))
+    if after is not None:
+        statement = statement.where(
+            tuple_(Job.created_at, Job.id) < tuple_(after.created_at, after.job_id)
+        )
+    return statement
+
+
+def list_jobs(
+    session: Session,
+    *,
+    statuses: Sequence[str] = (),
+    workflow_types: Sequence[str] = (),
+    after: JobListPosition | None = None,
+    limit: int,
+) -> list[Job]:
+    statement = list_jobs_statement(
+        statuses=statuses, workflow_types=workflow_types, after=after, limit=limit
+    )
+    return list(session.scalars(statement))
+
+
+@dataclass(frozen=True)
+class JobDetail:
+    job: Job
+    upload: Upload
+    attempts: list[JobAttempt]
+    artifacts: list[Artifact]
+
+
+def get_job_detail(session: Session, job_id: uuid.UUID) -> JobDetail | None:
+    job = session.get(Job, job_id)
+    if job is None:
+        return None
+    upload = session.get(Upload, job.upload_id)
+    attempts = list(
+        session.scalars(
+            select(JobAttempt).where(JobAttempt.job_id == job_id).order_by(JobAttempt.attempt_no)
+        )
+    )
+    artifacts = list(
+        session.scalars(
+            select(Artifact).where(Artifact.job_id == job_id).order_by(Artifact.artifact_type)
+        )
+    )
+    return JobDetail(job=job, upload=upload, attempts=attempts, artifacts=artifacts)

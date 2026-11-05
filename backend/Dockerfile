@@ -11,7 +11,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH="/opt/venv/bin:$PATH"
 COPY --from=uv /uv /usr/local/bin/uv
-RUN useradd --create-home --uid 1000 app
+# /data/storage is the storage mount point, owned by the app user. An empty named volume mounted
+# there copies this ownership, so the server can write uploads without running as root.
+RUN useradd --create-home --uid 1000 app \
+    && mkdir -p /data/storage && chown app:app /data/storage
 WORKDIR /app
 # Copy only the dependency files first, so Docker can cache the install layer and skip it
 # when only application code changes (like copying package.json before `npm ci`).
@@ -25,6 +28,7 @@ COPY alembic.ini ./
 COPY migrations ./migrations
 COPY app ./app
 COPY tests ./tests
+COPY devtools ./devtools
 RUN chown -R app:app /app
 USER app
 EXPOSE 8000

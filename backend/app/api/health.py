@@ -7,21 +7,18 @@
 """
 
 import logging
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, wait
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Request, Response, status
 from pydantic import BaseModel
 
-from app.db.session import check_database
-from app.queue.broker import check_broker
+from app.services.health import DependencyCheck, broker_check, database_check
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/health", tags=["health"])
 
 CheckResult = Literal["ok", "unavailable"]
-DependencyCheck = Callable[[], None]
 
 
 def create_check_executor() -> ThreadPoolExecutor:
@@ -47,13 +44,11 @@ class ReadyResponse(BaseModel):
 # Dependency providers. Tests replace these with fakes via app.dependency_overrides
 # (similar to stubbing a module in Jest).
 def get_database_check(request: Request) -> DependencyCheck:
-    engine = request.app.state.db_engine
-    return lambda: check_database(engine)
+    return database_check(request.app.state.db_engine)
 
 
 def get_broker_check(request: Request) -> DependencyCheck:
-    client = request.app.state.broker_client
-    return lambda: check_broker(client)
+    return broker_check(request.app.state.broker_client)
 
 
 def get_check_timeout(request: Request) -> float:

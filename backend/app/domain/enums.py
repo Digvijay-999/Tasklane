@@ -37,6 +37,19 @@ class UploadStatus(StrEnum):
     DELETED = "deleted"  # file removed by retention; the row stays because jobs reference it
 
 
+class UploadRejectionReason(StrEnum):
+    """Why an upload ended up `rejected` (stored on the row for auditing and cleanup)."""
+
+    TOO_LARGE = "too_large"
+    SIGNATURE_MISMATCH = "signature_mismatch"
+    EMPTY_FILE = "empty_file"
+    CLIENT_DISCONNECTED = "client_disconnected"
+    INTERNAL_ERROR = "internal_error"
+    # Cut off by request cancellation (e.g. server shutdown); the Phase 12 cleanup will also use it
+    # for uploads left 'receiving' by a crash.
+    INTERRUPTED = "interrupted"
+
+
 class AttemptTrigger(StrEnum):
     """Why an attempt was started."""
 
@@ -70,6 +83,10 @@ class EventType(StrEnum):
     JOB_CREATED = "job.created"
     JOB_STATUS_CHANGED = "job.status_changed"
     JOB_CANCEL_SUPERSEDED = "job.cancel_superseded"
+    ATTEMPT_STARTED = "attempt.started"
+    STAGE_STARTED = "stage.started"
+    STAGE_PROGRESS = "stage.progress"
+    STAGE_COMPLETED = "stage.completed"
 
 
 class ErrorClass(StrEnum):
@@ -78,3 +95,5 @@ class ErrorClass(StrEnum):
     INVALID_INPUT = "invalid_input"
     UNSUPPORTED_INPUT = "unsupported_input"
     LEASE_EXPIRED = "lease_expired"
+    # An unexpected exception in a stage. Until Phase 5 classifies errors, these fail the job.
+    INTERNAL_ERROR = "internal_error"

@@ -463,3 +463,35 @@ def test_claim_loses_to_cancel_and_the_worker_drops_the_message(engine):
         job = check.get(Job, job_id)
         assert job.status == S.CANCELLED
         assert job.started_at is None  # the job never ran
+
+
+# --- only_if_retry_due (Phase 4 claim guard) ------------------------------------------------------
+
+
+def test_retry_due_guard_allows_a_due_retry(session):
+    job = make_job(session, status=S.RETRY_WAIT, retry_at=utcnow() - timedelta(seconds=1))
+    session.commit()
+    result = transition_job(
+        session, job.id, from_status=S.RETRY_WAIT, to_status=S.RUNNING, only_if_retry_due=True
+    )
+    session.commit()
+    assert result.applied
+    assert job.retry_at is None  # cleared on leaving retry_wait
+
+
+def test_retry_due_guard_refuses_an_early_retry(session):
+    job = make_job(session, status=S.RETRY_WAIT, retry_at=utcnow() + timedelta(minutes=5))
+    session.commit()
+    result = transition_job(
+        session, job.id, from_status=S.RETRY_WAIT, to_status=S.RUNNING, only_if_retry_due=True
+    )
+    assert result == TransitionResult(applied=False, status=S.RETRY_WAIT)
+    assert _events(session, job.id) == []
+
+
+def test_retry_due_guard_only_applies_to_retry_wait(session):
+    job = make_job(session)
+    with pytest.raises(ValueError, match="retry_wait"):
+        transition_job(
+            session, job.id, from_status=S.QUEUED, to_status=S.RUNNING, only_if_retry_due=True
+        )

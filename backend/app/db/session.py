@@ -24,7 +24,13 @@ def build_database_url(settings: Settings) -> URL:
     )
 
 
-def create_db_engine(settings: Settings) -> Engine:
+def create_db_engine(
+    settings: Settings,
+    *,
+    pool_size: int = 5,
+    max_overflow: int = 5,
+    application_name: str = APPLICATION_NAME,
+) -> Engine:
     """Create the engine. No connection is opened until the first query."""
     return create_engine(
         build_database_url(settings),
@@ -33,14 +39,14 @@ def create_db_engine(settings: Settings) -> Engine:
         # the other pooled connections from before the restart, and opens a fresh one. This is
         # what lets the API recover after Postgres restarts without restarting the API itself.
         pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=5,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
         pool_timeout=10,  # max seconds to wait for a free pooled connection
         connect_args={
             # Fail fast instead of hanging when Postgres is unreachable (libpq: whole seconds).
             "connect_timeout": settings.dependency_timeout_seconds,
             # Shows up in pg_stat_activity, which makes our connections easy to identify.
-            "application_name": APPLICATION_NAME,
+            "application_name": application_name,
             # connect_timeout only covers *opening* a connection. If an open connection silently
             # stops responding (network drop, no reset), these TCP settings make the OS give up
             # within ~30-60 s instead of the default of many minutes.

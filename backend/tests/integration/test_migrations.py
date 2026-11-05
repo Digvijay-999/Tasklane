@@ -17,6 +17,7 @@ from app.domain.enums import (
     JobStatus,
     OutboxTask,
     UploadKind,
+    UploadRejectionReason,
     UploadStatus,
     WorkflowType,
 )
@@ -163,6 +164,7 @@ def test_check_constraint_names_match_models(migrated_engine):
 ENUM_CONSTRAINTS = {
     "ck_uploads_kind": UploadKind,
     "ck_uploads_status": UploadStatus,
+    "ck_uploads_rejection_reason": UploadRejectionReason,
     "ck_jobs_status": JobStatus,
     "ck_jobs_workflow_type": WorkflowType,
     "ck_jobs_finished_iff_terminal": TERMINAL_STATUSES,

@@ -18,12 +18,17 @@ The full product brief is in `PROJECT_BRIEF.md`; the planned design is in `docs/
 1. **Implement only the phase I ask for.** Never start the next phase on your own.
 2. **Plan first.** Before writing code for a phase, show a short plan and wait for my approval.
 3. **Explain important design decisions** in plain language suitable for a beginner.
-4. **Preserve module boundaries** between `api`, `domain`, `db`, `queue`, `workflows`,
-   `providers`, `observability`, and `frontend`:
-   - `domain` holds pure logic (state machine, error classes, rules) and imports no framework,
-     database, or queue code.
-   - `api` handles HTTP only and calls into services; it never talks to Celery directly.
-   - `db` owns SQLAlchemy models, sessions, and repositories.
+4. **Preserve module boundaries** between `api`, `services`, `domain`, `db`, `storage`, `queue`,
+   `workflows`, `providers`, `observability`, and `frontend`:
+   - `domain` holds pure logic (state machine, error classes, rules) and imports only the
+     standard library and other `domain` modules (a test enforces this).
+   - `api` handles HTTP only (parse input, call a service, shape the response, map error codes to
+     status codes); it never talks to Celery directly.
+   - `services` coordinates `db`, `storage`, and `domain` for each use case and owns transactions.
+     It knows nothing about HTTP: it raises `ServiceError` with a stable code.
+   - `db` owns SQLAlchemy models, sessions, and repositories (SQL only; never commits).
+   - `storage` owns files on disk: generated paths, temporary writes, atomic renames, deletes.
+     No database or HTTP code.
    - `queue` owns Celery app setup, the outbox dispatcher, and task entry points.
    - `workflows` owns stage logic; it receives a provider and storage, not HTTP or Celery objects.
    - `providers` owns the summarizer interface and its implementations (stub, optional LLM).
@@ -59,7 +64,8 @@ The full product brief is in `PROJECT_BRIEF.md`; the planned design is in `docs/
 - **Dependency checks run concurrently with a hard deadline** (`DEPENDENCY_TIMEOUT_SECONDS`,
   default 2). Driver timeouts alone don't cover DNS, which is slow for stopped Docker containers.
 - **`pool_pre_ping=True`** on the SQLAlchemy engine replaces dead connections after a Postgres restart.
-- **Redis Python client stays on 5.2.x**: Celery 5.5's kombu caps it at 5.2.1.
+- ~~Redis Python client stays on 5.2.x~~ (superseded in Phase 4: Celery 5.6 / kombu 5.6 allow
+  Redis client 6.4).
 - **Dev live reload** bind-mounts `backend/app` and `backend/tests` into the container and runs
   `uvicorn --reload` with `WATCHFILES_FORCE_POLLING=true`. Without polling, edits made on
   Windows were not detected.
@@ -99,16 +105,147 @@ The full product brief is in `PROJECT_BRIEF.md`; the planned design is in `docs/
 - **Integration tests use `<POSTGRES_DB>_test`** (recreated per run, guarded against the dev DB)
   and truncate all tables before each test.
 
+## Decisions made (Phase 3)
+
+- **Uploads are the raw request body** plus `?filename=` (display only, never in a path), not
+  multipart, so size and signature are checked while streaming. Required `Content-Type` per kind.
+- **Upload flow:** commit a `receiving` row first, stream to `uploads/.incoming/{id}.part`
+  (hashing and counting bytes), fsync, `os.replace` into `uploads/{id}/source.{pdf|zip}`, mark
+  `ready`. Any failure deletes the files and marks `rejected` with a `rejection_reason`.
+  Interrupted-upload cleanup is deferred to Phase 12.
+- **Limits:** PDF 50 MiB, ZIP 100 MiB (enforced on bytes received; Content-Length only fails
+  fast), upload TTL 24 h, JSON bodies 64 KiB, page size 20 (max 100).
+- **Only the signature is checked for ZIPs now**; contents are Phase 6, PDF structure Phase 5.
+- **Idempotency-Key** `^[A-Za-z0-9._:-]{16,128}$`, global scope, lives as long as the job row.
+  The request hash covers only fields the client sent (no defaults); stored options include
+  defaults. Explicit-default vs omitted fields are different requests (documented).
+- **Job creation:** key lookup (replay shortcut, skips upload validation) → upload `FOR SHARE` →
+  `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING` → event + outbox, one transaction.
+  201 + `Location` / 200 + `Idempotent-Replayed: true` / 409. One upload may feed many jobs.
+- **Listing** uses keyset pagination on `(created_at, id)` DESC with opaque cursors bound to the
+  filters; indexes in migration 0002.
+- **Errors:** one shape `{"error": {code, message, details, request_id}}`; services raise
+  `ServiceError`, `api/errors.py` maps codes to status. Unexpected errors → 500/503 generic.
+- **Boundaries are tested** (`tests/unit/test_boundaries.py`): `api` never imports `db` or
+  `storage` (health checks go through `services/health.py`); `services` never imports
+  FastAPI/Starlette; `storage` imports no database or HTTP code. Shared pure values such as
+  `JobListPosition` live in `domain`.
+- **Storage** is the named Docker volume `storage` at `/data/storage`;
+  `docker compose down -v` deletes it.
+- **Windows docs:** examples use `curl.exe`, `--data-binary "@file"`, and JSON written to a file
+  (PowerShell 5.1 strips quotes from inline JSON).
+
+## Decisions made (Phase 4)
+
+- **Celery 5.6.3, kombu `>=5.6.2,<5.7` (5.6.2), Redis client 6.4.0.** Celery 5.6 sets no upper
+  bound on kombu; we stay on the kombu line it shipped with. Phase 1 health tests stayed green.
+- **Dispatcher** (`app/queue/dispatcher.py`, `python -m app.queue.dispatcher`): one pass = one
+  transaction: `SELECT ... WHERE published_at IS NULL AND available_at <= now() ORDER BY
+  available_at, id LIMIT 50 FOR UPDATE SKIP LOCKED`, publish while holding the locks, mark
+  published, commit. Polls every 1 s (immediately again after a full batch). **No
+  LISTEN/NOTIFY** (polling is needed anyway for delayed retries).
+- **Redis down:** the failed row and the rest of the batch get `dispatch_attempts + 1`, the error
+  *type*, and `available_at = clock_timestamp() + backoff` (1 s doubling to 60 s, never gives up);
+  the loop backs off too. Only the dispatcher's Celery app skips kombu's connection retries
+  (`for_publishing=True`); a failed publish can still take a few seconds (DNS for a stopped
+  container). Workers reconnect forever (`broker_connection_max_retries=None`) and don't cancel
+  running tasks on a Redis disconnect.
+- **Celery settings:** JSON only, no result backend, `task_acks_late`, `task_reject_on_worker_lost`,
+  prefetch 1, visibility timeout 900 s (must exceed the lease; validated in Settings), hard task
+  limit 3600 s, `worker_hijack_root_logger=False`, never eager. Tests use Redis DB 15 and queue
+  `tasklane-test`.
+- **Claim** (`services/execution.py`, one transaction): read the job `FOR UPDATE`, then
+  `queued`/`retry_wait` -> `running` via `transition_job` (from `retry_wait` only if
+  `retry_at <= now()`: `only_if_retry_due`), `attempt_count + 1`, attempt row with a 60 s lease,
+  `attempt.started`. Anything else is a duplicate or stale message: **dropped with no writes**,
+  logged as `message dropped` with a reason.
+- **Database outage in a task:** `run_job` catches DB-connectivity errors and calls
+  `task.retry(countdown=backoff, max_retries=None)`, because with late acks a raising task is still
+  acked (the message would be lost and the job stuck `queued`). Safe either way: a retry after a
+  committed claim is a dropped duplicate. Other exceptions escaping `run()` are acked (logged).
+- **Worker identity** `worker@<hostname>:<pid>`. Each worker process creates its own engine on first
+  use and rebuilds it if it finds itself in a forked child (`queue/worker_process.py`).
+- **Progress = lease renewal + fencing:** every progress report renews the lease
+  (`UPDATE ... WHERE id = :attempt AND ended_at IS NULL`); if that matches nothing the worker stops
+  without writing (`RunOutcome.FENCED`).
+- **Phase 4 failure handling:** any exception in a stage fails the job permanently with
+  `error_class = internal_error` and a safe summary (traceback only in logs). No retries yet.
+- **Placeholder workflow:** every workflow type runs one `dummy` stage (`DUMMY_STAGE_SECONDS`,
+  default 3, five progress steps) until Phases 5-6.
+- **Compose:** `dispatcher` and `worker` services, Redis with append-only persistence on the
+  `redisdata` volume (`docker compose down -v` also deletes queued messages).
+- **Dev reload runner** (`backend/devtools/reload.py`), not the `watchfiles` CLI: watchfiles 1.3.0
+  kills its child 5 s after receiving SIGTERM regardless of `--sigint-timeout`, which cut off
+  running jobs on every `docker compose stop`. The runner forwards SIGTERM (Celery warm shutdown),
+  waits `--grace` (worker 25 s < `stop_grace_period` 30 s), restarts on `.py` changes, and exits
+  when its child exits so the restart policy applies. Verified: a 10 s job finishes on stop.
+- **Boundaries:** `workflows` imports no Celery/HTTP/database code; `services` never imports
+  Celery or the Celery modules of `queue` (only `app.queue.broker`, a Redis ping); `api` never
+  imports `queue`.
+
+## Carry-forward requirements
+
+Items later phases must address. Remove an item only when it is implemented and tested.
+
+- **Phase 5 — leases during long stages:** any stage that can run longer than the lease
+  (`LEASE_SECONDS`, 60 s) without reporting progress must not let its lease silently expire. Stages
+  must call `report_progress` well within the lease (e.g. per page or chunk), and single slow
+  calls (e.g. a provider request) need timeouts shorter than the lease. *Until Phase 7*, nothing
+  acts on an expired lease, so expiry has no effect yet; it starts to matter as soon as recovery
+  exists.
+- **Phase 5 — error classification:** replace the Phase 4 "any exception fails permanently"
+  stopgap with transient vs permanent errors, `retry_wait` + delayed outbox rows, and the attempt
+  budget.
+- **Phase 5 — retry timing:** a retry's outbox `available_at` must be >= the job's `retry_at`,
+  both computed from the same database clock in the same transaction (e.g. `now() + interval`),
+  never Python time. Otherwise the one legitimate retry message can be dropped as
+  `retry_not_due` and the job stalls in `retry_wait`.
+- **Phase 5 — attempt budget at claim:** the claim relies on the invariant
+  `attempt_count < max_attempts` for claimable jobs (the DB CHECK would reject a violation). Keep
+  it true in every path that moves a job to `queued`/`retry_wait`.
+- **Phase 5 — transient database errors inside a running stage** (in `report_progress`, deadlock
+  aborts) currently fail the job permanently; classify them as transient.
+- **Phase 5 — e2e storage:** e2e worker processes get `STORAGE_ROOT` from the test settings; keep
+  it that way when workers start reading uploads.
+- **Phase 5 — artifact download route** (`GET /v1/jobs/{id}/artifacts/{artifact_id}`), when
+  artifacts first exist.
+- **Phase 7 — heartbeats independent of progress updates** (a background heartbeat for stages
+  that can't report progress often enough).
+- **Phase 7 — lost messages:** recovery must detect claimable jobs (`queued`, or `retry_wait`
+  past its `retry_at`) with **no open attempt** and **no unpublished outbox row**, older than a
+  threshold, and re-queue them through the outbox. Causes: Redis losing a message, a manually
+  retried job whose message was lost, and a task that hit a non-database error before its claim
+  committed (the message is acked).
+- **Phase 7 — dead workers:** jobs left `running` by a worker killed mid-stage, or by the hard task
+  time limit, are recovered via lease expiry (close the attempt as `lease_expired`, then
+  `retry_wait` or `failed` per the state machine).
+- **Phase 7 — lock order:** the claim locks job then attempt; progress and finishing lock
+  attempt then job. Recovery must lock attempt then job (or detect and retry deadlock aborts), or
+  it can turn a live worker's progress write into a failure.
+- **Phase 8 — event order:** order and replay events by `seq` only, never `created_at` (`now()`
+  is the transaction start time).
+- **Phase 9 — queue health:** surface dispatch failures (`dispatch_attempts`,
+  `last_dispatch_error`) and the oldest queued job's age.
+- **Phase 10/11 — log redaction:** worker failure logs include the full exception text (by
+  design: details stay out of the database). Add redaction before real providers and API keys
+  are involved.
+- **Phase 12 — uploads:** clean up interrupted uploads (`receiving` rows and their files), and make
+  retention never delete files of uploads referenced by unfinished jobs.
+- **Dev note:** restarting the worker (including by live reload after a code change) interrupts
+  running jobs; they stay `running` until Phase 7 recovery.
+
 ## Commands
 
 ```powershell
 docker compose up --build -d                 # start; rebuild after dependency or alembic.ini changes
-docker compose run --rm api pytest           # all tests (unit + integration)
-docker compose run --rm api ruff check app tests migrations
-docker compose run --rm api ruff format app tests migrations
+docker compose run --rm api pytest           # all tests (unit + integration + e2e)
+docker compose run --rm api pytest -m "not e2e"   # skip the slower end-to-end tests
+docker compose logs -f worker dispatcher     # watch jobs being published and run
+docker compose run --rm api ruff check app tests migrations devtools
+docker compose run --rm api ruff format app tests migrations devtools
 docker compose run --rm migrate              # apply migrations
 docker compose run --rm migrate alembic check   # do models and database agree?
-docker compose run --rm api alembic revision --autogenerate --rev-id 0002 -m "describe change"
+docker compose run --rm api alembic revision --autogenerate --rev-id 0003 -m "describe change"
 ```
 
 Regenerate `backend/uv.lock` after editing dependencies (runs uv in a throwaway container):
@@ -123,9 +260,9 @@ docker run --rm -v "${PWD}\backend:/src" -w /src python:3.13.18-slim sh -c "pip 
 |---|---|---|
 | 0 | Planning: architecture, versions, working rules | **Done** |
 | 1 | Compose + FastAPI skeleton + health routes | **Done** |
-| 2 | Migrations + state machine | **Done** (awaiting developer verification) |
-| 3 | Upload and job APIs with idempotency and outbox | Not started |
-| 4 | Dispatcher + Celery worker with one dummy stage | Not started |
+| 2 | Migrations + state machine | **Done** |
+| 3 | Upload and job APIs with idempotency and outbox | **Done** |
+| 4 | Dispatcher + Celery worker with one dummy stage | **Done** (awaiting developer verification) |
 | 5 | PDF workflow + retries | Not started |
 | 6 | ZIP workflow + security | Not started |
 | 7 | Leases, recovery, cancellation, manual retry | Not started |

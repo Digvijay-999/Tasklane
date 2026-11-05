@@ -11,9 +11,11 @@ dependencies = [
     "pydantic-settings>=2.16.2,<3",
     "sqlalchemy>=2.0.55,<2.1",
     "psycopg[binary]>=3.3.6,<3.4",
-    # Kept on 5.2.x because Celery 5.5 (Phase 4) caps the Redis client at 5.2.1.
-    "redis>=5.2.1,<5.3",
+    "redis>=6.4.0,<6.5",                  # kombu 5.6 allows the Redis client up to <6.5
     "alembic>=1.20,<2",                   # database migrations (like knex/Prisma migrate)
+    "celery[redis]>=5.6.3,<5.7",          # task queue (like BullMQ); Redis is the broker
+    # Celery 5.6 sets no upper bound on kombu; stay on the 5.6 line it was released with.
+    "kombu>=5.6.2,<5.7",
 ]
 
 [dependency-groups]
@@ -29,6 +31,7 @@ pythonpath = ["."]
 addopts = ["--import-mode=importlib", "-p", "no:cacheprovider"]
 markers = [
     "integration: needs the real PostgreSQL and Redis containers from compose.yaml",
+    "e2e: starts real worker and dispatcher processes (slower); skip with -m 'not e2e'",
 ]
 
 [tool.ruff]

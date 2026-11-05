@@ -1,0 +1,325 @@
+# Tasklane HTTP API
+
+> **Status (Phase 4):** the routes marked **implemented** below work. Created jobs are picked up
+> by the dispatcher and a worker and run to `succeeded`, but every job currently runs a single
+> placeholder stage (`dummy`) instead of real PDF/ZIP processing (Phases 5–6). Routes marked
+> **planned** don't exist yet.
+
+| Route | Status |
+|---|---|
+| `GET /health/live`, `GET /health/ready` | implemented (Phase 1) |
+| `POST /v1/uploads` | implemented |
+| `POST /v1/jobs` | implemented |
+| `GET /v1/jobs` | implemented |
+| `GET /v1/jobs/{job_id}` | implemented |
+| `POST /v1/jobs/{job_id}/cancel`, `POST /v1/jobs/{job_id}/retry` | planned (Phase 7) |
+| `GET /v1/jobs/{job_id}/events` (SSE) | planned (Phase 8) |
+| Artifact download | planned (Phase 5) |
+| `GET /metrics` | planned (Phase 10) |
+
+Interactive docs generated from the code: http://127.0.0.1:8000/docs
+
+## Conventions
+
+- Base URL for local development: `http://127.0.0.1:8000`. Versioned routes live under `/v1`.
+- Request and response bodies are JSON, except the upload body, which is the raw file.
+- Timestamps are ISO 8601 in UTC (`2026-11-03T12:30:45.123456Z`). IDs are UUIDs.
+- Every response carries an `X-Request-ID` header. Send your own (letters, digits, `.`, `_`,
+  `-`, up to 64 characters) to correlate with your logs; otherwise the server generates one.
+- JSON request bodies are limited to 64 KiB (`MAX_JSON_BODY_BYTES`); larger ones get
+  `413 request_too_large`.
+
+### PowerShell examples
+
+The examples are for **Windows PowerShell** and call **`curl.exe`** explicitly (plain `curl` in
+PowerShell 5.1 is an alias for `Invoke-WebRequest`, which takes different arguments). They assume:
+
+```powershell
+$api = "http://127.0.0.1:8000"
+```
+
+JSON bodies are written to a file first and sent with `--data-binary "@file.json"`: Windows
+PowerShell 5.1 strips the double quotes out of JSON passed inline to native programs, so inline
+`-d '{"a":1}'` arrives broken. Run the commands from the folder that holds the files.
+
+## Errors
+
+Every error, on every route, has this shape:
+
+```json
+{
+  "error": {
+    "code": "upload_too_large",
+    "message": "The file exceeds the 50 MB limit for PDF uploads.",
+    "details": {"limit_bytes": 52428800},
+    "request_id": "3f2a9c0e5b7d4e1f8a6b2c3d4e5f6a7b"
+  }
+}
+```
+
+- `code` is stable and meant for programs; `message` is safe to show to people.
+- `details` holds extra structured information (may be empty).
+- `request_id` equals the `X-Request-ID` header; the server logs use the same id.
+- Messages never include internal details (stack traces, SQL, file paths, submitted values).
+
+| Status | `code` | When |
+|---|---|---|
+| 400 | `idempotency_key_missing` | `POST /v1/jobs` without an `Idempotency-Key` header |
+| 400 | `idempotency_key_invalid` | The key doesn't match the required format |
+| 400 | `invalid_cursor` | A malformed cursor, or one reused with different filters |
+| 400 | `empty_file` | The upload body is empty |
+| 400 | `upload_interrupted` | The client disconnected mid-upload |
+| 400 | `malformed_body` | The request body couldn't be read or parsed at all |
+| 404 | `job_not_found` | No job with that id (also for ids that aren't UUIDs) |
+| 404 | `not_found` | No route matches the URL |
+| 405 | `method_not_allowed` | Wrong HTTP method for the URL |
+| 409 | `idempotency_key_reused` | The key was used before with a *different* request |
+| 413 | `upload_too_large` | The file exceeds the limit for its type |
+| 413 | `request_too_large` | A JSON body exceeds 64 KiB |
+| 415 | `unsupported_file_type` | The filename doesn't end in `.pdf` or `.zip` |
+| 415 | `content_type_mismatch` | The `Content-Type` header doesn't fit the file type |
+| 415 | `file_signature_mismatch` | The file's first bytes don't match its type |
+| 422 | `invalid_request` | Request validation failed (including invalid JSON); `details.fields` lists each problem |
+| 422 | `invalid_filename` | The filename is empty, too long, or has control characters, line breaks, or invisible text-direction characters |
+| 422 | `upload_not_found` | `upload_id` doesn't exist |
+| 422 | `upload_not_ready` | The upload isn't `ready` (`details.upload_status` says why) |
+| 422 | `upload_expired` | The upload is past its `expires_at` |
+| 422 | `upload_kind_mismatch` | e.g. a ZIP upload for `pdf_ingest` |
+| 500 | `internal_error` | An unexpected server error (details are only in the logs) |
+| 503 | `service_unavailable` | The database can't be reached, or all its connections are busy |
+
+`invalid_request` details look like:
+`{"fields": [{"location": "query", "field": "limit", "issue": "Input should be less than or equal to 100"}]}`.
+The submitted value isn't echoed back: messages from the validator that would quote part of the
+input (for example for an invalid UUID) are replaced with fixed text.
+
+## Uploads
+
+### `POST /v1/uploads` — implemented
+
+Uploads a PDF or ZIP. The request body is the **raw file**, not a multipart form, so the server
+can check the size and file signature while the bytes arrive.
+
+| Part | Value |
+|---|---|
+| Query `filename` | Required. The original filename, **for display only**: it is never used in a storage path. Must end in `.pdf` or `.zip` (any case), 1–255 characters, with no control characters, line breaks, or invisible text-direction characters (which could make `x\u202Egpj.pdf` display as `xfdp.jpg`). |
+| Header `Content-Type` | Required. PDF: `application/pdf`. ZIP: `application/zip`, `application/x-zip-compressed`, or `application/octet-stream`. |
+| Body | The file bytes. |
+
+```powershell
+curl.exe -s -X POST "$api/v1/uploads?filename=report.pdf" -H "Content-Type: application/pdf" --data-binary "@report.pdf"
+curl.exe -s -X POST "$api/v1/uploads?filename=repo.zip" -H "Content-Type: application/zip" --data-binary "@repo.zip"
+```
+
+Use `--data-binary "@file"`. Plain `-d @file` strips newlines and corrupts binary files, and without
+`-H "Content-Type: ..."` curl sends `application/x-www-form-urlencoded`, which is rejected with
+`415 content_type_mismatch`.
+
+**`201 Created`:**
+
+```json
+{
+  "id": "9cb43d9b-5d6d-4963-b5f1-c1f7dc29646e",
+  "original_filename": "report.pdf",
+  "kind": "pdf",
+  "content_type": "application/pdf",
+  "size_bytes": 18234,
+  "sha256": "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad",
+  "status": "ready",
+  "created_at": "2026-11-03T12:00:00.000000Z",
+  "expires_at": "2026-11-04T12:00:00.000000Z"
+}
+```
+
+`content_type` is the type proven by the file signature, not the one you declared.
+
+**What is checked now:**
+
+1. The filename's extension and the declared `Content-Type` (before any body is read).
+2. Size: PDF up to **50 MiB** (`MAX_PDF_UPLOAD_BYTES`), ZIP up to **100 MiB**
+   (`MAX_ZIP_UPLOAD_BYTES`). The limit is enforced on the bytes actually received, so a missing or
+   wrong `Content-Length` can't bypass it. A `Content-Length` that already exceeds the limit is
+   rejected immediately, before anything is stored.
+3. The file signature: a PDF must start with `%PDF-`; a ZIP must start with `PK\x03\x04` (empty
+   or split archives are rejected). A mismatch is detected from the first bytes and the server
+   stops reading.
+4. The file isn't empty. Its SHA-256 is computed while streaming.
+
+**Not checked yet:** ZIP contents (path traversal, symlinks, decompression bombs, file counts,
+nested archives) are checked in Phase 6, when ZIPs are first opened. PDF structure, encryption,
+and scanned PDFs are checked in Phase 5. Until then, an accepted ZIP is only known to *start* like
+a ZIP.
+
+**Lifecycle (`status`):**
+
+| Status | Meaning |
+|---|---|
+| `receiving` | The row is created (and committed) before the body is read. The file streams into a temporary path. |
+| `ready` | The whole file arrived, passed the checks, and was renamed atomically into its final path. Only `ready` uploads can be used for jobs. |
+| `rejected` | A check failed or the upload was interrupted. Its files are deleted; `rejection_reason` records why (`too_large`, `signature_mismatch`, `empty_file`, `client_disconnected`, `internal_error`). |
+| `deleted` | (Phase 12) The file was removed by retention cleanup; the row stays because jobs reference it. |
+
+If the server **crashes mid-upload**, the row stays `receiving` and a partial file may remain. Such
+an upload can never be used for a job. Cleanup of these leftovers comes with retention in
+Phase 12.
+
+Uploads expire after **24 hours** (`UPLOAD_TTL_HOURS`): after that they can't be used for *new*
+jobs. Identical files uploaded twice are two separate uploads.
+
+**Where files are stored:** in the `storage` Docker volume, at
+`uploads/{upload_id}/source.pdf` (or `.zip`). The original filename is never part of a path.
+To look at them:
+
+```powershell
+docker compose exec api find /data/storage -type f
+docker compose cp "api:/data/storage/uploads/<upload_id>/source.pdf" .\copy.pdf
+```
+
+`docker compose down -v` deletes this volume, and with it every uploaded file (and the database).
+Plain `docker compose down` keeps both.
+
+## Jobs
+
+### `POST /v1/jobs` — implemented
+
+Creates a job for an upload. The job is written together with its first event (`job.created`) and
+an outbox message in **one transaction**: either all three exist or none do. The job is returned
+`queued`; within about a second the dispatcher publishes it and a worker picks it up (follow it
+with `GET /v1/jobs/{job_id}`). If Redis is down, it stays `queued` until Redis is back.
+
+**Headers:** `Content-Type: application/json` and **`Idempotency-Key`** (required).
+
+**Body:**
+
+| Field | Required | Notes |
+|---|---|---|
+| `workflow_type` | yes | `pdf_ingest` (needs a PDF upload) or `repo_index` (needs a ZIP upload) |
+| `upload_id` | yes | A `ready`, unexpired upload of the matching kind |
+| `options` | no | Workflow-specific options. **None are defined yet**, so it must be `{}` if sent. Unknown fields are rejected. |
+
+```powershell
+$upload = curl.exe -s -X POST "$api/v1/uploads?filename=report.pdf" -H "Content-Type: application/pdf" --data-binary "@report.pdf" | ConvertFrom-Json
+@{ workflow_type = "pdf_ingest"; upload_id = $upload.id } | ConvertTo-Json -Compress | Set-Content -Encoding ascii job.json
+$key = "demo-" + [guid]::NewGuid()
+curl.exe -i -X POST "$api/v1/jobs" -H "Content-Type: application/json" -H "Idempotency-Key: $key" --data-binary "@job.json"
+```
+
+**Responses:**
+
+| Status | Headers | Meaning |
+|---|---|---|
+| `201 Created` | `Location: /v1/jobs/{id}`, `Idempotent-Replayed: false` | A new job was created |
+| `200 OK` | `Idempotent-Replayed: true` | Replay: this key was already used for the *same* request; the existing job is returned (in its current state) and nothing new is written |
+| `409 Conflict` | | `idempotency_key_reused`: the key was used for a *different* request; `details.job_id` names the existing job |
+
+Both `201` and `200` return the job (see [Job object](#job-object)).
+
+#### Idempotency keys
+
+Send a fresh `Idempotency-Key` for each new job, and **the same key when retrying** a request
+whose response you didn't get (timeout, dropped connection). The retry returns the original job
+instead of creating a second one.
+
+- **Format:** 16–128 characters of letters, digits, and `.` `_` `:` `-`. A UUID works well.
+  Missing → `400 idempotency_key_missing`; malformed → `400 idempotency_key_invalid`.
+- **Scope:** one key space for the whole (single-user) service.
+- **Retention:** a key lives **as long as its job row**. There is no separate expiry; when
+  retention cleanup (Phase 12) deletes a job, its key becomes usable again.
+- A request rejected by validation (e.g. `422 upload_not_found`) **doesn't use up** its key: fix
+  the request and retry with the same key.
+- A replay doesn't re-check the upload, so retrying returns the original job even if the upload
+  has expired since.
+- **Concurrent requests** with the same key are safe: the database's unique index on the key
+  decides the winner (`INSERT ... ON CONFLICT DO NOTHING`), the others wait for it and then get
+  the replay (or `409`). Exactly one job is created.
+
+#### How "same request" is decided
+
+The server fingerprints the request with SHA-256 over a canonical JSON form of **the fields you
+actually sent**:
+
+- Key order and whitespace don't matter; UUIDs are compared case-insensitively.
+- Defaults are **not** filled in before hashing, so if a future version adds an option with a
+  default, replays of older requests still match.
+- Consequence: **sending a field explicitly with its default value and omitting it count as
+  different requests.** For example, `{"workflow_type": "pdf_ingest", "upload_id": "..."}` and the
+  same body plus `"options": {}` are different; reusing one's key for the other gets `409`.
+- The job itself stores the *resolved* options, with defaults filled in.
+
+#### Using one upload for several jobs
+
+Allowed. Uploads are immutable inputs, so the same file can be processed again (for example
+after a failure, or later with different options). Duplicate *submissions* are prevented by the
+idempotency key, not by the upload.
+
+### `GET /v1/jobs` — implemented
+
+Lists jobs, **newest first**, with cursor pagination.
+
+| Query | Notes |
+|---|---|
+| `status` | Optional, repeatable: `queued`, `running`, `retry_wait`, `cancel_requested`, `succeeded`, `failed`, `cancelled` |
+| `workflow_type` | Optional, repeatable: `pdf_ingest`, `repo_index` |
+| `limit` | 1–100, default 20 |
+| `cursor` | The `next_cursor` from the previous page |
+
+```powershell
+curl.exe -s "$api/v1/jobs?limit=5"
+curl.exe -s "$api/v1/jobs?status=queued&status=failed&workflow_type=pdf_ingest"
+$page = curl.exe -s "$api/v1/jobs?limit=2" | ConvertFrom-Json
+curl.exe -s "$api/v1/jobs?limit=2&cursor=$($page.next_cursor)"
+```
+
+**Response:** `{"items": [<job>, ...], "next_cursor": "..." | null}`. `next_cursor` is `null` on
+the last page.
+
+**Why a cursor instead of page numbers:** with `?page=2` (offset paging), every job created
+between your requests pushes rows down a page, so you'd see some jobs twice and miss others, and
+the database has to read and discard every skipped row. A cursor means "continue after this
+job": it stays correct while new jobs arrive, and an index jumps straight to it. Jobs are ordered
+by `created_at`, then `id` to break ties.
+
+The cursor is opaque. It is tied to the filters it was created with: reusing it with different
+`status`/`workflow_type` filters, or sending a damaged one, returns `400 invalid_cursor`. There is
+no total count.
+
+### `GET /v1/jobs/{job_id}` — implemented
+
+```powershell
+curl.exe -s "$api/v1/jobs/<job_id>"
+```
+
+Returns the [job object](#job-object) plus:
+
+- `upload`: `id`, `original_filename`, `kind`, `size_bytes`, `sha256`, `status`.
+- `attempts`: one entry per execution attempt (`attempt_no`, `trigger`, `worker_id`, `task_id`,
+  `started_at`, `heartbeat_at`, `lease_expires_at`, `ended_at`, `outcome`, `error_class`,
+  `error_summary`). Filled in once a worker claims the job.
+- `artifacts`: output metadata (`id`, `artifact_type`, `attempt_no`, `filename`, `size_bytes`,
+  `content_type`, `sha256`, `created_at`). No download link yet. **Empty until workflows produce
+  outputs (Phase 5).**
+
+An unknown id, or one that isn't a UUID, returns `404 job_not_found`.
+
+### Job object
+
+| Field | Notes |
+|---|---|
+| `id`, `workflow_type`, `status`, `upload_id`, `input_sha256` | `input_sha256` is the upload's hash at submission |
+| `current_stage`, `progress_percent` | Set by the worker as stages run (Phase 4: `dummy`, 0–100 in steps of 20) |
+| `options` | Resolved options, defaults included |
+| `attempt_count`, `max_attempts`, `manual_retry_count` | The retry budget is 3 automatic attempts |
+| `retry_at` | When a `retry_wait` job runs again |
+| `cancel_requested_at` | When cancellation was requested |
+| `error_class`, `error_summary` | Safe description of the latest failure |
+| `last_event_seq` | Number of the job's latest event (SSE in Phase 8 replays from here) |
+| `created_at`, `updated_at`, `started_at`, `finished_at` | |
+
+## Health
+
+```powershell
+curl.exe -s "$api/health/live"
+curl.exe -s "$api/health/ready"
+```
+
+See [architecture.md](architecture.md#health-semantics-implemented-in-phase-1).

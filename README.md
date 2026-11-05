@@ -5,12 +5,13 @@ processing jobs (PDF ingestion and repository ZIP indexing), with a focus on dur
 retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the goals and
 [docs/architecture.md](docs/architecture.md) for the planned design.
 
-## Current status: Phase 2 of 12
+## Current status: Phase 4 of 12
 
 **What works today:**
 
-- A Docker Compose stack with PostgreSQL 17, Redis 7.4, and a FastAPI service. All ports are bound
-  to `127.0.0.1`.
+- A Docker Compose stack with PostgreSQL 17, Redis 7.4 (with append-only persistence), a FastAPI
+  service, an outbox dispatcher, and a Celery worker. All published ports are bound to
+  `127.0.0.1`; the dispatcher and worker publish none.
 - `GET /health/live` reports whether the API process is running.
 - `GET /health/ready` checks PostgreSQL and Redis at the same time and answers within about
   2 seconds (`DEPENDENCY_TIMEOUT_SECONDS`), even when a dependency hangs. It returns `503` only
@@ -22,11 +23,32 @@ retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) fo
 - The database schema (uploads, jobs, attempts, events, artifacts, outbox), created by Alembic
   migrations that run automatically before the API starts.
 - The job state machine and the database functions that apply status changes (with conditional
-  updates, so concurrent changes can't both succeed) and append per-job numbered events. These are
-  tested, but no API route or worker uses them yet. See [docs/reliability.md](docs/reliability.md).
+  updates, so concurrent changes can't both succeed) and append per-job numbered events. See
+  [docs/reliability.md](docs/reliability.md).
+- **Uploads** (`POST /v1/uploads`): PDF and ZIP files are streamed to disk in chunks, hashed
+  (SHA-256) while streaming, size-limited on the bytes actually received (50 MiB PDF, 100 MiB ZIP),
+  and checked for extension, declared type, and file signature. ZIP *contents* are not inspected
+  yet (Phase 6).
+- **Jobs** (`POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{id}`): job creation requires an
+  `Idempotency-Key`; replays return the same job (`200`, `Idempotent-Replayed: true`) and reusing
+  a key for a different request returns `409`. The job, its `job.created` event, and an outbox
+  message are written in one transaction. Listing is newest first with cursor pagination.
+- One error format on every route. Full reference: [docs/api.md](docs/api.md).
+- **Jobs run.** The dispatcher publishes outbox rows to Redis (Celery); a worker claims the job,
+  records an attempt with a lease, runs it, and marks it `succeeded`. Progress, stage events, and
+  attempts are visible through `GET /v1/jobs/{id}`.
+  - Duplicate or stale messages are detected by the claim and dropped without side effects, so
+    a job is never run twice at the same time.
+  - While Redis is down, new jobs stay `queued` and visible; the dispatcher backs off and
+    publishes them when Redis returns.
+  - **For now every job runs a placeholder stage** (`dummy`, about 3 seconds of simulated
+    progress, `DUMMY_STAGE_SECONDS`). No PDF or ZIP content is processed yet (Phases 5–6).
+  - Any error during a stage fails the job (no automatic retries until Phase 5).
+  - A worker killed mid-job leaves that job `running` until lease recovery exists (Phase 7).
+  See [docs/reliability.md](docs/reliability.md#delivery-outbox--dispatcher--redis--worker).
 
-**Not implemented yet:** upload and job API routes, workers, the dispatcher, workflows, retries,
-recovery, cancellation, the event stream, the dashboard, and metrics. See the phase list in
+**Not implemented yet:** real PDF/ZIP processing, retries, lease recovery, cancellation, manual
+retry, the event stream, artifact downloads, the dashboard, and metrics. See the phase list in
 [CLAUDE.md](CLAUDE.md).
 
 ## Requirements
@@ -51,8 +73,51 @@ If a port is already in use, change `API_HOST_PORT`, `POSTGRES_HOST_PORT`, or `R
 `docker compose up` first runs a one-shot `migrate` container (`alembic upgrade head`); the API
 starts only after it succeeds. `docker compose ps -a` shows it as `Exited (0)` when it worked.
 
-Stop the stack with `docker compose down` (data is kept in a Docker volume). To also delete the
-database data, run `docker compose down -v`.
+Stop the stack with `docker compose down`; the database, uploaded files, and queued messages are
+kept in Docker volumes. `docker compose down -v` **deletes all three** (all jobs, all uploaded
+files, and any messages waiting in Redis).
+
+Watch jobs being published and run:
+
+```powershell
+docker compose logs -f worker dispatcher
+```
+
+To have time to watch a job (or to stop the worker mid-job), make the placeholder stage longer,
+e.g. `DUMMY_STAGE_SECONDS=30` in `.env`, then `docker compose up -d worker`.
+
+## Try the API (PowerShell)
+
+These use `curl.exe` (not the PowerShell `curl` alias). Run them from a folder containing a PDF
+named `report.pdf`. Every route, with all options and error codes, is documented in
+[docs/api.md](docs/api.md).
+
+```powershell
+$api = "http://127.0.0.1:8000"
+
+# Upload: raw file body, --data-binary, and an explicit Content-Type (curl's default is rejected)
+$upload = curl.exe -s -X POST "$api/v1/uploads?filename=report.pdf" -H "Content-Type: application/pdf" --data-binary "@report.pdf" | ConvertFrom-Json
+$upload
+
+# Create a job. JSON goes through a file: PowerShell 5.1 mangles quotes in inline JSON.
+@{ workflow_type = "pdf_ingest"; upload_id = $upload.id } | ConvertTo-Json -Compress | Set-Content -Encoding ascii job.json
+$key = "demo-" + [guid]::NewGuid()
+curl.exe -i -X POST "$api/v1/jobs" -H "Content-Type: application/json" -H "Idempotency-Key: $key" --data-binary "@job.json"
+
+# Same key + same body again: 200 with "Idempotent-Replayed: true", same job
+curl.exe -i -X POST "$api/v1/jobs" -H "Content-Type: application/json" -H "Idempotency-Key: $key" --data-binary "@job.json"
+
+# List jobs (newest first) and fetch one
+curl.exe -s "$api/v1/jobs?limit=5"
+$job = (curl.exe -s "$api/v1/jobs?limit=1" | ConvertFrom-Json).items[0]
+curl.exe -s "$api/v1/jobs/$($job.id)"
+```
+
+Uploaded files live in the `storage` Docker volume, not in your project folder:
+
+```powershell
+docker compose exec api find /data/storage -type f
+```
 
 ## Database migrations
 
@@ -64,7 +129,7 @@ docker compose run --rm migrate alembic current                   # show the app
 docker compose run --rm migrate alembic history                   # list migrations
 docker compose run --rm migrate alembic check                     # "No new upgrade operations
                                                                   #  detected" = models match DB
-docker compose run --rm api alembic revision --autogenerate --rev-id 0002 -m "describe change"
+docker compose run --rm api alembic revision --autogenerate --rev-id 0003 -m "describe change"
 ```
 
 Autogenerate writes a *draft* into `backend/migrations/versions/`. Always review it by hand: it
@@ -81,7 +146,12 @@ changes, so you don't need to rebuild after editing code. Rebuild only after cha
 On Docker Desktop for Windows, file-change events from the Windows filesystem don't reach Linux
 containers, so `.env` sets `WATCHFILES_FORCE_POLLING=true` and the reloader checks files on a timer.
 
-Watch logs: `docker compose logs -f api`
+The `worker` and `dispatcher` containers also run your local code and restart when a `.py` file
+under `backend/app` changes (via `backend/devtools/reload.py`). A restart, like
+`docker compose stop worker`, lets a running job finish for up to 25 seconds; a job still running
+after that is interrupted and stays `running` until lease recovery exists (Phase 7).
+
+Watch logs: `docker compose logs -f api worker dispatcher`
 
 ## Tests
 
@@ -90,10 +160,12 @@ separate database, `<POSTGRES_DB>_test` (for example `tasklane_test`), which the
 on every run; they never touch your development database.
 
 ```powershell
-docker compose run --rm api pytest                  # everything
+docker compose run --rm api pytest                  # everything (about a minute)
+docker compose run --rm api pytest -m "not e2e"     # skip the end-to-end tests
+docker compose run --rm api pytest -m e2e           # only end-to-end: real worker + dispatcher
 docker compose run --rm api pytest tests/unit       # unit tests only (no database needed)
 docker compose run --rm api pytest -m integration   # integration tests only
-docker compose run --rm api ruff check app tests migrations   # lint
+docker compose run --rm api ruff check app tests migrations devtools   # lint
 ```
 
 ## Dependency pinning

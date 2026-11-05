@@ -210,6 +210,18 @@ CASES: dict[str, Case] = {
 }
 
 
+# Phase 3 (migration 0002) upload constraints.
+CASES["ck_uploads_ready_has_content"] = lambda s: make_upload(
+    s, status=UploadStatus.READY, sha256=None
+)
+CASES["ck_uploads_rejected_has_reason"] = lambda s: make_upload(s, status=UploadStatus.REJECTED)
+CASES["ck_uploads_reason_only_when_rejected"] = lambda s: make_upload(
+    s, status=UploadStatus.READY, rejection_reason="too_large"
+)
+CASES["ck_uploads_rejection_reason"] = lambda s: make_upload(
+    s, status=UploadStatus.REJECTED, rejection_reason="bored"
+)
+
 CASES["ck_jobs_no_cancel_while_active"] = lambda s: make_job(
     s, status=JobStatus.QUEUED, cancel_requested_at=utcnow()
 )
@@ -217,6 +229,11 @@ CASES["ck_jobs_no_cancel_while_active"] = lambda s: make_job(
 # Extra cases for constraints with more than one way to break them, e.g. both directions of an
 # "if and only if" CHECK.
 MORE_CASES: list[tuple[str, str, Case]] = [
+    (
+        "ck_uploads_ready_has_content",
+        "ready without a size",
+        lambda s: make_upload(s, status=UploadStatus.READY, size_bytes=None),
+    ),
     (
         "ck_uploads_deleted_consistent",
         "deleted_at set but status ready",

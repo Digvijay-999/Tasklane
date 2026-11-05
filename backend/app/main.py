@@ -7,14 +7,19 @@ effects (handy for tests, which build their own app with test settings).
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import timedelta
 
 from fastapi import FastAPI
 
-from app.api import health
+from app.api import health, jobs, uploads
+from app.api.errors import install_error_handling
 from app.config import Settings, get_settings
-from app.db.session import create_db_engine
+from app.db.session import create_db_engine, create_session_factory
 from app.observability.logging import RequestContextMiddleware, configure_logging
 from app.queue.broker import create_broker_client
+from app.services.jobs import JobService
+from app.services.uploads import UploadLimits, UploadService
+from app.storage.local import LocalStorage
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -28,6 +33,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.db_engine = create_db_engine(settings)
         app.state.broker_client = create_broker_client(settings)
         app.state.check_executor = health.create_check_executor()
+        session_factory = create_session_factory(app.state.db_engine)
+        storage = LocalStorage(settings.storage_root)
+        app.state.upload_service = UploadService(
+            session_factory,
+            storage,
+            UploadLimits(
+                pdf_bytes=settings.max_pdf_upload_bytes, zip_bytes=settings.max_zip_upload_bytes
+            ),
+            ttl=timedelta(hours=settings.upload_ttl_hours),
+        )
+        app.state.job_service = JobService(session_factory)
         try:
             yield
         finally:
@@ -38,6 +54,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Tasklane", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
+
+    # Middleware order matters: the last one added runs first. Request IDs must be outermost so
+    # every response (including errors) carries one.
+    install_error_handling(
+        app,
+        max_json_body_bytes=settings.max_json_body_bytes,
+        exempt_paths={uploads.UPLOADS_PATH},
+    )
     app.add_middleware(RequestContextMiddleware)
+
     app.include_router(health.router)
+    app.include_router(uploads.router)
+    app.include_router(jobs.router)
     return app

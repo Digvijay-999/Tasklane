@@ -31,6 +31,7 @@ from app.domain.enums import (
     JobStatus,
     OutboxTask,
     UploadKind,
+    UploadRejectionReason,
     UploadStatus,
     WorkflowType,
 )
@@ -57,9 +58,12 @@ class Upload(Base):
     original_filename: Mapped[str]  # for display only
     kind: Mapped[str]
     content_type: Mapped[str]  # detected from the file, not trusted from the client
-    size_bytes: Mapped[int] = mapped_column(BigInteger)
-    sha256: Mapped[str]
+    # Size and hash are unknown while the file is still streaming in (status 'receiving'), so
+    # they are nullable; ck_uploads_ready_has_content requires them once the upload is ready.
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    sha256: Mapped[str | None]
     status: Mapped[str] = mapped_column(server_default=UploadStatus.RECEIVING.value)
+    rejection_reason: Mapped[str | None]
     created_at: Mapped[datetime] = mapped_column(server_default=now())
     expires_at: Mapped[datetime]
     deleted_at: Mapped[datetime | None]
@@ -79,6 +83,20 @@ class Upload(Base):
         CheckConstraint(
             "(status = 'deleted') = (deleted_at IS NOT NULL)", name="deleted_consistent"
         ),
+        # A ready upload always has its size and hash, so jobs can rely on them.
+        CheckConstraint(
+            "status <> 'ready' OR (sha256 IS NOT NULL AND size_bytes IS NOT NULL)",
+            name="ready_has_content",
+        ),
+        # A rejected upload says why; a reason is only kept on rejected (or later deleted) rows.
+        CheckConstraint(
+            "status <> 'rejected' OR rejection_reason IS NOT NULL", name="rejected_has_reason"
+        ),
+        CheckConstraint(
+            "status IN ('deleted', 'rejected') OR rejection_reason IS NULL",
+            name="reason_only_when_rejected",
+        ),
+        CheckConstraint(one_of("rejection_reason", UploadRejectionReason), name="rejection_reason"),
         # Retention sweeps look for expired, not-yet-deleted uploads.
         Index(
             "ix_uploads_expires_at_pending",
@@ -160,6 +178,19 @@ class Job(Base):
         CheckConstraint("jsonb_typeof(options) = 'object'", name="options_object"),
         Index("ix_jobs_upload_id", "upload_id"),  # makes the RESTRICT check on upload deletes fast
     )
+
+
+# Indexes for GET /v1/jobs (migration 0002). The list is ordered newest first with the id as a
+# tie-breaker, and pages with a keyset condition `(created_at, id) < (cursor values)`, so each
+# index has exactly that order; the filtered variants put the filter column first.
+Index("ix_jobs_created_at_id", Job.created_at.desc(), Job.id.desc())
+Index("ix_jobs_status_created_at_id", Job.status, Job.created_at.desc(), Job.id.desc())
+Index(
+    "ix_jobs_workflow_type_created_at_id",
+    Job.workflow_type,
+    Job.created_at.desc(),
+    Job.id.desc(),
+)
 
 
 class JobAttempt(Base):

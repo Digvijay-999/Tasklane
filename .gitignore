@@ -22,10 +22,11 @@ node_modules/
 dist/
 
 # Local upload and artifact storage
-storage/
+/storage/
 
 # Editors / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+graphify-out/

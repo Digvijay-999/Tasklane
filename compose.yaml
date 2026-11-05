@@ -16,6 +16,32 @@ x-backend-env: &backend-env
   REDIS_URL: redis://redis:6379/0
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
   DEPENDENCY_TIMEOUT_SECONDS: ${DEPENDENCY_TIMEOUT_SECONDS:-2}
+  STORAGE_ROOT: /data/storage
+  MAX_PDF_UPLOAD_BYTES: ${MAX_PDF_UPLOAD_BYTES:-52428800}
+  MAX_ZIP_UPLOAD_BYTES: ${MAX_ZIP_UPLOAD_BYTES:-104857600}
+  UPLOAD_TTL_HOURS: ${UPLOAD_TTL_HOURS:-24}
+  MAX_JSON_BODY_BYTES: ${MAX_JSON_BODY_BYTES:-65536}
+  CELERY_QUEUE: tasklane
+  DISPATCH_POLL_SECONDS: ${DISPATCH_POLL_SECONDS:-1}
+  DISPATCH_BATCH_SIZE: ${DISPATCH_BATCH_SIZE:-50}
+  PUBLISH_TIMEOUT_SECONDS: ${PUBLISH_TIMEOUT_SECONDS:-2}
+  LEASE_SECONDS: ${LEASE_SECONDS:-60}
+  CELERY_VISIBILITY_TIMEOUT_SECONDS: ${CELERY_VISIBILITY_TIMEOUT_SECONDS:-900}
+  CELERY_TASK_TIME_LIMIT_SECONDS: ${CELERY_TASK_TIME_LIMIT_SECONDS:-3600}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+  DUMMY_STAGE_SECONDS: ${DUMMY_STAGE_SECONDS:-3}
+  # Docker Desktop on Windows doesn't reliably forward file-change events from the Windows
+  # filesystem into Linux containers, so the dev reloaders check files on a timer instead.
+  WATCHFILES_FORCE_POLLING: ${WATCHFILES_FORCE_POLLING:-true}
+
+# Containers that run the backend code (dev): live source, migrations finished first.
+x-backend-depends: &backend-depends
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_started  # not "healthy": every service must tolerate Redis being down
+  migrate:
+    condition: service_completed_successfully
 
 services:
   postgres:
@@ -36,16 +62,22 @@ services:
 
   redis:
     image: redis:7.4.12-alpine
+    # Append-only file: every write is logged to disk (flushed every second), so queued messages
+    # survive a Redis restart. `docker compose down -v` deletes the volume, and with it any
+    # queued messages.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
       - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
 
-  # One-shot: applies database migrations, then exits. The api (and, later, the worker and
-  # dispatcher) wait for it to finish successfully, so only one process ever migrates.
+  # One-shot: applies database migrations, then exits. The api, worker, and dispatcher wait for
+  # it to finish successfully, so only one process ever migrates.
   migrate:
     build: *backend-build
     image: tasklane-backend:dev
@@ -62,11 +94,7 @@ services:
   api:
     build: *backend-build
     image: tasklane-backend:dev
-    environment:
-      <<: *backend-env
-      # Docker Desktop on Windows doesn't reliably forward file-change events from the Windows
-      # filesystem into Linux containers, so the reloader checks files on a timer instead.
-      WATCHFILES_FORCE_POLLING: ${WATCHFILES_FORCE_POLLING:-true}
+    environment: *backend-env
     ports:
       - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     volumes:
@@ -75,13 +103,81 @@ services:
       - ./backend/app:/app/app
       - ./backend/tests:/app/tests
       - ./backend/migrations:/app/migrations
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_started
-      migrate:
-        condition: service_completed_successfully
+      - ./backend/devtools:/app/devtools
+      # Uploaded files (and artifacts). A named volume lives inside Docker, not in your project
+      # folder; `docker compose down -v` deletes it along with the database.
+      - storage:/data/storage
+    depends_on: *backend-depends
+
+  # Publishes committed outbox rows to Redis. No ports. It keeps running, and keeps jobs queued,
+  # while Redis is down.
+  #
+  # Dev only: devtools/reload.py restarts it when Python files change, stops it gracefully on
+  # `docker compose stop` (SIGTERM, then up to --grace seconds), and exits if the dispatcher exits
+  # on its own, so the restart policy restarts the container.
+  dispatcher:
+    build: *backend-build
+    image: tasklane-backend:dev
+    command:
+      - python
+      - -m
+      - devtools.reload
+      - --path
+      - app
+      - --grace
+      - "10"
+      - --
+      - python
+      - -m
+      - app.queue.dispatcher
+    environment: *backend-env
+    # A tiny init process (tini) as PID 1: it forwards stop signals to the reload runner.
+    init: true
+    stop_grace_period: 15s
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/devtools:/app/devtools
+    depends_on: *backend-depends
+    restart: unless-stopped
+
+  # Celery worker processes that claim and run jobs. No ports.
+  #
+  # Stopping: `docker compose stop` -> tini -> reload runner -> SIGTERM to Celery, which does a
+  # "warm shutdown": it stops taking messages and lets running tasks finish, for up to --grace
+  # (25 s). That fits inside stop_grace_period (30 s), after which Docker kills the container. A
+  # job still running at that point stays `running` until Phase 7.
+  #
+  # Dev only: the runner restarts the worker when Python files change (the same warm shutdown, so
+  # short jobs finish; longer ones are interrupted and stay `running` until Phase 7).
+  worker:
+    build: *backend-build
+    image: tasklane-backend:dev
+    command:
+      - python
+      - -m
+      - devtools.reload
+      - --path
+      - app
+      - --grace
+      - "25"
+      - --
+      - celery
+      - -A
+      - app.queue.worker_main
+      - worker
+      - --loglevel=INFO
+      - --hostname=worker@%h
+    environment: *backend-env
+    init: true
+    stop_grace_period: 30s
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/devtools:/app/devtools
+      - storage:/data/storage
+    depends_on: *backend-depends
+    restart: unless-stopped
 
 volumes:
   pgdata:
+  storage:
+  redisdata:
