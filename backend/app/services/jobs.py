@@ -27,6 +27,7 @@ from app.domain.idempotency import KEY_FORMAT_DESCRIPTION, is_valid_key, request
 from app.domain.listing import JobListPosition
 from app.domain.state_machine import ATTEMPTS_PER_RUN
 from app.domain.uploads import required_upload_kind
+from app.providers.faults import OPTION_NAME as FAULT_INJECTION_OPTION
 from app.services.errors import ErrorCode, ServiceError
 
 
@@ -64,8 +65,11 @@ class JobDetail:
 
 
 class JobService:
-    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+    def __init__(
+        self, session_factory: sessionmaker[Session], *, fault_injection_enabled: bool = False
+    ) -> None:
         self.session_factory = session_factory
+        self.fault_injection_enabled = fault_injection_enabled
 
     # --- Create ----------------------------------------------------------------------------------
 
@@ -78,6 +82,8 @@ class JobService:
             if existing is not None:
                 return _replay(existing, fingerprint)
 
+            if FAULT_INJECTION_OPTION in command.resolved_options:
+                self._require_fault_injection_enabled()
             upload = _validated_upload(session, command)
             job_id = uuid.uuid4()
             inserted = job_rows.insert_job_if_key_unused(
@@ -112,6 +118,16 @@ class JobService:
             assert job is not None
         # Leaving the `begin()` block committed the job, event, and outbox row together.
         return CreateJobResult(job=job, created=True)
+
+    def _require_fault_injection_enabled(self) -> None:
+        # Never silently ignore the option: a job that asked for failures and quietly didn't get
+        # them would make a retry test look like it passed.
+        if not self.fault_injection_enabled:
+            raise ServiceError(
+                ErrorCode.FAULT_INJECTION_DISABLED,
+                "This job asks for fault injection, but fault injection is disabled on this "
+                "server. It is a development feature, enabled with ENABLE_FAULT_INJECTION=true.",
+            )
 
     # --- Read ------------------------------------------------------------------------------------
 

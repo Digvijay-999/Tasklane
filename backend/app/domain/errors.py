@@ -4,8 +4,10 @@ Every error class has a fixed message template. Templates take only numbers (lim
 never exception text, file content, or paths, so `error_summary` and the event stream can't leak
 internals. Tracebacks and raw exception text go to the logs only.
 
-Phase 5 Part A: every class here fails the job permanently. Part B adds transient classes and
-automatic retries.
+Each class is TRANSIENT (it might work if tried again, so the job is retried while attempts
+remain) or PERMANENT (it would fail the same way again, so the job fails at once). Any exception
+that isn't classified becomes the permanent `internal_error`: retrying an unknown bug would only
+repeat it.
 """
 
 from dataclasses import dataclass
@@ -14,8 +16,8 @@ from typing import Any
 
 
 class ErrorKind(StrEnum):
-    TRANSIENT = "transient"  # might succeed if tried again (Part B: retried)
-    PERMANENT = "permanent"  # will fail the same way again
+    TRANSIENT = "transient"  # might succeed if tried again: retried while attempts remain
+    PERMANENT = "permanent"  # will fail the same way again: the job fails at once
 
 
 @dataclass(frozen=True)
@@ -53,9 +55,39 @@ ERRORS: dict[str, ErrorSpec] = {
         ErrorKind.PERMANENT,
         "The uploaded file is no longer available. Upload it again and create a new job.",
     ),
-    # --- Processing limits (Part B makes this transient: a retry resumes the work) ---
+    # --- Temporary trouble (transient: a retry resumes from the last completed stage) ---
     "stage_timeout": ErrorSpec(
-        ErrorKind.PERMANENT, "Processing took longer than the {limit}-second limit for this step."
+        ErrorKind.TRANSIENT, "Processing took longer than the {limit}-second limit for this step."
+    ),
+    "provider_timeout": ErrorSpec(
+        ErrorKind.TRANSIENT, "The summarization provider did not respond in time."
+    ),
+    "provider_unavailable": ErrorSpec(
+        ErrorKind.TRANSIENT, "The summarization provider is temporarily unavailable."
+    ),
+    "provider_rate_limited": ErrorSpec(
+        ErrorKind.TRANSIENT, "The summarization provider is limiting requests right now."
+    ),
+    "database_unavailable": ErrorSpec(
+        ErrorKind.TRANSIENT, "The database was temporarily unavailable."
+    ),
+    "database_conflict": ErrorSpec(
+        ErrorKind.TRANSIENT, "A temporary database conflict interrupted the job."
+    ),
+    "storage_unavailable": ErrorSpec(
+        ErrorKind.TRANSIENT, "File storage was temporarily unavailable."
+    ),
+    # --- Fault injection (development only; see providers/faults.py) ---
+    "injected_transient": ErrorSpec(
+        ErrorKind.TRANSIENT, "Injected transient failure (fault injection test)."
+    ),
+    "injected_permanent": ErrorSpec(
+        ErrorKind.PERMANENT, "Injected permanent failure (fault injection test)."
+    ),
+    # --- Configuration (permanent: retrying with the same configuration fails the same way) ---
+    "fault_injection_disabled": ErrorSpec(
+        ErrorKind.PERMANENT,
+        "The job asks for fault injection, but fault injection is disabled on the worker.",
     ),
     # --- Anything unexpected ---
     "internal_error": ErrorSpec(
@@ -77,6 +109,16 @@ INPUT_ERROR_CLASSES = frozenset(
         "input_unavailable",
     }
 )
+
+
+TRANSIENT_ERROR_CLASSES = frozenset(
+    name for name, spec in ERRORS.items() if spec.kind == ErrorKind.TRANSIENT
+)
+
+
+def gave_up_summary(safe_message: str, attempts: int) -> str:
+    """The job's error summary when a transient error used up the last attempt."""
+    return f"{safe_message} Gave up after {attempts} attempts."
 
 
 class JobError(Exception):

@@ -23,6 +23,7 @@ from sqlalchemy import Engine
 
 from app.config import Settings, get_settings
 from app.db.session import create_db_engine, create_session_factory
+from app.domain.retry import RetryPolicy
 from app.providers.factory import create_provider
 from app.services.execution import JobExecutionService
 from app.storage.local import LocalStorage
@@ -86,6 +87,10 @@ def _create_state() -> _ProcessState:
         lease=timedelta(seconds=settings.lease_seconds),
         stages_for=lambda workflow_type: stages_for(workflow_type, config),
         storage=LocalStorage(settings.storage_root),
+        retry_policy=RetryPolicy(
+            base_seconds=settings.retry_base_seconds, max_seconds=settings.retry_max_seconds
+        ),
+        fault_injection_enabled=settings.enable_fault_injection,
     )
     logger.info(
         "worker process ready",

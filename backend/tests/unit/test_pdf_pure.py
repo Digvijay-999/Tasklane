@@ -6,7 +6,14 @@ import re
 import pytest
 
 from app.domain.enums import JobStatus, ProviderCallPurpose
-from app.domain.errors import ERRORS, INPUT_ERROR_CLASSES, ErrorKind, JobError
+from app.domain.errors import (
+    ERRORS,
+    INPUT_ERROR_CLASSES,
+    TRANSIENT_ERROR_CLASSES,
+    ErrorKind,
+    JobError,
+    gave_up_summary,
+)
 from app.domain.state_machine import can_manual_retry
 from app.providers.base import SummarizeOptions
 from app.providers.stub import STUB_MODEL, StubProvider
@@ -261,12 +268,51 @@ def test_manifest_is_deterministic_json():
 # --- Errors -------------------------------------------------------------------------------------
 
 
+TRANSIENT = {
+    "provider_timeout",
+    "provider_unavailable",
+    "provider_rate_limited",
+    "stage_timeout",
+    "database_unavailable",
+    "database_conflict",
+    "storage_unavailable",
+    "injected_transient",
+}
+
+
 @pytest.mark.parametrize("error_class", sorted(ERRORS))
 def test_every_error_has_a_formattable_safe_message(error_class):
     error = JobError(error_class, pages=600, limit=500)
     assert error.safe_message and "{" not in error.safe_message
-    assert error.kind == ErrorKind.PERMANENT  # Part A: nothing is retried yet
-    assert error.retryable is False
+    expected = ErrorKind.TRANSIENT if error_class in TRANSIENT else ErrorKind.PERMANENT
+    assert error.kind == expected
+    assert error.retryable is (error_class in TRANSIENT)
+
+
+def test_the_classification_table():
+    """The approved split: exactly these classes are retried; unknown errors are permanent."""
+    assert TRANSIENT_ERROR_CLASSES == TRANSIENT
+    for permanent in (
+        "pdf_encrypted",
+        "pdf_corrupt",
+        "pdf_no_text",
+        "pdf_too_many_pages",
+        "pdf_text_too_large",
+        "pdf_too_complex",
+        "input_unavailable",
+        "fault_injection_disabled",
+        "injected_permanent",
+        "internal_error",
+    ):
+        assert ERRORS[permanent].kind == ErrorKind.PERMANENT
+    # Input errors are never offered a manual retry; transient ones never are input errors.
+    assert not (INPUT_ERROR_CLASSES & TRANSIENT)
+
+
+def test_gave_up_summary():
+    assert gave_up_summary("The provider timed out.", 3) == (
+        "The provider timed out. Gave up after 3 attempts."
+    )
 
 
 def test_limit_messages_include_the_numbers():

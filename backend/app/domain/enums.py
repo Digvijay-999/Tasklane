@@ -88,6 +88,7 @@ class EventType(StrEnum):
     STAGE_PROGRESS = "stage.progress"
     STAGE_COMPLETED = "stage.completed"
     STAGE_FAILED = "stage.failed"
+    STAGE_SKIPPED = "stage.skipped"  # a retry reused the stage's verified checkpoint
 
 
 class ProviderCallPurpose(StrEnum):

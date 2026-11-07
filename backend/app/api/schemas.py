@@ -2,19 +2,42 @@
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.enums import WorkflowType
+from app.domain.state_machine import MAX_ATTEMPTS_LIMIT
 
 # --- Job options ----------------------------------------------------------------------------------
-# One model per workflow. No options exist yet: Phases 5 and 6 add fields with defaults. Unknown
-# fields are rejected, so a typo can't silently be ignored.
+# One model per workflow. Unknown fields are rejected, so a typo can't silently be ignored.
+
+
+class TransientFaults(BaseModel):
+    """Fail the first provider call of attempts 1..failures with a transient error."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["transient"]
+    failures: int = Field(ge=1, le=MAX_ATTEMPTS_LIMIT)
+
+
+class PermanentFault(BaseModel):
+    """Fail the first provider call with a permanent error (never retried)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["permanent"]
+
+
+FaultInjection = Annotated[TransientFaults | PermanentFault, Field(discriminator="mode")]
 
 
 class PdfIngestOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    # Development only, and refused unless the server has ENABLE_FAULT_INJECTION=true.
+    fault_injection: FaultInjection | None = None
 
 
 class RepoIndexOptions(BaseModel):
@@ -33,7 +56,9 @@ class CreateJobRequest(BaseModel):
     workflow_type: WorkflowType
     upload_id: uuid.UUID
     options: dict[str, Any] = Field(
-        default_factory=dict, description="Workflow-specific options. None are defined yet."
+        default_factory=dict,
+        description="Workflow-specific options. pdf_ingest: `fault_injection` (development "
+        "only). repo_index: none yet.",
     )
 
 

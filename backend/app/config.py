@@ -86,6 +86,15 @@ class Settings(BaseSettings):
     summary_final_max_chars: int = Field(default=2000, ge=200)
     summary_combine_max_input_chars: int = Field(default=12000, ge=1000)
 
+    # --- Retries (Phase 5) ---
+    # Backoff before automatic retry n: equal jitter over min(base * 2^(n-1), max) seconds, so
+    # the first retry is 2.5-5 s away and the second 5-10 s with the defaults.
+    retry_base_seconds: float = Field(default=5, gt=0, le=3600)
+    retry_max_seconds: float = Field(default=300, gt=0, le=86_400)
+    # Development only: lets a job ask for injected provider failures (option
+    # "fault_injection"). Off by default; the API refuses the option while it is off.
+    enable_fault_injection: bool = False
+
     @model_validator(mode="after")
     def _visibility_timeout_exceeds_lease(self) -> "Settings":
         if self.celery_visibility_timeout_seconds <= self.lease_seconds:
@@ -93,6 +102,12 @@ class Settings(BaseSettings):
                 "CELERY_VISIBILITY_TIMEOUT_SECONDS must be longer than LEASE_SECONDS, or Redis "
                 "would redeliver messages for work that is still legitimately leased"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _retry_backoff_range(self) -> "Settings":
+        if self.retry_max_seconds < self.retry_base_seconds:
+            raise ValueError("RETRY_MAX_SECONDS must be at least RETRY_BASE_SECONDS")
         return self
 
     @model_validator(mode="after")

@@ -20,6 +20,7 @@ from app.domain.state_machine import MAX_ATTEMPTS_LIMIT
 from tests.factories import (
     make_artifact,
     make_attempt,
+    make_checkpoint,
     make_event,
     make_job,
     make_outbox,
@@ -250,6 +251,30 @@ CASES["ck_provider_calls_success_iff_no_error"] = _with_job(
     lambda s, j: make_provider_call(s, j, success=True, error_class="provider_timeout")
 )
 
+# Phase 5 Part B (migration 0004): the claimable budget invariant and stage checkpoints.
+CASES["ck_jobs_claimable_has_attempt_left"] = lambda s: make_job(
+    s, status=JobStatus.RETRY_WAIT, attempt_count=3, max_attempts=3
+)
+CASES["pk_stage_checkpoints"] = _with_job(
+    lambda s, j: _duplicate_pk(
+        lambda s2: make_checkpoint(s2, j),
+        lambda s2, first: make_checkpoint(s2, j, stage=first.stage),
+    )(s)
+)
+CASES["fk_stage_checkpoints_job_id_jobs"] = lambda s: make_checkpoint(s, _missing_job())
+CASES["ck_stage_checkpoints_stage_version_positive"] = _with_job(
+    lambda s, j: make_checkpoint(s, j, stage_version=0)
+)
+CASES["ck_stage_checkpoints_attempt_no_positive"] = _with_job(
+    lambda s, j: make_checkpoint(s, j, attempt_no=0)
+)
+CASES["ck_stage_checkpoints_input_fingerprint_format"] = _with_job(
+    lambda s, j: make_checkpoint(s, j, input_fingerprint="abc")
+)
+CASES["ck_stage_checkpoints_outputs_nonempty"] = _with_job(
+    lambda s, j: make_checkpoint(s, j, outputs=[])
+)
+
 CASES["ck_jobs_no_cancel_while_active"] = lambda s: make_job(
     s, status=JobStatus.QUEUED, cancel_requested_at=utcnow()
 )
@@ -257,6 +282,16 @@ CASES["ck_jobs_no_cancel_while_active"] = lambda s: make_job(
 # Extra cases for constraints with more than one way to break them, e.g. both directions of an
 # "if and only if" CHECK.
 MORE_CASES: list[tuple[str, str, Case]] = [
+    (
+        "ck_jobs_claimable_has_attempt_left",
+        "queued with no attempts left",
+        lambda s: make_job(s, status=JobStatus.QUEUED, attempt_count=3, max_attempts=3),
+    ),
+    (
+        "ck_stage_checkpoints_outputs_nonempty",
+        "outputs not an array",
+        _with_job(lambda s, j: make_checkpoint(s, j, outputs={"path": "x"})),
+    ),
     (
         "ck_provider_calls_success_iff_no_error",
         "failure without an error class",
@@ -344,7 +379,22 @@ def test_every_constraint_and_unique_index_has_a_test(engine):
 
 
 def test_attempt_budget_accepts_the_cap(session):
-    make_job(session, max_attempts=MAX_ATTEMPTS_LIMIT, attempt_count=MAX_ATTEMPTS_LIMIT)
+    make_job(
+        session,
+        status=JobStatus.RUNNING,
+        max_attempts=MAX_ATTEMPTS_LIMIT,
+        attempt_count=MAX_ATTEMPTS_LIMIT,
+    )
+
+
+@pytest.mark.parametrize("status", [JobStatus.RUNNING, JobStatus.FAILED, JobStatus.SUCCEEDED])
+def test_a_job_with_no_attempts_left_is_fine_when_not_claimable(session, status):
+    """The budget CHECK only forbids *claimable* jobs without an attempt left."""
+    make_job(session, status=status, attempt_count=3, max_attempts=3)
+
+
+def test_a_claimable_job_with_an_attempt_left_is_accepted(session):
+    make_job(session, status=JobStatus.RETRY_WAIT, attempt_count=2, max_attempts=3)
 
 
 def test_attempt_budget_rejects_one_above_the_cap(session):

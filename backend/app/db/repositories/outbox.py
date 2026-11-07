@@ -45,6 +45,29 @@ def enqueue_run_job(
     return session.execute(statement).scalar_one_or_none()
 
 
+def enqueue_retry(session: Session, job_id: uuid.UUID, *, available_at: datetime) -> int:
+    """The message for an automatic retry, due at `available_at` (the job's retry_at).
+
+    If the job already has an unpublished message (an odd case, e.g. one due earlier), that row is
+    pushed back to the retry time instead of being kept as it is: published early, it would only
+    be dropped by the claim as "retry not due", and the job would wait for recovery.
+    """
+    statement = insert(outbox).values(
+        job_id=job_id,
+        task_name=OutboxTask.RUN_JOB.value,
+        payload={"job_id": str(job_id)},
+        available_at=available_at,
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=[outbox.c.job_id],
+        index_where=outbox.c.published_at.is_(None),
+        set_={
+            "available_at": func.greatest(outbox.c.available_at, statement.excluded.available_at)
+        },
+    ).returning(outbox.c.id)
+    return session.execute(statement).scalar_one()
+
+
 @dataclass(frozen=True)
 class DueMessage:
     id: int

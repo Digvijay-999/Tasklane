@@ -5,6 +5,7 @@ Run with:  uvicorn app.main:create_app --factory
 effects (handy for tests, which build their own app with test settings).
 """
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -21,6 +22,8 @@ from app.services.artifacts import ArtifactService
 from app.services.jobs import JobService
 from app.services.uploads import UploadLimits, UploadService
 from app.storage.local import LocalStorage
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -44,7 +47,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ),
             ttl=timedelta(hours=settings.upload_ttl_hours),
         )
-        app.state.job_service = JobService(session_factory)
+        app.state.job_service = JobService(
+            session_factory, fault_injection_enabled=settings.enable_fault_injection
+        )
+        if settings.enable_fault_injection:
+            logger.warning(
+                "fault injection is ENABLED: jobs may request injected failures "
+                "(development only; set ENABLE_FAULT_INJECTION=false to turn it off)"
+            )
         app.state.artifact_service = ArtifactService(session_factory, storage)
         try:
             yield

@@ -3,11 +3,12 @@
 This document explains how Tasklane keeps job state correct when several processes touch the same
 job at once, and what each database constraint protects.
 
-> **Status (Phase 4):** implemented and tested: the state machine, the schema and its
+> **Status (Phase 5):** implemented and tested: the state machine, the schema and its
 > constraints, conditional status changes and per-job events (Phase 2), idempotent job creation
-> with the outbox write (Phase 3), and the delivery pipeline: dispatcher, Celery worker, claim,
-> duplicate handling, progress with lease renewal and fencing (Phase 4). **Not yet:** retries
-> (Phase 5), and lease-expiry recovery, cancellation, and manual retry (Phase 7). See
+> with the outbox write (Phase 3), the delivery pipeline: dispatcher, Celery worker, claim,
+> duplicate handling, progress with lease renewal and fencing (Phase 4), and error
+> classification, automatic retries with backoff, and resume from verified checkpoints
+> (Phase 5). **Not yet:** lease-expiry recovery, cancellation, and manual retry (Phase 7). See
 > [Known gaps](#known-gaps-until-phase-7).
 
 Tasklane does **not** promise "exactly once" execution. Messages may be delivered more than once,
@@ -169,6 +170,8 @@ misses CHECK bodies and partial-index conditions.
 | `uq_artifacts_job_id_artifact_type` | A repeated stage replaces its artifact instead of duplicating it |
 | `uq_outbox_one_pending_per_job` (partial unique index) | A job can't be queued twice at once by recovery, automatic retry, and manual retry |
 | `ck_jobs_attempt_budget` | No more attempts than the budget; budget capped at 20 |
+| `ck_jobs_claimable_has_attempt_left` | A `queued` or `retry_wait` job always has an attempt left, so a claim's `attempt_count + 1` can never break the budget (a job out of attempts must be `failed`) |
+| `pk_stage_checkpoints` `(job_id, stage)`, `ck_stage_checkpoints_*` | One checkpoint per stage per job, with a well-formed fingerprint and at least one output file to verify |
 | `ck_jobs_finished_iff_terminal` | A job looks finished exactly when it has a finish time |
 | `ck_jobs_failed_has_error` | Every failed job carries a non-empty explanation (uses `coalesce`, because a bare `char_length(NULL) > 0` is NULL and CHECK treats NULL as a pass) |
 | `ck_jobs_retry_wait_has_retry_at` | A waiting job always knows when it will run again |
@@ -314,10 +317,10 @@ closing the parent's connections (tested with a real `fork`).
 
 ### Known gaps until Phase 7
 
-- **There are no automatic retries yet** (Phase 5, part B). Every failure is permanent: expected
-  input problems get a specific `error_class` (see [api.md](api.md#failure-classes)), anything
-  unexpected becomes `internal_error`. Transient database errors inside a running stage are
-  among them for now.
+- **If the database is still down when a failure is being recorded**, the failure can't be
+  written. The task asks Celery to redeliver the message later (as for a failed claim). That
+  message is dropped, because the job is still `running`, so the job waits for Phase 7 lease
+  recovery.
 - **A worker killed mid-stage**, or a task hitting the hard time limit, leaves the job `running`
   with an open attempt whose lease simply lapses. Nothing acts on an expired lease until Phase 7.
   A redelivered message for that job is dropped, because the job is still `running`.
@@ -370,8 +373,111 @@ chunk ids are hashes of the input hash, the chunking settings, and the text), so
 again produces byte-identical files, and artifact rows are upserted on `(job_id, artifact_type)`,
 so a re-run replaces the row instead of adding one. Artifact rows are written only in the
 transaction that marks the job `succeeded`, so a job that fails after its files were written
-lists no artifacts. Tests run every stage twice and compare the files byte for byte. (Phase 5, part B uses this to resume a retried job from its last completed
-stage.)
+lists no artifacts. Tests run every stage twice and compare the files byte for byte.
+
+## Failures, retries, and resume (Phase 5)
+
+### Classification
+
+Every exception that ends an attempt is given an error class with a fixed, safe message (the
+full list is in [api.md](api.md#failures-and-retries)):
+
+- **Transient** (might work if tried again): provider timeout, unavailable, or rate-limited;
+  `stage_timeout`; database connection trouble (`database_unavailable`) and deadlock or
+  serialization aborts, Postgres `40P01`/`40001` (`database_conflict`); disk trouble such as
+  `ENOSPC`, `EIO`, `EROFS` (`storage_unavailable`); and `injected_transient`.
+- **Permanent:** problems with the input (`pdf_*`, `input_unavailable`), configuration
+  (`fault_injection_disabled`), and `injected_permanent`.
+- **Anything else** becomes the permanent `internal_error`. Retrying an unknown bug would only
+  repeat it, and the brief says to retry only errors known to be transient.
+
+### The failure transaction
+
+One transaction (`JobExecutionService._fail`). It locks the attempt, then the job: the same
+order as progress reports, and the order Phase 7 recovery must use.
+
+1. Close our attempt as `failed_transient` or `failed_permanent`:
+   `UPDATE job_attempts ... WHERE id = :attempt AND ended_at IS NULL`. If that matches nothing,
+   someone else closed it (fenced out), so nothing more is written.
+2. Append `stage.failed` (`stage`, `error_class`, `retryable`), then lock the job row
+   (`SELECT ... FOR UPDATE`) and read its status, `attempt_count`, and `max_attempts`.
+3. `status_after_failure` (pure, in the state machine) decides:
+   - transient with attempts left → `retry_wait`;
+   - transient with none left → `failed`, and the summary gains "Gave up after N attempts.";
+   - permanent → `failed`;
+   - a transient failure while a cancel is pending → `cancelled`.
+4. For `retry_wait`: `retry_at = now() + delay`, computed once from the database clock, is
+   written to the job and used as the retry's outbox `available_at`. The outbox write is an
+   upsert on the one-pending-row-per-job index: if an unpublished row already exists, its
+   `available_at` becomes `GREATEST(existing, retry_at)`, so it is never left due earlier.
+5. `job.status_changed` (`running → retry_wait`, with `retry_at`, `retry_in_seconds`, and
+   `error_class`).
+
+**Why `retry_at` and `available_at` must be equal.** Inside one transaction, Postgres's
+`now()` is frozen at the transaction's start, so the value is a single database-clock instant.
+The dispatcher publishes a row only when `available_at <= now()`, and the claim accepts a
+`retry_wait` job only when `retry_at <= now()`. A message published before `retry_at` would be
+dropped as "retry not due", and with nothing else queued the job would wait for Phase 7 recovery.
+Python's clock is never used for either value. Tests check that the two values are equal.
+
+**Backoff.** `delay = d/2 + random(0, d/2)` with `d = min(RETRY_BASE_SECONDS × 2^(n−1),
+RETRY_MAX_SECONDS)` ("equal jitter", `app/domain/retry.py`). With the defaults (5 s, 300 s) the
+first retry is 2.5–5 s out, the second 5–10 s. The delay is always at least half of `d`, so
+retries really do back off. The random half spreads out jobs that failed at the same moment. The
+random source can be swapped, so tests are exact.
+
+**Budget.** A job gets 3 attempts (`max_attempts`). `ck_jobs_claimable_has_attempt_left`
+guarantees every claimable job has one left, because a job out of attempts is moved to `failed`,
+never to `retry_wait`.
+
+### Resume from verified checkpoints
+
+When a checkpointed stage completes, the same transaction as its `stage.completed` event writes a
+`stage_checkpoints` row with:
+
+- `stage_version`: a constant in the stage's code, bumped whenever its output for the same
+  input changes;
+- `input_fingerprint`: SHA-256 over the stage's relevant settings (page and text limits, chunk
+  sizes, provider and model, ...) and the size and SHA-256 of **every upstream output file**;
+- `outputs`: each file the stage wrote, with its size and SHA-256.
+
+On a retry, a stage is skipped (event `stage.skipped`, `reason: checkpoint_reused`) only if all of
+these hold (`app/domain/checkpoints.py`):
+
+1. no earlier stage in this attempt had to run;
+2. the version matches;
+3. the fingerprint matches what the stage would compute now;
+4. the same set of files is listed, and each one still exists with the recorded size and SHA-256.
+
+Anything else runs the stage again, **and every stage after it** (rule 1). A stage's output
+therefore never rests on another attempt's stale upstream files. The one deliberate reuse inside a
+rerun stage is the per-chunk cache below, and it is keyed tightly enough to be safe. Examples: an edited `pages.jsonl` reruns
+`extract_text`, `chunk_document`, `summarize`, and `write_artifacts`; changed chunk sizes rerun
+everything from `chunk_document` on. `write_artifacts` has no checkpoint: it's cheap, and it must
+register the artifacts in the successful attempt.
+
+**Inside `summarize`**, each chunk's summary is cached in `work/{job_id}/summaries/{chunk_id}.json`
+with the chunk's SHA-256, the configured provider and model, the stage version, and the length
+limit. It's reused only if all five match, so bumping `summarize`'s `stage_version` re-summarizes
+every chunk. A retry after a provider failure on chunk 37 of 40 calls the provider only for chunks
+37–40. `summary.json` is identical either way (it counts summaries, not provider calls). The
+real calls are in `provider_calls`.
+
+### Fault injection
+
+`ENABLE_FAULT_INJECTION=true` (default off; development only) lets a job ask its summarizer to
+fail on purpose (`providers/faults.py`):
+
+- **transient, N:** the first summarizer call of attempts 1 to N fails. It depends only on the
+  attempt number, so it needs no stored state and behaves the same every time.
+- **permanent:** the first call fails, once.
+
+"Attempts 1 to N fail" assumes each attempt reaches a summarizer call. An attempt that resumes
+past `summarize` (because it failed later, in `write_artifacts`) makes no call, so nothing fires.
+
+Guards: the API refuses the option with `422` while the flag is off. The worker re-checks its
+own flag, and fails a mismatched job with `fault_injection_disabled` instead of silently running
+it without the requested failures. Both processes log a warning at startup when it's on.
 
 ## Test isolation
 

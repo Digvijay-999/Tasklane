@@ -17,6 +17,7 @@ from app.db.models import (
     JobEvent,
     OutboxMessage,
     ProviderCall,
+    StageCheckpoint,
     Upload,
 )
 from app.domain.enums import (
@@ -167,3 +168,18 @@ def make_provider_call(session: Session, job: Job, **overrides: Any) -> Provider
     }
     values.update(overrides)
     return _add(session, ProviderCall(**values))
+
+
+def make_checkpoint(session: Session, job: Job, **overrides: Any) -> StageCheckpoint:
+    values: dict[str, Any] = {
+        "job_id": job.id,
+        "stage": "validate_pdf",
+        "stage_version": 1,
+        "attempt_no": 1,
+        "input_fingerprint": sha256_hex(7),
+        "outputs": [
+            {"path": f"work/{job.id}/validate.json", "size_bytes": 10, "sha256": sha256_hex(8)}
+        ],
+    }
+    values.update(overrides)
+    return _add(session, StageCheckpoint(**values))

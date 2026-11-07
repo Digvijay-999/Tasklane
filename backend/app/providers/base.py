@@ -50,8 +50,28 @@ class Provider(Protocol):
     model: str
 
     def summarize(self, text: str, options: SummarizeOptions) -> SummaryResult:
-        """Summarize `text`. Raise on failure (Part B adds typed, classified provider errors)."""
+        """Summarize `text`. Raise a ProviderError subclass for an expected failure; anything
+        else is treated as a bug (permanent `internal_error`)."""
         ...
+
+
+class ProviderError(Exception):
+    """An expected provider failure. `error_class` is a key of app.domain.errors.ERRORS, which
+    decides whether the job is retried. The exception text is logged, never shown to users."""
+
+    error_class = "provider_unavailable"
+
+
+class ProviderTimeout(ProviderError):
+    error_class = "provider_timeout"
+
+
+class ProviderUnavailable(ProviderError):
+    error_class = "provider_unavailable"
+
+
+class ProviderRateLimited(ProviderError):
+    error_class = "provider_rate_limited"
 
 
 @dataclass(frozen=True)

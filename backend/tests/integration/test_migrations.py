@@ -33,6 +33,7 @@ APP_TABLES = {
     "artifacts",
     "outbox",
     "provider_calls",
+    "stage_checkpoints",
 }
 
 

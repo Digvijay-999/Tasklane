@@ -12,16 +12,23 @@ is always a **claim** against the database, which is the source of truth:
 2. Stages: every report from a stage (progress, keep-alive, provider call, artifact) renews the
    lease in the same short transaction as its write. If the attempt was closed by someone else
    (recovery, Phase 7), the worker is *fenced out*: it stops without writing anything further.
+   Before a stage runs, its checkpoint from an earlier attempt is verified; if it holds, the
+   stage is skipped (`stage.skipped`) and the retry resumes after it (app/domain/checkpoints.py).
 3. Finish (one transaction): close the attempt and move the job to `succeeded`, or record the
    failure.
 
-Failure handling (Phase 5 Part A): a JobError (an expected failure such as an encrypted PDF) fails
-the job with its own error class and safe message; any other exception fails it with
-`internal_error`. Nothing is retried yet (Part B adds transient errors and retries). If even the
-failure can't be recorded (e.g. the database is down), or the worker process dies, the job stays
-`running` with an open attempt until its lease expires; recovering it is Phase 7's job.
+Failure handling: every exception is classified (`_classify`):
+- a JobError carries its own class (an encrypted PDF, a provider timeout, ...);
+- database connection trouble -> `database_unavailable`; deadlocks and serialization failures
+  -> `database_conflict`; disk trouble -> `storage_unavailable` (all transient);
+- anything else -> `internal_error` (permanent: retrying an unknown bug would only repeat it).
+A transient failure moves the job to `retry_wait` with a backoff while attempts remain, in the
+same transaction as the retry's outbox row (`_fail`). If even the failure can't be recorded (the
+database is down), or the worker process dies, the job stays `running` with an open attempt until
+its lease expires; recovering it is Phase 7's job.
 """
 
+import errno
 import logging
 import time
 import uuid
@@ -29,15 +36,27 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.models import Job, Upload
 from app.db.repositories import artifacts as artifact_rows
 from app.db.repositories import attempts as attempt_rows
+from app.db.repositories import checkpoints as checkpoint_rows
 from app.db.repositories import jobs as job_rows
 from app.db.repositories import provider_calls as provider_call_rows
+from app.db.repositories.outbox import enqueue_retry
+from app.domain.checkpoints import (
+    Checkpoint,
+    OutputFile,
+    ReuseDecision,
+    input_fingerprint,
+    reuse_decision,
+)
 from app.domain.enums import (
     AttemptOutcome,
     AttemptTrigger,
@@ -45,7 +64,8 @@ from app.domain.enums import (
     JobStatus,
     WorkflowType,
 )
-from app.domain.errors import ERRORS, JobError
+from app.domain.errors import ERRORS, ErrorKind, JobError, gave_up_summary
+from app.domain.retry import RetryPolicy
 from app.domain.state_machine import (
     CLAIMABLE_STATUSES,
     FailureKind,
@@ -53,6 +73,7 @@ from app.domain.state_machine import (
     status_after_success,
 )
 from app.providers.base import ProviderCallRecord
+from app.providers.faults import fault_plan
 from app.storage.local import LocalStorage
 from app.storage.workspace import JobWorkspace
 from app.workflows.base import ArtifactOutput, JobInput, Stage, UploadInput
@@ -63,6 +84,13 @@ INTERNAL_ERROR = "internal_error"
 INTERNAL_ERROR_SUMMARY = ERRORS[INTERNAL_ERROR].message
 EXECUTING_STATUSES = frozenset({JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED})
 
+# Postgres SQLSTATEs meaning "this transaction lost a race; running it again will work".
+DEADLOCK_DETECTED = "40P01"
+SERIALIZATION_FAILURE = "40001"
+# Disk trouble that may clear up: full, I/O error, read-only remount, quota, busy.
+FAIL_TRANSACTION_TRIES = 3
+STORAGE_ERRNOS = frozenset({errno.ENOSPC, errno.EIO, errno.EROFS, errno.EDQUOT, errno.EAGAIN})
+
 
 class AttemptFencedError(Exception):
     """This worker's attempt was closed by someone else (or the job left `running`): stop."""
@@ -71,6 +99,8 @@ class AttemptFencedError(Exception):
 class RunOutcome(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    RETRY_SCHEDULED = "retry_scheduled"  # transient failure: the job waits in retry_wait
+    CANCELLED = "cancelled"  # transient failure while a cancel request was pending
     DROPPED = "dropped"  # duplicate or stale message: nothing was written
     FENCED = "fenced"  # lost ownership mid-run: stopped without further writes
 
@@ -90,7 +120,7 @@ class RunResult:
     drop_reason: DropReason | None = None
     job_status: JobStatus | None = None  # for DROPPED: the status that caused it
     attempt_no: int | None = None
-    error_class: str | None = None  # for FAILED
+    error_class: str | None = None  # for FAILED, RETRY_SCHEDULED, CANCELLED
 
 
 @dataclass(frozen=True)
@@ -107,6 +137,7 @@ class _Failure:
     error_class: str
     summary: str
     stage: str | None
+    transient: bool
 
 
 class JobExecutionService:
@@ -118,12 +149,16 @@ class JobExecutionService:
         lease: timedelta,
         stages_for: Callable[[WorkflowType], list[Stage]],
         storage: LocalStorage | None = None,
+        retry_policy: RetryPolicy | None = None,
+        fault_injection_enabled: bool = False,
     ) -> None:
         self.session_factory = session_factory
         self.worker_id = worker_id
         self.lease = lease
         self.stages_for = stages_for
         self.storage = storage
+        self.retry_policy = retry_policy or RetryPolicy()
+        self.fault_injection_enabled = fault_injection_enabled
 
     # --- Entry point -----------------------------------------------------------------------------
 
@@ -151,32 +186,31 @@ class JobExecutionService:
         progress = _StageTracker()
         try:
             self._run_stages(claim, progress)
+            progress.finishing = True  # a failure from here on is not any stage's fault
             self._succeed(claim, progress)
         except AttemptFencedError:
             logger.warning("attempt fenced out; stopping without further writes", extra=log_extra)
             return RunResult(RunOutcome.FENCED, attempt_no=claim.attempt_no)
-        except JobError as error:
-            # An expected failure (e.g. an encrypted PDF): its class and safe message are recorded.
-            logger.warning(
-                "job failed",
-                extra={
-                    **log_extra,
-                    "error_class": error.error_class,
-                    "stage": progress.current_stage,
-                },
-            )
-            failure = _Failure(error.error_class, error.safe_message, progress.current_stage)
+        except Exception as exc:
+            failure = _classify(exc, None if progress.finishing else progress.current_stage)
+            failure_log = {
+                **log_extra,
+                "error_class": failure.error_class,
+                "stage": failure.stage,
+                "transient": failure.transient,
+            }
+            if failure.error_class == INTERNAL_ERROR:
+                # Unexpected: the traceback goes to the logs; the database gets a safe summary.
+                logger.exception("job attempt failed with an unexpected error", extra=failure_log)
+            else:
+                logger.warning(
+                    "job attempt failed",
+                    extra={**failure_log, "exception_type": type(exc).__name__},
+                )
             return RunResult(
                 self._fail(claim, failure),
                 attempt_no=claim.attempt_no,
-                error_class=error.error_class,
-            )
-        except Exception:
-            # Unexpected: the traceback goes to the logs; the database only gets a safe summary.
-            logger.exception("job failed with an unexpected error", extra=log_extra)
-            failure = _Failure(INTERNAL_ERROR, INTERNAL_ERROR_SUMMARY, progress.current_stage)
-            return RunResult(
-                self._fail(claim, failure), attempt_no=claim.attempt_no, error_class=INTERNAL_ERROR
+                error_class=failure.error_class,
             )
         logger.info("job succeeded", extra=log_extra)
         return RunResult(RunOutcome.SUCCEEDED, attempt_no=claim.attempt_no)
@@ -273,25 +307,98 @@ class JobExecutionService:
     # --- Stages ----------------------------------------------------------------------------------
 
     def _run_stages(self, claim: ClaimedAttempt, tracker: "_StageTracker") -> None:
+        if fault_plan(claim.job_input.options) and not self.fault_injection_enabled:
+            # The API accepted the option, so the flag was on there; it is off here. Fail clearly
+            # instead of quietly running without the faults the job asked for.
+            raise JobError("fault_injection_disabled")
         stages = self.stages_for(claim.workflow_type)
         weights = [max(1, int(getattr(stage, "weight", 1))) for stage in stages]
         total = sum(weights) or 1
+        checkpoints = self._load_checkpoints(claim, stages)
+        upstream: list[OutputFile] = []  # files written by the stages so far, in order
+        earlier_stage_ran = False
         done = 0
         for stage, weight in zip(stages, weights, strict=True):
             tracker.current_stage = stage.name
             context = _AttemptContext(
                 self, claim, tracker, stage.name, done / total, weight / total
             )
+            done += weight
+            plan = self._checkpoint_plan(stage, claim, context, upstream)
+            if plan is not None:
+                decision = reuse_decision(
+                    checkpoints.get(stage.name),
+                    stage_version=plan.stage_version,
+                    fingerprint=plan.fingerprint,
+                    expected_paths=plan.output_paths,
+                    earlier_stage_ran=earlier_stage_ran,
+                    describe=context.describe_file,
+                )
+                if decision == ReuseDecision.REUSE:
+                    context.record(
+                        EventType.STAGE_SKIPPED,
+                        {"stage": stage.name, "reason": "checkpoint_reused"},
+                        stage_percent=100,
+                    )
+                    upstream.extend(checkpoints[stage.name].outputs)
+                    continue
+                if decision != ReuseDecision.NO_CHECKPOINT:
+                    logger.info(
+                        "checkpoint not reused; running the stage again",
+                        extra={
+                            "job_id": str(claim.job_id),
+                            "stage": stage.name,
+                            "reason": str(decision),
+                        },
+                    )
+            earlier_stage_ran = True
             context.record(EventType.STAGE_STARTED, {"stage": stage.name}, stage_percent=0)
             started = time.monotonic()
             stage.run(context)
             duration_ms = round((time.monotonic() - started) * 1000)
+            completed_checkpoint = None
+            if plan is not None:
+                outputs = [context.describe_file(path) for path in plan.output_paths]
+                written = [output for output in outputs if output is not None]
+                if len(written) != len(outputs):
+                    raise RuntimeError(f"stage {stage.name} did not write all of its outputs")
+                upstream.extend(written)
+                completed_checkpoint = (plan, written)
             context.record(
                 EventType.STAGE_COMPLETED,
                 {"stage": stage.name, "duration_ms": duration_ms},
                 stage_percent=100,
+                checkpoint=completed_checkpoint,
             )
-            done += weight
+
+    def _load_checkpoints(
+        self, claim: ClaimedAttempt, stages: list[Stage]
+    ) -> dict[str, Checkpoint]:
+        if claim.attempt_no == 1 or not any(_checkpointable(stage) for stage in stages):
+            return {}  # a first attempt has nothing to resume from
+        with self.session_factory() as session:
+            return checkpoint_rows.get_checkpoints(session, claim.job_id)
+
+    def _checkpoint_plan(
+        self,
+        stage: Stage,
+        claim: ClaimedAttempt,
+        context: "_AttemptContext",
+        upstream: list[OutputFile],
+    ) -> "_CheckpointPlan | None":
+        """What this stage's checkpoint must match, or None if the stage isn't checkpointed
+        (no `stage_version`: e.g. the dummy stage and write_artifacts)."""
+        if not _checkpointable(stage) or self.storage is None:
+            return None
+        version = int(stage.stage_version)  # type: ignore[attr-defined]
+        params = stage.fingerprint_params(claim.job_input)  # type: ignore[attr-defined]
+        return _CheckpointPlan(
+            stage_version=version,
+            fingerprint=input_fingerprint(
+                stage=stage.name, stage_version=version, params=params, upstream=upstream
+            ),
+            output_paths=list(stage.output_paths(context.workspace)),  # type: ignore[attr-defined]
+        )
 
     # --- Finish ----------------------------------------------------------------------------------
 
@@ -322,13 +429,48 @@ class JobExecutionService:
             self._move_to_outcome(session, claim, status_after_success)
 
     def _fail(self, claim: ClaimedAttempt, failure: _Failure) -> RunOutcome:
-        """Record a failed attempt and fail the job (Part A: every failure is permanent)."""
+        """Record a failed attempt and decide what happens to the job, in ONE transaction:
+
+        1. close our attempt (fencing: if it was already closed, write nothing at all);
+        2. append `stage.failed`, then lock the job row and read its status and attempt budget;
+        3. status_after_failure(): transient with attempts left -> retry_wait; transient with none
+           left -> failed ("... Gave up after N attempts."); permanent -> failed; transient while
+           a cancel is pending -> cancelled;
+        4. for retry_wait: the job's retry_at and the retry's outbox available_at get the SAME
+           timestamp, taken from the database clock in this transaction, so the message can
+           never arrive before the job is due (it would be dropped as "retry not due").
+        Lock order: attempt, then job (the same as progress reports; Phase 7 recovery too).
+
+        A deadlock or serialization failure rolls the whole transaction back, so it is safe to
+        run again; after a few tries the error reaches the task layer.
+        """
+        kind = FailureKind.TRANSIENT if failure.transient else FailureKind.PERMANENT
+        for remaining in range(FAIL_TRANSACTION_TRIES - 1, -1, -1):
+            try:
+                return self._record_failure(claim, failure, kind)
+            except DBAPIError as exc:
+                if remaining == 0 or not _is_conflict(exc):
+                    raise
+                logger.warning(
+                    "recording a failure hit a database conflict; trying again",
+                    extra={"job_id": str(claim.job_id), "attempt_no": claim.attempt_no},
+                )
+        raise AssertionError("unreachable")
+
+    def _record_failure(
+        self, claim: ClaimedAttempt, failure: _Failure, kind: FailureKind
+    ) -> RunOutcome:
+        outcome = (
+            AttemptOutcome.FAILED_TRANSIENT
+            if failure.transient
+            else AttemptOutcome.FAILED_PERMANENT
+        )
         try:
             with self.session_factory.begin() as session:
                 closed = attempt_rows.close_attempt(
                     session,
                     claim.attempt_id,
-                    AttemptOutcome.FAILED_PERMANENT,
+                    outcome,
                     error_class=failure.error_class,
                     error_summary=failure.summary,
                 )
@@ -339,20 +481,70 @@ class JobExecutionService:
                         session,
                         claim.job_id,
                         EventType.STAGE_FAILED,
-                        {"stage": failure.stage, "error_class": failure.error_class},
+                        {
+                            "stage": failure.stage,
+                            "error_class": failure.error_class,
+                            "retryable": failure.transient,
+                        },
                         attempt_no=claim.attempt_no,
                     )
-                self._move_to_outcome(
-                    session,
-                    claim,
-                    lambda current: status_after_failure(
-                        current, FailureKind.PERMANENT, attempt_count=0, max_attempts=0
-                    ),
-                    changes={"error_class": failure.error_class, "error_summary": failure.summary},
-                )
+                return self._apply_failure(session, claim, failure, kind)
         except AttemptFencedError:
             return RunOutcome.FENCED
-        return RunOutcome.FAILED
+
+    def _apply_failure(
+        self, session: Session, claim: ClaimedAttempt, failure: _Failure, kind: FailureKind
+    ) -> RunOutcome:
+        # stage.failed already locked the job row (it bumps the event counter); FOR UPDATE also
+        # covers failures outside any stage. The loop is defensive: if the conditional update
+        # still loses to a concurrent status change, re-read and decide again.
+        for _ in range(3):
+            row = session.execute(
+                select(Job.status, Job.attempt_count, Job.max_attempts)
+                .where(Job.id == claim.job_id)
+                .with_for_update()
+            ).one()
+            status = JobStatus(row.status)
+            if status not in EXECUTING_STATUSES:
+                raise AttemptFencedError  # someone else already finished or moved the job
+            target = status_after_failure(status, kind, row.attempt_count, row.max_attempts)
+            changes: dict[str, Any] = {
+                "error_class": failure.error_class,
+                "error_summary": failure.summary,
+            }
+            payload: dict[str, Any] = {
+                "attempt_no": claim.attempt_no,
+                "error_class": failure.error_class,
+            }
+            retry_at = None
+            if target == JobStatus.RETRY_WAIT:
+                delay = self.retry_policy.delay_seconds(claim.attempt_no)
+                # now() is frozen for the whole transaction: one database-clock instant.
+                retry_at = session.execute(
+                    select(func.now() + timedelta(seconds=delay))
+                ).scalar_one()
+                changes["retry_at"] = retry_at
+                payload["retry_at"] = retry_at.isoformat()
+                payload["retry_in_seconds"] = round(delay, 3)
+            elif target == JobStatus.FAILED and failure.transient:
+                changes["error_summary"] = gave_up_summary(failure.summary, row.attempt_count)
+                payload["gave_up_after_attempts"] = row.attempt_count
+            result = job_rows.transition_job(
+                session,
+                claim.job_id,
+                from_status=status,
+                to_status=target,
+                changes=changes,
+                event_payload=payload,
+                attempt_no=claim.attempt_no,
+            )
+            if not result.applied:
+                continue
+            if retry_at is not None:
+                enqueue_retry(session, claim.job_id, available_at=retry_at)
+                return RunOutcome.RETRY_SCHEDULED
+            return RunOutcome.CANCELLED if target == JobStatus.CANCELLED else RunOutcome.FAILED
+        raise AttemptFencedError
 
     def _move_to_outcome(
         self,
@@ -391,6 +583,7 @@ class _StageTracker:
 
     def __init__(self) -> None:
         self.current_stage: str | None = None
+        self.finishing = False  # every stage is done; the success is being recorded
         self.artifacts: dict[str, ArtifactOutput] = {}  # by artifact type; a re-save replaces
 
 
@@ -463,8 +656,22 @@ class _AttemptContext:
 
     # --- Internals ------------------------------------------------------------------------------
 
-    def record(self, event_type: EventType, payload: dict[str, object], stage_percent: int) -> None:
-        """One short transaction: renew the lease (fencing check), update progress, add event."""
+    def describe_file(self, path: str) -> OutputFile | None:
+        """A file's current size and SHA-256, or None if it doesn't exist."""
+        workspace = self.workspace
+        if not workspace.exists(path):
+            return None
+        return OutputFile(path, workspace.size(path), workspace.sha256(path))
+
+    def record(
+        self,
+        event_type: EventType,
+        payload: dict[str, object],
+        stage_percent: int,
+        checkpoint: "tuple[_CheckpointPlan, list[OutputFile]] | None" = None,
+    ) -> None:
+        """One short transaction: renew the lease (fencing check), update progress, add event,
+        and, when a stage completes, record its checkpoint."""
         overall = round((self.progress_start + self.progress_share * stage_percent / 100) * 100)
         with self.service.session_factory.begin() as session:
             self._renew(session)
@@ -475,7 +682,50 @@ class _AttemptContext:
             job_rows.append_event(
                 session, self.claim.job_id, event_type, payload, attempt_no=self.claim.attempt_no
             )
+            if checkpoint is not None:
+                plan, outputs = checkpoint
+                checkpoint_rows.upsert_checkpoint(
+                    session,
+                    job_id=self.claim.job_id,
+                    stage=self.stage_name,
+                    stage_version=plan.stage_version,
+                    attempt_no=self.claim.attempt_no,
+                    input_fingerprint=plan.fingerprint,
+                    outputs=outputs,
+                )
 
     def _renew(self, session: Session) -> None:
         if not attempt_rows.renew_lease(session, self.claim.attempt_id, self.service.lease):
             raise AttemptFencedError
+
+
+@dataclass(frozen=True)
+class _CheckpointPlan:
+    stage_version: int
+    fingerprint: str
+    output_paths: list[str]
+
+
+def _checkpointable(stage: Stage) -> bool:
+    return getattr(stage, "stage_version", None) is not None
+
+
+def _classify(exc: BaseException, stage: str | None) -> _Failure:
+    """Turn any exception from a running attempt into an error class and a safe message."""
+    if isinstance(exc, JobError):
+        return _Failure(exc.error_class, exc.safe_message, stage, exc.kind == ErrorKind.TRANSIENT)
+    error_class = INTERNAL_ERROR
+    if _is_conflict(exc):
+        error_class = "database_conflict"
+    elif isinstance(exc, (OperationalError, InterfaceError, PoolTimeoutError)):
+        error_class = "database_unavailable"
+    elif isinstance(exc, OSError) and exc.errno in STORAGE_ERRNOS:
+        error_class = "storage_unavailable"
+    spec = ERRORS[error_class]
+    return _Failure(error_class, spec.message, stage, spec.kind == ErrorKind.TRANSIENT)
+
+
+def _is_conflict(exc: BaseException) -> bool:
+    """A deadlock or serialization failure: the transaction lost a race and can run again."""
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    return isinstance(exc, DBAPIError) and sqlstate in (DEADLOCK_DETECTED, SERIALIZATION_FAILURE)

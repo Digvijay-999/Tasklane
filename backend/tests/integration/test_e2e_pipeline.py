@@ -19,13 +19,14 @@ import subprocess
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import JobAttempt, JobEvent, ProviderCall
+from app.db.models import JobAttempt, JobEvent, OutboxMessage, ProviderCall
 from app.queue.celery_app import RUN_JOB_TASK, create_celery_app
 from devtools import pdf_samples
 from tests.integration.conftest import TEST_QUEUE
@@ -34,13 +35,17 @@ from tests.samples import zip_bytes
 pytestmark = pytest.mark.e2e
 
 BACKEND = Path(__file__).resolve().parents[2]
+E2E_RETRY_BASE_SECONDS = 1
 PDF_STAGES = ["validate_pdf", "extract_text", "chunk_document", "summarize", "write_artifacts"]
 
 
 @pytest.fixture
 def api_settings(api_settings):
-    """The shared fixture's 4 KiB upload limit is too small for real sample PDFs."""
-    return api_settings.model_copy(update={"max_pdf_upload_bytes": 1024 * 1024})
+    """Real sample PDFs need more than the shared fixture's 4 KiB upload limit; the retry tests
+    need the API to accept the fault_injection option (the worker gets the flag below)."""
+    return api_settings.model_copy(
+        update={"max_pdf_upload_bytes": 1024 * 1024, "enable_fault_injection": True}
+    )
 
 
 def process_environment(pid: int) -> dict[str, str]:
@@ -161,6 +166,9 @@ def start_pipeline(
             "PYTHONUNBUFFERED": "1",
             # Same storage folder as the in-process API, never the dev volume.
             "STORAGE_ROOT": str(queue_settings.storage_root),
+            # Fault injection for the retry tests, with 1 s backoff (0.5-1 s, then 1-2 s).
+            "ENABLE_FAULT_INJECTION": "true",
+            "RETRY_BASE_SECONDS": str(E2E_RETRY_BASE_SECONDS),
         }
         pipeline = Pipeline(env, tmp_path)
         pipelines.append(pipeline)
@@ -173,7 +181,12 @@ def start_pipeline(
         pipeline.stop()
 
 
-def submit_job(api, workflow_type: str = "repo_index", content: bytes | None = None) -> str:
+def submit_job(
+    api,
+    workflow_type: str = "repo_index",
+    content: bytes | None = None,
+    options: dict | None = None,
+) -> str:
     """Upload a file and create a job. Default: a repo_index job (runs the `dummy` stage)."""
     if workflow_type == "repo_index":
         filename, content_type, content = "e2e.zip", "application/zip", content or zip_bytes()
@@ -187,11 +200,10 @@ def submit_job(api, workflow_type: str = "repo_index", content: bytes | None = N
         headers={"Content-Type": content_type},
     )
     assert upload.status_code == 201, upload.text
-    response = api.post(
-        "/v1/jobs",
-        json={"workflow_type": workflow_type, "upload_id": upload.json()["id"]},
-        headers={"Idempotency-Key": f"e2e-{uuid.uuid4()}"},
-    )
+    body = {"workflow_type": workflow_type, "upload_id": upload.json()["id"]}
+    if options is not None:
+        body["options"] = options
+    response = api.post("/v1/jobs", json=body, headers={"Idempotency-Key": f"e2e-{uuid.uuid4()}"})
     assert response.status_code == 201, response.text
     return response.json()["id"]
 
@@ -363,3 +375,80 @@ def test_worker_and_dispatcher_use_the_test_storage_root_never_the_real_volume(
     assert not (real_root / "uploads" / detail["upload_id"]).exists()
     assert not (real_root / "work" / job_id).exists()
     assert not (real_root / "artifacts" / job_id).exists()
+
+
+# --- Retries (Phase 5 Part B) ---------------------------------------------------------------------
+
+
+def outbox_of(engine, job_id: str) -> list[OutboxMessage]:
+    with Session(engine) as session:
+        return list(
+            session.scalars(
+                select(OutboxMessage)
+                .where(OutboxMessage.job_id == uuid.UUID(job_id))
+                .order_by(OutboxMessage.id)
+            )
+        )
+
+
+def status_history(events: list[JobEvent]) -> list[str]:
+    changes = [e.payload for e in events if e.event_type == "job.status_changed"]
+    return [changes[0]["from"]] + [change["to"] for change in changes]
+
+
+def test_two_transient_failures_are_retried_with_backoff_then_succeed(api, engine, start_pipeline):
+    """Acceptance #2: real dispatcher, worker and Redis; the retries travel through the outbox."""
+    start_pipeline()
+    faults = {"fault_injection": {"mode": "transient", "failures": 2}}
+    job_id = submit_job(api, "pdf_ingest", options=faults)
+
+    wait_until(lambda: job_status(api, job_id) in ("succeeded", "failed"), 120, "job finished")
+
+    detail = api.get(f"/v1/jobs/{job_id}").json()
+    assert detail["status"] == "succeeded", detail
+    assert [(a["attempt_no"], a["trigger"], a["outcome"]) for a in detail["attempts"]] == [
+        (1, "initial", "failed_transient"),
+        (2, "auto_retry", "failed_transient"),
+        (3, "auto_retry", "succeeded"),
+    ]
+    events = events_of(engine, job_id)
+    assert status_history(events) == [
+        "queued",
+        "running",
+        "retry_wait",
+        "running",
+        "retry_wait",
+        "running",
+        "succeeded",
+    ]
+    # Each retry's message was due at exactly the job's retry_at.
+    retries = [
+        e.payload
+        for e in events
+        if e.event_type == "job.status_changed" and e.payload["to"] == "retry_wait"
+    ]
+    outbox = outbox_of(engine, job_id)
+    assert len(outbox) == 3 and all(m.published_at for m in outbox)
+    assert [datetime.fromisoformat(r["retry_at"]) for r in retries] == [
+        m.available_at for m in outbox[1:]
+    ]
+    # Equal jitter with a 1 s base: 0.5-1 s, then 1-2 s.
+    base = E2E_RETRY_BASE_SECONDS
+    first, second = (r["retry_in_seconds"] for r in retries)
+    assert base * 0.5 <= first <= base and base <= second <= base * 2
+    # The retried attempts resumed after the stages that had already finished.
+    skipped = [e.payload["stage"] for e in events if e.event_type == "stage.skipped"]
+    assert skipped == ["validate_pdf", "extract_text", "chunk_document"] * 2
+
+
+def test_three_transient_failures_give_up_after_three_attempts(api, start_pipeline):
+    start_pipeline()
+    faults = {"fault_injection": {"mode": "transient", "failures": 3}}
+    job_id = submit_job(api, "pdf_ingest", options=faults)
+
+    wait_until(lambda: job_status(api, job_id) in ("succeeded", "failed"), 120, "job finished")
+
+    detail = api.get(f"/v1/jobs/{job_id}").json()
+    assert detail["status"] == "failed"
+    assert detail["error_summary"].endswith("Gave up after 3 attempts.")
+    assert [a["outcome"] for a in detail["attempts"]] == ["failed_transient"] * 3

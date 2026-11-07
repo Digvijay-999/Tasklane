@@ -7,10 +7,10 @@
 > creation with the transactional outbox write, listing and detail (Phase 3), and the delivery
 > pipeline: outbox dispatcher, Celery worker, claim with duplicate dropping, lease renewal on
 > progress, and one placeholder stage (Phase 4), and the PDF workflow with the stub provider, the
-> sandboxed parser, artifacts and their download route (Phase 5, part A). In the lifecycle below,
-> steps 1–4 are implemented, step 5 runs the real PDF stages (`repo_index` still runs one
-> placeholder stage), step 6 handles success and fails every error permanently (retries are
-> Phase 5, part B), and steps 7–8 are planned. The HTTP API is documented in
+> sandboxed parser, artifacts and their download route, error classification, automatic
+> retries with backoff, and resume from verified checkpoints (Phase 5). In the lifecycle below,
+> steps 1–6 are implemented (step 5 runs the real PDF stages; `repo_index` still runs one
+> placeholder stage), and steps 7–8 are planned. The HTTP API is documented in
 > [api.md](api.md); delivery guarantees in [reliability.md](reliability.md).
 
 ## 1. Goal
@@ -161,7 +161,9 @@ The API writes `uploads`, `jobs`, `job_events` (`job.created`), and `outbox`. Th
 reads and marks the outbox, and workers write `job_attempts`, progress, and stage events
 (Phase 4), plus `artifacts` and `provider_calls` (Phase 5). Migration `0003` (Phase 5) added
 `provider_calls`: one row per summarizer call (provider, model, latency, success, sizes, token
-usage when the provider reports it), never the text itself.
+usage when the provider reports it), never the text itself. Migration `0004` added
+`stage_checkpoints` (the files each finished stage wrote, for resuming retries) and
+`ck_jobs_claimable_has_attempt_left`.
 Column definitions are in `backend/app/db/models.py`; the reason for each constraint is in
 [reliability.md](reliability.md#database-constraints).
 
@@ -264,7 +266,7 @@ specific tags.
 | 2 | Migrations + state machine | Alembic; all six tables; pure state-machine module with exhaustive unit tests; event sequence allocation |
 | 3 | Upload and job APIs with idempotency and outbox | Upload size/type/signature checks; `POST/GET /v1/jobs`; idempotency + 409; transactional outbox write |
 | 4 | Dispatcher + Celery worker with one dummy stage | Outbox publishing; attempt creation; duplicate-delivery guard |
-| 5 | PDF workflow + retries | **Part A (done):** stages, sandboxed parser and limits, provider interface + **stub provider**, artifacts and download route, `provider_calls`, lease `keep_alive`. **Part B:** transient vs permanent errors, bounded backoff with jitter via delayed outbox rows, attempt-budget CHECK, fault injection, stage checkpoints/resume (migration `0004`) |
+| 5 | PDF workflow + retries | **Part A:** stages, sandboxed parser and limits, provider interface + **stub provider**, artifacts and download route, `provider_calls`, lease `keep_alive`. **Part B:** transient vs permanent errors, bounded backoff with jitter via delayed outbox rows, attempt-budget CHECK, fault injection, stage checkpoints/resume (migration `0004`) |
 | 6 | ZIP workflow + security | Path traversal, symlinks, zip bombs, file-count limits, file filtering, manifest + JSONL |
 | 7 | Leases, recovery, cancellation, manual retry | Heartbeats; recovery loop; cooperative cancellation; `POST /cancel`, `POST /retry` |
 | 8 | SSE with replay | `Last-Event-ID` replay, then live polling; paginated event history |

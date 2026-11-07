@@ -38,6 +38,10 @@ x-backend-env: &backend-env
   PROVIDER: ${PROVIDER:-stub}
   PROVIDER_TIMEOUT_SECONDS: ${PROVIDER_TIMEOUT_SECONDS:-20}
   SUMMARIZE_TIMEOUT_SECONDS: ${SUMMARIZE_TIMEOUT_SECONDS:-900}
+  RETRY_BASE_SECONDS: ${RETRY_BASE_SECONDS:-5}
+  RETRY_MAX_SECONDS: ${RETRY_MAX_SECONDS:-300}
+  # Development only, off unless set (a shell variable overrides .env for one session).
+  ENABLE_FAULT_INJECTION: ${ENABLE_FAULT_INJECTION:-false}
   # Docker Desktop on Windows doesn't reliably forward file-change events from the Windows
   # filesystem into Linux containers, so the dev reloaders check files on a timer instead.
   WATCHFILES_FORCE_POLLING: ${WATCHFILES_FORCE_POLLING:-true}

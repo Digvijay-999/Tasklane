@@ -238,28 +238,81 @@ The full product brief is in `PROJECT_BRIEF.md`; the planned design is in `docs/
 - **E2E isolation:** e2e processes get the test `STORAGE_ROOT` (guarded in the fixture) and no
   `*API_KEY*` variables; a test reads `/proc/<pid>/environ` of the dispatcher, the Celery main
   process and the worker child, and checks the real volume has nothing for the job.
-- **Part B (when asked):** backoff 5 s base doubling, 300 s cap, equal jitter: the first retry is
-  2.5–5 s out and the second 5–10 s (use these ranges in docs and walkthroughs); budget CHECK;
-  fault injection (`ENABLE_FAULT_INJECTION` + per-job option, 422 when disabled); stage
-  checkpoints and resume (migration 0004).
+
+## Decisions made (Phase 5, part B)
+
+- **Classification** (`domain/errors.py`): transient = `provider_timeout`,
+  `provider_unavailable`, `provider_rate_limited`, `stage_timeout`, `database_unavailable`,
+  `database_conflict`, `storage_unavailable`, `injected_transient`; permanent = input errors,
+  `fault_injection_disabled`, `injected_permanent`, and any unclassified exception
+  (`internal_error`). `services/execution.py::_classify` maps SQLAlchemy
+  `OperationalError`/`InterfaceError`/pool timeouts → `database_unavailable`, SQLSTATE
+  `40P01`/`40001` → `database_conflict`, `OSError` with `ENOSPC/EIO/EROFS/EDQUOT/EAGAIN` →
+  `storage_unavailable`. Providers raise `ProviderError` subclasses (`providers/base.py`); the
+  summarize stage records the call and re-raises `JobError(exc.error_class)`.
+- **Backoff** (`domain/retry.py`): equal jitter, `d = min(RETRY_BASE_SECONDS × 2^(n−1),
+  RETRY_MAX_SECONDS)`, delay `d/2 + random·d/2`; defaults 5 s / 300 s → first retry 2.5–5 s,
+  second 5–10 s (use these ranges in docs and walkthroughs). `RetryPolicy` takes an injectable
+  random source. e2e uses `RETRY_BASE_SECONDS=1`.
+- **Failure transaction** (`_fail` + `_apply_failure`): close attempt (fenced) → `stage.failed`
+  `{stage, error_class, retryable}` → `SELECT ... FOR UPDATE` on the job → `status_after_failure`
+  → `transition_job`. For `retry_wait`, `retry_at` comes from `SELECT now() + interval` in that
+  transaction and is written both to the job and, via `enqueue_retry`, to the outbox
+  (`ON CONFLICT (job_id) WHERE published_at IS NULL DO UPDATE SET available_at =
+  GREATEST(...)`). Budget exhausted → `failed` with "<message> Gave up after N attempts." and
+  `gave_up_after_attempts` in the event; transient during `cancel_requested` → `cancelled`.
+  `RunOutcome` gained `RETRY_SCHEDULED` and `CANCELLED`. The failure transaction is retried
+  up to 3 times on `40P01`/`40001`. A failure while recording success (`_succeed`) is
+  classified like any other but names no stage (no `stage.failed`).
+- **Migration 0004:** `ck_jobs_claimable_has_attempt_left` (`status NOT IN ('queued',
+  'retry_wait') OR attempt_count < max_attempts`) and `stage_checkpoints` (PK `(job_id, stage)`,
+  `stage_version`, `attempt_no`, `input_fingerprint`, `outputs` JSONB array of
+  `{path, size_bytes, sha256}`; a list because `extract_text` writes two files).
+- **Checkpoints** (`domain/checkpoints.py`, pure): a stage is checkpointed if it has
+  `stage_version`, `output_paths(workspace)` and `fingerprint_params(job)` (validate, extract,
+  chunk, summarize; not `write_artifacts`, which must register artifacts in the successful
+  attempt). Fingerprint = SHA-256 of stage, version, params and every upstream output
+  `{path, size, sha256}`. Reuse needs: no earlier stage ran in this attempt, same version, same
+  fingerprint, same file set, each file's size and SHA-256 verified (hashing last). Once one
+  stage reruns, all later ones do. Reuse emits `stage.skipped {stage, reason:
+  "checkpoint_reused"}`. Checkpoints are written in the `stage.completed` transaction and only
+  read for `attempt_no > 1`.
+- **Per-chunk reuse:** `work/{job_id}/summaries/{chunk_id}.json` holds `chunk_sha256`, the
+  configured provider and model (not the provider's reported model), `stage_version`,
+  `max_output_chars`, summary, tokens; reused only if all match. `summary.json["calls"]`
+  counts summaries (cached or not), so reruns stay byte-identical.
+- **Fault injection** (`providers/faults.py`): option `{"fault_injection": {"mode":
+  "transient", "failures": 1-20}}` or `{"mode": "permanent"}` (pydantic discriminated union, extra
+  forbidden). Transient: the first provider call of attempts 1..N raises `injected_transient`.
+  Permanent: first call raises `injected_permanent`. `ENABLE_FAULT_INJECTION` default false
+  (commented out in `.env.example`, `${ENABLE_FAULT_INJECTION:-false}` in Compose, so a shell
+  variable enables it for one session); API → `422 fault_injection_disabled` (checked after the
+  idempotent-replay shortcut); worker re-check → permanent `fault_injection_disabled` before any
+  stage; startup warnings from the API lifespan and Celery `worker_ready`. Stored options omit
+  options that are off (`exclude_none`).
 
 ## Carry-forward requirements
 
 Items later phases must address. Remove an item only when it is implemented and tested.
 
-- **Phase 5B — error classification:** replace the "any exception fails permanently" stopgap
-  with transient vs permanent errors, `retry_wait` + delayed outbox rows, and the attempt budget.
-  New stages must keep calling `report_progress`/`keep_alive` within the lease, and any new slow
-  call needs a timeout of at most half the lease.
-- **Phase 5B — retry timing:** a retry's outbox `available_at` must be >= the job's `retry_at`,
-  both computed from the same database clock in the same transaction (e.g. `now() + interval`),
-  never Python time. Otherwise the one legitimate retry message can be dropped as
-  `retry_not_due` and the job stalls in `retry_wait`.
-- **Phase 5B — attempt budget at claim:** the claim relies on the invariant
-  `attempt_count < max_attempts` for claimable jobs (the DB CHECK would reject a violation). Keep
-  it true in every path that moves a job to `queued`/`retry_wait`.
-- **Phase 5B — transient database errors inside a running stage** (in `report_progress`,
-  `keep_alive`, deadlock aborts) currently fail the job permanently; classify them as transient.
+- **All later stages (Phase 6+):** keep calling `report_progress`/`keep_alive` within the lease;
+  any new slow call needs a timeout of at most half the lease. A checkpointed stage must list
+  every file it writes in `output_paths` and every setting its output depends on in
+  `fingerprint_params`, and bump `stage_version` when its output changes for the same input.
+- **Phase 7 — lease-expiry retries:** recovery moving an expired job to `retry_wait` must reuse
+  the Part B rules: `retry_at` and the outbox `available_at` from one database-clock value in one
+  transaction (`enqueue_retry`), the backoff policy, and the budget (`claimable_has_attempt_left`
+  will reject a violation).
+- **Phase 7 — backoff after a manual retry:** the delay uses the lifetime `attempt_no`, so after
+  a manual retry (attempt 4+) the first automatic retry waits 20–40 s, not 2.5–5 s. Base it on the
+  attempt number within the current run, or document it, when manual retry is built.
+- **Phase 7 — manual retry and checkpoints:** a manual retry's first attempt has
+  `attempt_no > 1`, so it resumes from verified checkpoints. Decide whether that's wanted, or
+  whether manual retry should clear `stage_checkpoints` and start fresh.
+- **Phase 11 — real providers:** raise `ProviderTimeout`/`ProviderUnavailable`/
+  `ProviderRateLimited` for transient failures; add permanent `provider_auth` and
+  `provider_rejected` classes. Per-chunk cache keys include provider and model, so switching
+  models re-summarizes.
 - **Phase 6 — reuse the sandbox pattern** for anything that parses untrusted ZIP content, and
   keep e2e processes on the test `STORAGE_ROOT` (the isolation test must keep passing).
 - **Phase 7/11 — fenced writes to files:** a fenced worker makes no more database writes, but it
@@ -311,7 +364,7 @@ docker compose run --rm api ruff check app tests migrations devtools
 docker compose run --rm api ruff format app tests migrations devtools
 docker compose run --rm migrate              # apply migrations
 docker compose run --rm migrate alembic check   # do models and database agree?
-docker compose run --rm api alembic revision --autogenerate --rev-id 0003 -m "describe change"
+docker compose run --rm api alembic revision --autogenerate --rev-id 0005 -m "describe change"
 ```
 
 Regenerate `backend/uv.lock` after editing dependencies (runs uv in a throwaway container):
@@ -329,7 +382,7 @@ docker run --rm -v "${PWD}\backend:/src" -w /src python:3.13.18-slim sh -c "pip 
 | 2 | Migrations + state machine | **Done** |
 | 3 | Upload and job APIs with idempotency and outbox | **Done** |
 | 4 | Dispatcher + Celery worker with one dummy stage | **Done** (awaiting developer verification) |
-| 5 | PDF workflow + retries | **Part A done** (awaiting developer verification); Part B not started |
+| 5 | PDF workflow + retries | **Done** (awaiting developer verification) |
 | 6 | ZIP workflow + security | Not started |
 | 7 | Leases, recovery, cancellation, manual retry | Not started |
 | 8 | SSE with replay | Not started |

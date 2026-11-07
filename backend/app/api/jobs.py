@@ -68,7 +68,8 @@ def create_job(
             idempotency_key=idempotency_key,
             workflow_type=body.workflow_type,
             upload_id=body.upload_id,
-            resolved_options=options.model_dump(mode="json"),
+            # Options that are off (None) are left out of what the job stores.
+            resolved_options=options.model_dump(mode="json", exclude_none=True),
             sent_fields=sent_fields,
         )
     )

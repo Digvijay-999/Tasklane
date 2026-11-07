@@ -22,6 +22,7 @@ class ErrorCode(StrEnum):
     UPLOAD_EXPIRED = "upload_expired"
     UPLOAD_KIND_MISMATCH = "upload_kind_mismatch"
     JOB_NOT_FOUND = "job_not_found"
+    FAULT_INJECTION_DISABLED = "fault_injection_disabled"
     # Artifacts
     ARTIFACT_NOT_FOUND = "artifact_not_found"
     ARTIFACT_GONE = "artifact_gone"

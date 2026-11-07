@@ -1,11 +1,11 @@
 # Tasklane HTTP API
 
-> **Status (Phase 5, part A):** the routes marked **implemented** below work. `pdf_ingest` jobs
+> **Status (Phase 5):** the routes marked **implemented** below work. `pdf_ingest` jobs
 > really process the PDF (with the built-in **stub** summarizer, not an AI model) and produce
 > downloadable artifacts; see [What a pdf_ingest job does](#what-a-pdf_ingest-job-does).
-> `repo_index` jobs still run a placeholder stage (`dummy`) until Phase 6. There are **no
-> automatic retries yet** (Phase 5, part B): every failure is final. Routes marked **planned**
-> don't exist yet.
+> Transient failures are retried automatically with backoff, resuming after the stages that
+> already finished; see [Failures and retries](#failures-and-retries). `repo_index` jobs still
+> run a placeholder stage (`dummy`) until Phase 6. Routes marked **planned** don't exist yet.
 
 | Route | Status |
 |---|---|
@@ -89,6 +89,7 @@ Every error, on every route, has this shape:
 | 422 | `upload_not_ready` | The upload isn't `ready` (`details.upload_status` says why) |
 | 422 | `upload_expired` | The upload is past its `expires_at` |
 | 422 | `upload_kind_mismatch` | e.g. a ZIP upload for `pdf_ingest` |
+| 422 | `fault_injection_disabled` | The job asks for `fault_injection`, but the server has `ENABLE_FAULT_INJECTION` off |
 | 500 | `internal_error` | An unexpected server error (details are only in the logs) |
 | 503 | `service_unavailable` | The database can't be reached, or all its connections are busy |
 
@@ -199,7 +200,7 @@ with `GET /v1/jobs/{job_id}`). If Redis is down, it stays `queued` until Redis i
 |---|---|---|
 | `workflow_type` | yes | `pdf_ingest` (needs a PDF upload) or `repo_index` (needs a ZIP upload) |
 | `upload_id` | yes | A `ready`, unexpired upload of the matching kind |
-| `options` | no | Workflow-specific options. **None are defined yet**, so it must be `{}` if sent. Unknown fields are rejected. |
+| `options` | no | Workflow-specific options; unknown fields are rejected. `pdf_ingest`: only `fault_injection` (development only, see [Fault injection](#fault-injection-development-only)). `repo_index`: none, so `{}` if sent. Options that are off are not stored. |
 
 ```powershell
 $upload = curl.exe -s -X POST "$api/v1/uploads?filename=report.pdf" -H "Content-Type: application/pdf" --data-binary "@report.pdf" | ConvertFrom-Json
@@ -359,11 +360,26 @@ Inconsistent values (for example a text limit too large for `PDF_PARSER_OUTPUT_M
 overlap not smaller than the chunk target) stop the services at startup with a message naming
 the setting, instead of failing jobs later.
 
-#### Failure classes
+#### Failures and retries
 
-When a job fails, `error_class` says why and `error_summary` holds a fixed, safe message (never
-a stack trace, a file path, or text from the PDF). In this part of Phase 5 **every failure is
-permanent**: the job goes straight to `failed` after one attempt.
+When an attempt fails, `error_class` says why and `error_summary` holds a fixed, safe message
+(never a stack trace, a file path, or text from the PDF). Each class is either:
+
+- **transient**, meaning it might work if tried again. While attempts remain (3 per job), the job
+  goes to `retry_wait` with `retry_at` set, and is retried automatically after a backoff. The
+  backoff uses equal jitter over `min(RETRY_BASE_SECONDS × 2^(n−1), RETRY_MAX_SECONDS)`. With
+  the defaults (5 s and 300 s), the **first retry is 2.5–5 s out, the second 5–10 s**. A retry
+  resumes after the stages that already finished (`stage.skipped` events), and chunks that were
+  already summarized aren't sent to the provider again. If the last attempt fails too, the job
+  ends `failed` and the summary gains "Gave up after N attempts.";
+- **permanent**, meaning it would fail the same way again. The job goes straight to `failed`
+  after one attempt.
+
+The job's `attempts` list shows each try's `outcome` (`failed_transient`, `failed_permanent`,
+`succeeded`). Its events include `stage.failed` (with `retryable`) and a `job.status_changed` to
+`retry_wait`, whose payload has `retry_at` and `retry_in_seconds`.
+
+Permanent:
 
 | `error_class` | Stage | `error_summary` |
 |---|---|---|
@@ -374,13 +390,39 @@ permanent**: the job goes straight to `failed` after one attempt.
 | `pdf_text_too_large` | `extract_text` | The PDF contains more than L characters of text, which is over the limit. |
 | `pdf_too_complex` | `validate_pdf` / `extract_text` | The PDF took too long or needed too much memory to process. |
 | `input_unavailable` | `validate_pdf` / `extract_text` | The uploaded file is no longer available. Upload it again and create a new job. |
-| `stage_timeout` | `summarize` | Processing took longer than the N-second limit for this step. |
-| `internal_error` | any | An unexpected error occurred while running the job. (Details are only in the worker logs.) |
+| `injected_permanent` | `summarize` | Injected permanent failure (fault injection test). |
+| `fault_injection_disabled` | (before any stage) | The job asks for fault injection, but fault injection is disabled on the worker. |
+| `internal_error` | any | An unexpected error occurred while running the job. (Details are only in the worker logs.) Any error that isn't classified ends up here: retrying an unknown bug would only repeat it. |
+
+Transient (retried):
+
+| `error_class` | When | `error_summary` |
+|---|---|---|
+| `stage_timeout` | `summarize` ran past `SUMMARIZE_TIMEOUT_SECONDS` | Processing took longer than the N-second limit for this step. |
+| `provider_timeout`, `provider_unavailable`, `provider_rate_limited` | The summarizer timed out, was down, or refused for rate limiting (real providers arrive in Phase 11) | The summarization provider did not respond in time. / ... is temporarily unavailable. / ... is limiting requests right now. |
+| `database_unavailable` | The database connection failed during a stage | The database was temporarily unavailable. |
+| `database_conflict` | A deadlock or serialization failure (Postgres `40P01`, `40001`) | A temporary database conflict interrupted the job. |
+| `storage_unavailable` | The disk was full, read-only, or failed (`ENOSPC`, `EIO`, ...) | File storage was temporarily unavailable. |
+| `injected_transient` | Fault injection | Injected transient failure (fault injection test). |
 
 "Little or no text" means fewer than 100 visible characters in total, or fewer than 20 per page
 on average. PDFs protected only by an *owner* password (printing/copying restrictions, no
 password needed to open) are processed normally; `manifest.json` records
 `"owner_password_only": true`.
+
+#### Fault injection (development only)
+
+To watch retries happen, a `pdf_ingest` job can ask its summarizer to fail on purpose:
+
+| `options.fault_injection` | Effect |
+|---|---|
+| `{"mode": "transient", "failures": N}` (N = 1–20) | The first summarizer call of attempts 1 to N fails with `injected_transient`, so those attempts are retried; attempt N+1 runs normally. With N ≥ 3 and the default budget, the job gives up after 3 attempts. |
+| `{"mode": "permanent"}` | The first summarizer call fails with `injected_permanent`; never retried. |
+
+It needs the server setting **`ENABLE_FAULT_INJECTION=true`** (default `false`). While the
+setting is off, the API answers `422 fault_injection_disabled` and creates nothing. The worker
+checks its own setting again before running the job, and fails it with `fault_injection_disabled`
+if they disagree. When the setting is on, the API and worker log a warning at startup.
 
 ### Job object
 

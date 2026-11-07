@@ -5,11 +5,13 @@ a recording StageContext instead of the database.
 """
 
 import hashlib
+import json
 import uuid
 
 import pytest
 
 from app.domain.enums import UploadKind, WorkflowType
+from app.providers.stub import StubProvider
 from app.queue.worker_process import workflow_config
 from app.storage.local import LocalStorage
 from app.storage.workspace import JobWorkspace
@@ -85,7 +87,8 @@ def test_the_pipeline_produces_the_expected_files(pipeline):
     for stage in stages:
         stage.run(context)
 
-    names = {path.rsplit("/", 1)[-1] for path in _snapshot(workspace)}
+    files = _snapshot(workspace)
+    names = {path.rsplit("/", 1)[-1] for path in files if "/summaries/" not in path}
     assert names == {
         "validate.json",
         "pages.jsonl",
@@ -95,6 +98,10 @@ def test_the_pipeline_produces_the_expected_files(pipeline):
         "summary.md",
         "manifest.json",
     }  # no leftover temporary files
+    # One cached summary per chunk (what a retry reuses instead of calling the provider again).
+    chunk_ids = {c["chunk_id"] for c in workspace.iter_jsonl(workspace.work("chunks.jsonl"))}
+    cached = {p.rsplit("/", 1)[-1] for p in files if "/summaries/" in p}
+    assert cached == {f"{chunk_id}.json" for chunk_id in chunk_ids}
     assert [a.artifact_type for a in context.artifacts] == ["summary", "manifest"]
     assert context.calls and all(c.success and c.provider == "stub" for c in context.calls)
 
@@ -127,3 +134,63 @@ def test_rerunning_the_whole_pipeline_is_identical(pipeline):
     for stage in stages:
         stage.run(RecordingContext(workspace, job))
     assert _snapshot(workspace) == before
+
+
+# --- The per-chunk summary cache ------------------------------------------------------------------
+
+
+def _summarize(stages):
+    [stage] = [s for s in stages if s.name == "summarize"]
+    return stage
+
+
+def _chunk_calls(context) -> list:
+    return [c for c in context.calls if c.purpose == "chunk"]
+
+
+def test_a_rerun_reuses_every_chunk_summary(pipeline):
+    stages, workspace, job = pipeline
+    for stage in stages:
+        stage.run(RecordingContext(workspace, job))
+    again = RecordingContext(workspace, job)
+    _summarize(stages).run(again)
+    assert _chunk_calls(again) == []  # only the combine calls reach the provider
+
+
+@pytest.mark.parametrize("change", ["corrupt file", "other length limit", "other stage version"])
+def test_a_cached_summary_that_does_not_match_is_made_again(pipeline, change):
+    stages, workspace, job = pipeline
+    for stage in stages:
+        stage.run(RecordingContext(workspace, job))
+    summarize = _summarize(stages)
+    chunk_ids = [c["chunk_id"] for c in workspace.iter_jsonl(workspace.work("chunks.jsonl"))]
+    first = workspace.absolute(workspace.work(f"summaries/{chunk_ids[0]}.json"))
+    if change == "corrupt file":
+        first.write_text("{not json")
+        expected = 1
+    elif change == "other length limit":
+        cached = json.loads(first.read_text())
+        first.write_text(json.dumps({**cached, "max_output_chars": 1}))
+        expected = 1
+    else:
+        summarize.stage_version += 1  # the stage's logic changed: nothing cached applies
+        expected = len(chunk_ids)
+
+    again = RecordingContext(workspace, job)
+    summarize.run(again)
+
+    assert len(_chunk_calls(again)) == expected
+
+
+def test_another_model_does_not_reuse_cached_summaries(pipeline):
+    stages, workspace, job = pipeline
+    for stage in stages:
+        stage.run(RecordingContext(workspace, job))
+    summarize = _summarize(stages)
+    renamed = StubProvider()
+    renamed.model = "stub-extractive-v2"
+    summarize.provider = renamed
+    again = RecordingContext(workspace, job)
+    summarize.run(again)
+    chunks = sum(1 for _ in workspace.iter_jsonl(workspace.work("chunks.jsonl")))
+    assert len(_chunk_calls(again)) == chunks

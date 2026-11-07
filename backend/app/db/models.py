@@ -22,6 +22,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -145,6 +146,13 @@ class Job(Base):
             f"max_attempts BETWEEN 1 AND {MAX_ATTEMPTS_LIMIT} "
             "AND attempt_count BETWEEN 0 AND max_attempts",
             name="attempt_budget",
+        ),
+        # A job a worker may claim always has an attempt left (migration 0004), so the claim's
+        # `attempt_count + 1` can never exceed the budget: a job out of attempts must be failed,
+        # never queued or left waiting to retry.
+        CheckConstraint(
+            "status NOT IN ('queued', 'retry_wait') OR attempt_count < max_attempts",
+            name="claimable_has_attempt_left",
         ),
         CheckConstraint("manual_retry_count >= 0", name="manual_retry_count_nonneg"),
         # A job looks finished exactly when it has a finish time.
@@ -367,4 +375,38 @@ class ProviderCall(Base):
         # A call either succeeded, or failed with a recorded error class.
         CheckConstraint("success = (error_class IS NULL)", name="success_iff_no_error"),
         Index("ix_provider_calls_job_id", "job_id"),
+    )
+
+
+class StageCheckpoint(Base):
+    """A stage that finished during some attempt of a job, and the files it wrote (migration
+    0004). A retry skips the stage if the checkpoint still verifies; see app/domain/checkpoints.py.
+    """
+
+    __tablename__ = "stage_checkpoints"
+
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True
+    )
+    stage: Mapped[str] = mapped_column(primary_key=True)  # one checkpoint per stage per job
+    stage_version: Mapped[int] = mapped_column(SmallInteger)
+    attempt_no: Mapped[int] = mapped_column(SmallInteger)  # the attempt that wrote it
+    input_fingerprint: Mapped[str]
+    # [{"path": ..., "size_bytes": ..., "sha256": ...}, ...]: every file the stage wrote
+    outputs: Mapped[list[dict[str, Any]]] = mapped_column(JSONB())
+    created_at: Mapped[datetime] = mapped_column(server_default=now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=now())
+
+    __table_args__ = (
+        CheckConstraint("stage_version >= 1", name="stage_version_positive"),
+        CheckConstraint("attempt_no >= 1", name="attempt_no_positive"),
+        CheckConstraint(f"input_fingerprint ~ '{SHA256_PATTERN}'", name="input_fingerprint_format"),
+        # A checkpoint lists at least one file; there is nothing to verify otherwise. (CASE,
+        # because jsonb_array_length() raises an error, not a violation, on a non-array, and SQL
+        # doesn't promise to evaluate AND from left to right.)
+        CheckConstraint(
+            "CASE WHEN jsonb_typeof(outputs) = 'array' "
+            "THEN jsonb_array_length(outputs) > 0 ELSE false END",
+            name="outputs_nonempty",
+        ),
     )

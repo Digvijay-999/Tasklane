@@ -5,7 +5,7 @@ processing jobs (PDF ingestion and repository ZIP indexing), with a focus on dur
 retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the goals and
 [docs/architecture.md](docs/architecture.md) for the planned design.
 
-## Current status: Phase 5 of 12 (part A done)
+## Current status: Phase 5 of 12
 
 **What works today:**
 
@@ -41,8 +41,15 @@ retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) fo
     a job is never run twice at the same time.
   - While Redis is down, new jobs stay `queued` and visible; the dispatcher backs off and
     publishes them when Redis returns.
-  - Any error during a stage fails the job permanently (no automatic retries yet: Phase 5,
-    part B).
+  - **Transient failures are retried automatically**: provider timeouts and outages,
+    database connection trouble and deadlocks, disk trouble, and stage timeouts. The job waits
+    in `retry_wait` with a backoff (equal jitter: the first retry is 2.5–5 s away, the second
+    5–10 s), up to 3 attempts in all, and then ends `failed` with "Gave up after 3 attempts."
+    A retry resumes after the stages that already finished: their saved outputs are verified by
+    size and SHA-256 first. Errors caused by the input, and errors nobody has classified, fail
+    at once without retrying.
+  - For development, a job can ask for injected failures (`fault_injection`) to watch retries
+    happen. This needs `ENABLE_FAULT_INJECTION=true` on the server and is off by default.
   - A worker killed mid-job leaves that job `running` until lease recovery exists (Phase 7).
   See [docs/reliability.md](docs/reliability.md#delivery-outbox--dispatcher--redis--worker).
 - **PDF ingestion** (`pdf_ingest`): validate, extract text, chunk, summarize, and write two
@@ -59,7 +66,7 @@ retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) fo
 - `repo_index` jobs still run a placeholder stage (`dummy`, about 3 seconds of simulated
   progress, `DUMMY_STAGE_SECONDS`). ZIP contents are processed in Phase 6.
 
-**Not implemented yet:** automatic retries (Phase 5, part B), ZIP processing, lease recovery,
+**Not implemented yet:** ZIP processing, lease recovery,
 cancellation, manual retry, the event stream, the dashboard, metrics, and any real LLM provider.
 See the phase list in [CLAUDE.md](CLAUDE.md).
 
@@ -159,7 +166,7 @@ docker compose run --rm migrate alembic current                   # show the app
 docker compose run --rm migrate alembic history                   # list migrations
 docker compose run --rm migrate alembic check                     # "No new upgrade operations
                                                                   #  detected" = models match DB
-docker compose run --rm api alembic revision --autogenerate --rev-id 0004 -m "describe change"
+docker compose run --rm api alembic revision --autogenerate --rev-id 0005 -m "describe change"
 ```
 
 Autogenerate writes a *draft* into `backend/migrations/versions/`. Always review it by hand: it

@@ -44,6 +44,7 @@ STATUS_BY_CODE: dict[str, int] = {
     ErrorCode.UPLOAD_NOT_READY: 422,
     ErrorCode.UPLOAD_EXPIRED: 422,
     ErrorCode.UPLOAD_KIND_MISMATCH: 422,
+    ErrorCode.FAULT_INJECTION_DISABLED: 422,
 }
 
 # Codes produced here rather than by services.
