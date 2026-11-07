@@ -128,7 +128,6 @@ def queue_settings(api_settings: Settings, dev_settings: Settings) -> Settings:
             "redis_url": _test_redis_url(dev_settings.redis_url),
             "celery_queue": TEST_QUEUE,
             "dispatch_poll_seconds": 0.2,
-            "dummy_stage_seconds": 0.0,
             "lease_seconds": 30,
             "provider_timeout_seconds": 10,  # must stay <= lease / 2 (validated in Settings)
         }

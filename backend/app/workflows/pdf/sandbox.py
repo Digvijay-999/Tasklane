@@ -1,40 +1,31 @@
-"""Run the PDF parser (parse_child.py) in a separate, limited process and enforce its limits.
+"""Run the PDF parser (parse_child.py) in the shared sandbox (app/workflows/sandbox.py).
 
-Which mechanism enforces which limit:
-- Wall-clock time: THIS process waits with a deadline and kills the child's whole process group
-  (SIGKILL) when it passes. A stuck parser can't stop itself, but it can be stopped from outside.
-- Memory: RLIMIT_AS. Exceeding it makes allocations fail (MemoryError) or kills the child.
-- CPU: RLIMIT_CPU (deadline + a few seconds), a kernel backstop in case this process stalls.
-- The RLIMITs (and "no core dumps") are set by limited_launcher.py inside the child, before the
-  parser is loaded.
-- Output size: RLIMIT_FSIZE, so a crafted file can't fill the disk with "extracted text".
-- Pages and characters: checked inside the child (cheap, and it stops early).
-
-While waiting, the parent wakes at least every `keep_alive_interval` seconds to renew the job's
-lease, so a long extraction can't let the lease lapse (Phase 7 adds independent heartbeats).
+Pages and characters are checked inside the child (cheap, and it stops early); time, memory, CPU
+and output size are enforced by the sandbox. A parser that is killed or runs out of resources
+fails the job with `pdf_too_complex`.
 """
 
-import json
-import logging
-import os
-import queue
-import signal
-import subprocess
-import sys
-import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from app.domain.errors import ERRORS, JobError
-
-logger = logging.getLogger(__name__)
+from app.workflows.sandbox import SandboxLimits, run_sandboxed
 
 CHILD_SCRIPT = Path(__file__).with_name("parse_child.py")
-LAUNCHER = Path(__file__).with_name("limited_launcher.py")
-_STDERR_TAIL_BYTES = 4096
+
+# The only error classes the PDF child may report (anything else becomes internal_error).
+PDF_CHILD_ERRORS = frozenset(
+    {
+        "pdf_encrypted",
+        "pdf_corrupt",
+        "pdf_no_text",
+        "pdf_too_many_pages",
+        "pdf_text_too_large",
+        "pdf_too_complex",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -59,137 +50,15 @@ def run_parser(
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Run the child and return its result. Raises JobError for every expected failure."""
-    command = [
-        sys.executable,
-        "-I",  # isolated: no app imports, no PYTHON* environment variables, no user site
-        str(LAUNCHER),  # sets the resource limits, then runs the child script
-        str(limits.memory_bytes),
-        str(int(timeout_seconds) + 5),  # CPU seconds: a backstop behind the wall-clock deadline
-        str(limits.output_max_bytes),
-        str(child_script),
-        mode,
-        str(input_path),
-        str(output_path),
-        str(limits.max_pages),
-        str(limits.max_chars),
-    ]
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
-        # The child gets no secrets: not the database password, not API keys.
-        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"},
-        start_new_session=True,  # its own process group, so it can be killed as a whole
+    return run_sandboxed(
+        child_script,
+        [mode, str(input_path), str(output_path), str(limits.max_pages), str(limits.max_chars)],
+        limits=SandboxLimits(limits.memory_bytes, limits.output_max_bytes),
+        timeout_seconds=timeout_seconds,
+        keep_alive=keep_alive,
+        keep_alive_interval=keep_alive_interval,
+        too_complex_error="pdf_too_complex",
+        allowed_errors=PDF_CHILD_ERRORS,
+        on_progress=on_progress,
+        clock=clock,
     )
-    messages: queue.Queue[dict[str, Any] | None] = queue.Queue()
-    stderr_tail = bytearray()
-    readers = [
-        threading.Thread(target=_read_messages, args=(process.stdout, messages), daemon=True),
-        threading.Thread(target=_read_tail, args=(process.stderr, stderr_tail), daemon=True),
-    ]
-    for reader in readers:
-        reader.start()
-
-    deadline = clock() + timeout_seconds
-    next_keep_alive = clock() + keep_alive_interval
-    try:
-        while True:
-            now = clock()
-            if now >= deadline:
-                _kill(process)
-                logger.warning(
-                    "pdf parser timed out", extra={"mode": mode, "timeout": timeout_seconds}
-                )
-                raise JobError("pdf_too_complex")
-            if now >= next_keep_alive:
-                keep_alive()  # raises if this worker no longer owns the job
-                next_keep_alive = now + keep_alive_interval
-            try:
-                message = messages.get(timeout=max(0.01, min(deadline, next_keep_alive) - now))
-            except queue.Empty:
-                continue
-            if message is None:  # stdout closed: the child exited without a final message
-                process.wait(timeout=10)
-                readers[1].join(timeout=5)  # let the stderr reader finish before reading it
-                return _interpret_exit(process, bytes(stderr_tail), mode)
-            kind = message.get("type")
-            if kind == "progress" and on_progress is not None:
-                on_progress(int(message.get("done", 0)), int(message.get("total", 0)))
-            elif kind == "result":
-                process.wait(timeout=10)
-                return {k: v for k, v in message.items() if k != "type"}
-            elif kind == "error":
-                process.wait(timeout=10)
-                raise _job_error(message)
-    finally:
-        _kill(process)
-        for reader in readers:
-            reader.join(timeout=2)
-
-
-def _read_messages(stream: Any, messages: "queue.Queue[dict[str, Any] | None]") -> None:
-    try:
-        for raw in stream:
-            try:
-                message = json.loads(raw)
-            except ValueError:
-                continue  # ignore anything that isn't a protocol line
-            if isinstance(message, dict):
-                messages.put(message)
-    finally:
-        messages.put(None)
-
-
-def _read_tail(stream: Any, tail: bytearray) -> None:
-    for chunk in iter(lambda: stream.read(1024), b""):
-        tail.extend(chunk)
-        del tail[:-_STDERR_TAIL_BYTES]
-
-
-def _job_error(message: dict[str, Any]) -> JobError:
-    """Turn the child's error message into a JobError, trusting only known classes and
-    numeric parameters (the child processed untrusted input)."""
-    error_class = message.get("error_class")
-    params = message.get("params") or {}
-    if error_class not in ERRORS or not isinstance(params, dict):
-        return JobError("internal_error")
-    try:
-        return JobError(error_class, **{str(k): int(v) for k, v in params.items()})
-    except (KeyError, TypeError, ValueError):  # parameters don't fit the message template
-        return JobError("internal_error")
-
-
-def _interpret_exit(process: subprocess.Popen, stderr_tail: bytes, mode: str) -> dict[str, Any]:
-    returncode = process.wait(timeout=10)
-    # Killed by a signal (out of memory, CPU limit, file-size limit) or ran out of memory:
-    # the file needs more resources than we allow.
-    # (Python ignores the "file too large" signal, so going over RLIMIT_FSIZE shows up as an
-    # EFBIG OSError instead: "[Errno 27] File too large".)
-    exhausted = (b"MemoryError", b"[Errno 27]", b"File too large")
-    if returncode < 0 or any(marker in stderr_tail for marker in exhausted):
-        logger.warning(
-            "pdf parser was killed or ran out of memory or disk allowance",
-            extra={"mode": mode, "returncode": returncode},
-        )
-        raise JobError("pdf_too_complex")
-    # Any other exit without a protocol message is a bug in the parser code, not the input.
-    logger.error(
-        "pdf parser exited unexpectedly",
-        extra={
-            "mode": mode,
-            "returncode": returncode,
-            "stderr": stderr_tail.decode(errors="replace"),
-        },
-    )
-    raise RuntimeError(f"pdf parser exited with code {returncode}")
-
-
-def _kill(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait(timeout=10)

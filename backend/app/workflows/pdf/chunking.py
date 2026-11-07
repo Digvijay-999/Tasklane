@@ -40,7 +40,7 @@ class ChunkingSettings:
 @dataclass(frozen=True)
 class Piece:
     text: str
-    page: int
+    page: int  # page number (PDF) or line number (repo source file)
 
 
 @dataclass(frozen=True)
@@ -82,6 +82,27 @@ def chunk_pages(
     pages: list[tuple[int, str]], *, input_sha256: str, settings: ChunkingSettings
 ) -> list[Chunk]:
     pieces = split_pieces(pages, settings.max_chars)
+    chunks = []
+    for index, group in enumerate(group_pieces(pieces, settings)):
+        text = " ".join(p.text for p in group)
+        chunks.append(
+            Chunk(
+                chunk_id=chunk_id(input_sha256, CHUNKER_VERSION, settings, index, text),
+                index=index,
+                text=text,
+                sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                page_start=group[0].page,
+                page_end=group[-1].page,
+            )
+        )
+    return chunks
+
+
+def group_pieces(pieces: list[Piece], settings: ChunkingSettings) -> list[list[Piece]]:
+    """Pack pieces greedily into groups of about target_chars (never more than max_chars, counting
+    one separator character between pieces), each group after the first starting with the
+    previous group's last whole pieces up to overlap_chars. Also used by the repo chunker, where
+    a piece is one line."""
     groups: list[list[Piece]] = []
     current: list[Piece] = []
     for piece in pieces:
@@ -94,32 +115,23 @@ def chunk_pages(
         current.append(piece)
     if current and (not groups or current != groups[-1]):
         groups.append(current)
+    return groups
 
-    chunks = []
-    for index, group in enumerate(groups):
-        text = " ".join(p.text for p in group)
-        sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        identity = "|".join(
-            [
-                input_sha256,
-                CHUNKER_VERSION,
-                f"{settings.target_chars}/{settings.max_chars}/{settings.overlap_chars}",
-                str(index),
-                text,
-            ]
-        )
-        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
-        chunks.append(
-            Chunk(
-                chunk_id=f"c{index:04d}-{digest}",
-                index=index,
-                text=text,
-                sha256=sha,
-                page_start=group[0].page,
-                page_end=group[-1].page,
-            )
-        )
-    return chunks
+
+def chunk_id(
+    input_sha256: str, version: str, settings: ChunkingSettings, index: int, text: str
+) -> str:
+    """c{index:04d}-{first 12 hex of sha256(input_sha256|version|sizes|index|text)}."""
+    identity = "|".join(
+        [
+            input_sha256,
+            version,
+            f"{settings.target_chars}/{settings.max_chars}/{settings.overlap_chars}",
+            str(index),
+            text,
+        ]
+    )
+    return f"c{index:04d}-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:12]}"
 
 
 def _length(pieces: list[Piece]) -> int:

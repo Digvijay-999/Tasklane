@@ -5,7 +5,7 @@ processing jobs (PDF ingestion and repository ZIP indexing), with a focus on dur
 retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the goals and
 [docs/architecture.md](docs/architecture.md) for the planned design.
 
-## Current status: Phase 5 of 12
+## Current status: Phase 6 of 12
 
 **What works today:**
 
@@ -27,8 +27,8 @@ retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) fo
   [docs/reliability.md](docs/reliability.md).
 - **Uploads** (`POST /v1/uploads`): PDF and ZIP files are streamed to disk in chunks, hashed
   (SHA-256) while streaming, size-limited on the bytes actually received (50 MiB PDF, 100 MiB ZIP),
-  and checked for extension, declared type, and file signature. ZIP *contents* are not inspected
-  yet (Phase 6).
+  and checked for extension, declared type, and file signature. ZIP contents are inspected when
+  a `repo_index` job runs (below).
 - **Jobs** (`POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{id}`): job creation requires an
   `Idempotency-Key`; replays return the same job (`200`, `Idempotent-Replayed: true`) and reusing
   a key for a different request returns `409`. The job, its `job.created` event, and an outbox
@@ -63,10 +63,27 @@ retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) fo
   - Password-protected, damaged, image-only (scanned), too-long, and too-large PDFs fail with a
     clear message after one attempt. Scanned PDFs are not supported (no OCR).
   - Details: [docs/api.md](docs/api.md#what-a-pdf_ingest-job-does).
-- `repo_index` jobs still run a placeholder stage (`dummy`, about 3 seconds of simulated
-  progress, `DUMMY_STAGE_SECONDS`). ZIP contents are processed in Phase 6.
+- **Repository indexing** (`repo_index`): validate the ZIP, extract it, filter the files,
+  chunk the sources by lines, summarize, and write three artifacts: `summary.md` (an overview
+  and one summary per file), `chunks.jsonl` (every chunk with its file, line range and
+  SHA-256), and `manifest.json` (what was included, what was skipped and why, per-language
+  counts, and the limits that applied).
+  - The ZIP is read in a separate, limited process (like PDFs). Nothing from the archive is
+    ever executed, imported, or built, symlinks are never created or followed, and files are
+    never written under their own names: their bytes go into one generated file.
+  - An archive with any unsafe name (`..`, an absolute path, a drive letter, a backslash, a NUL
+    byte, duplicate names or names differing only in case) is rejected as a whole. So are
+    encrypted, damaged, and zip-bomb archives (sizes are counted while decompressing; the sizes
+    written in the ZIP are never trusted), archives with more than 5,000 entries, and archives
+    that expand to more than 500 MiB.
+  - Only allowlisted text and code files are indexed. Everything else is skipped with a reason
+    (`excluded_dir` for `.git`, `node_modules`, `dist`, ...; `hidden`, `binary`, `too_large`
+    over 5 MiB, `minified`, `lockfile`, `symlink`, `nested_archive`, `unsupported_type`, ...).
+    An archive with nothing to index fails with `repo_no_sources`.
+  - Threat model and where each defense is enforced and tested:
+    [docs/security.md](docs/security.md). Job details: [docs/api.md](docs/api.md#what-a-repo_index-job-does).
 
-**Not implemented yet:** ZIP processing, lease recovery,
+**Not implemented yet:** lease recovery,
 cancellation, manual retry, the event stream, the dashboard, metrics, and any real LLM provider.
 See the phase list in [CLAUDE.md](CLAUDE.md).
 
@@ -102,8 +119,9 @@ Watch jobs being published and run:
 docker compose logs -f worker dispatcher
 ```
 
-To have time to watch a `repo_index` job (or to stop the worker mid-job), make the placeholder
-stage longer, e.g. `DUMMY_STAGE_SECONDS=30` in `.env`, then `docker compose up -d worker`.
+To have time to watch a job (or to stop the worker mid-job), slow the stub summarizer down,
+e.g. `STUB_DELAY_SECONDS=2` (seconds per summarization call) in `.env`, then
+`docker compose up -d worker`.
 
 ### Sample PDFs
 
@@ -115,6 +133,17 @@ one) into a folder you choose:
 $demo = "$env:USERPROFILE\tasklane-demo"
 New-Item -ItemType Directory -Force $demo | Out-Null
 docker compose run --rm -v "${demo}:/out" api python -m devtools.pdf_samples /out
+```
+
+### Sample ZIPs
+
+Likewise for repository ZIPs: `repo.zip` (a realistic small repository with files skipped for
+every reason), `zipslip.zip`, `symlink.zip`, `bomb.zip` (about 2 KB on disk: 2 MiB of zeros
+compressed about 1000:1, rejected before it is decompressed), `encrypted.zip`, `corrupt.zip`,
+`nested.zip`, and `empty_repo.zip`:
+
+```powershell
+docker compose run --rm -v "${demo}:/out" api python -m devtools.zip_samples /out
 ```
 
 ## Try the API (PowerShell)
@@ -197,7 +226,7 @@ separate database, `<POSTGRES_DB>_test` (for example `tasklane_test`), which the
 on every run; they never touch your development database.
 
 ```powershell
-docker compose run --rm api pytest                  # everything (about a minute)
+docker compose run --rm api pytest                  # everything (about 4 minutes)
 docker compose run --rm api pytest -m "not e2e"     # skip the end-to-end tests
 docker compose run --rm api pytest -m e2e           # only end-to-end: real worker + dispatcher
 docker compose run --rm api pytest tests/unit       # unit tests only (no database needed)

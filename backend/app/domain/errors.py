@@ -51,6 +51,46 @@ ERRORS: dict[str, ErrorSpec] = {
         ErrorKind.PERMANENT,
         "The PDF took too long or needed too much memory to process.",
     ),
+    # Repository ZIPs (repo_index). Messages never include names from inside the archive.
+    "zip_corrupt": ErrorSpec(
+        ErrorKind.PERMANENT,
+        "The archive is damaged or is not a valid ZIP file, so it could not be read.",
+    ),
+    "zip_encrypted": ErrorSpec(
+        ErrorKind.PERMANENT,
+        "The archive contains password-protected entries. Upload an archive without encryption.",
+    ),
+    "zip_unsafe_path": ErrorSpec(
+        ErrorKind.PERMANENT,
+        "The archive contains an entry with an unsafe or conflicting name (for example an "
+        "absolute path, a '..' segment, a drive letter, a backslash, or two names that differ "
+        "only in letter case), so the whole archive was rejected.",
+    ),
+    "zip_too_many_files": ErrorSpec(
+        ErrorKind.PERMANENT, "The archive has {entries} entries; the limit is {limit}."
+    ),
+    "zip_too_large": ErrorSpec(
+        ErrorKind.PERMANENT,
+        "The archive's files add up to more than the limit of {limit} bytes when extracted.",
+    ),
+    "zip_bomb": ErrorSpec(
+        ErrorKind.PERMANENT,
+        "The archive is compressed more than {ratio}:1, which is how zip bombs work, so it was "
+        "not extracted.",
+    ),
+    "zip_too_complex": ErrorSpec(
+        ErrorKind.PERMANENT, "The archive took too long or needed too much memory to process."
+    ),
+    "repo_no_sources": ErrorSpec(
+        ErrorKind.PERMANENT,
+        "None of the {files} files in the archive can be indexed (unsupported file types, "
+        "excluded folders, binary, empty, or too large files).",
+    ),
+    "repo_too_large": ErrorSpec(
+        ErrorKind.PERMANENT,
+        "The repository has too much source code to summarize within the limit of {limit} "
+        "summarization calls.",
+    ),
     "input_unavailable": ErrorSpec(
         ErrorKind.PERMANENT,
         "The uploaded file is no longer available. Upload it again and create a new job.",
@@ -106,6 +146,15 @@ INPUT_ERROR_CLASSES = frozenset(
         "pdf_too_many_pages",
         "pdf_text_too_large",
         "pdf_too_complex",
+        "zip_corrupt",
+        "zip_encrypted",
+        "zip_unsafe_path",
+        "zip_too_many_files",
+        "zip_too_large",
+        "zip_bomb",
+        "zip_too_complex",
+        "repo_no_sources",
+        "repo_too_large",
         "input_unavailable",
     }
 )

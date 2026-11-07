@@ -63,14 +63,19 @@ class JobWorkspace:
     def write_text(self, relative: str, text: str) -> None:
         self.write_bytes(relative, text.encode("utf-8"))
 
-    def write_json(self, relative: str, value: Any) -> None:
-        """Deterministic JSON (sorted keys), so the same data always gives the same bytes."""
+    def write_json(self, relative: str, value: Any, *, ensure_ascii: bool = False) -> None:
+        """Deterministic JSON (sorted keys), so the same data always gives the same bytes.
+        ensure_ascii=True writes every non-ASCII character as a \\u escape (used for artifacts
+        that contain untrusted names and text)."""
         self.write_text(
-            relative, json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+            relative,
+            json.dumps(value, sort_keys=True, indent=2, ensure_ascii=ensure_ascii) + "\n",
         )
 
-    def write_jsonl(self, relative: str, records: list[dict[str, Any]]) -> None:
-        lines = (json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n" for r in records)
+    def write_jsonl(
+        self, relative: str, records: list[dict[str, Any]], *, ensure_ascii: bool = False
+    ) -> None:
+        lines = (json.dumps(r, sort_keys=True, ensure_ascii=ensure_ascii) + "\n" for r in records)
         self.write_text(relative, "".join(lines))
 
     def discard(self, path: Path) -> None:

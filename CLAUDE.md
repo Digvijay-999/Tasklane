@@ -171,7 +171,8 @@ The full product brief is in `PROJECT_BRIEF.md`; the planned design is in `docs/
 - **Phase 4 failure handling:** any exception in a stage fails the job permanently with
   `error_class = internal_error` and a safe summary (traceback only in logs). No retries yet.
 - **Placeholder workflow:** every workflow type runs one `dummy` stage (`DUMMY_STAGE_SECONDS`,
-  default 3, five progress steps) until Phases 5-6. (Since Phase 5 only `repo_index` does.)
+  default 3, five progress steps) until Phases 5-6. (Removed in Phase 6: the class lives on as
+  `tests/dummy_stage.py`; slow test jobs use `STUB_DELAY_SECONDS`.)
 - **Compose:** `dispatcher` and `worker` services, Redis with append-only persistence on the
   `redisdata` volume (`docker compose down -v` also deletes queued messages).
 - **Dev reload runner** (`backend/devtools/reload.py`), not the `watchfiles` CLI: watchfiles 1.3.0
@@ -291,6 +292,86 @@ The full product brief is in `PROJECT_BRIEF.md`; the planned design is in `docs/
   stage; startup warnings from the API lifespan and Celery `worker_ready`. Stored options omit
   options that are off (`exclude_none`).
 
+## Decisions made (Phase 6)
+
+Full reasoning for each decision: `PHASE6_NOTES.md`.
+
+- **Stages** (`app/workflows/repo/stages.py`, weights): `validate_archive` [5], `extract_files`
+  [15], `filter_files` [5], `chunk_sources` [5], `summarize` [65], `write_artifacts` [5]. The
+  first five are checkpointed. Work files (generated names only): `archive.json`, `files.bin` +
+  `extract.json`, `files.jsonl` + `filter.json`, `chunks.jsonl`, `summary.json`.
+- **Shared sandbox:** `app/workflows/sandbox.py` (`run_sandboxed`, `SandboxLimits`) and
+  `app/workflows/limited_launcher.py` serve both children; each caller passes its
+  `too_complex_error` and the `allowed_errors` its child may report. `pdf/sandbox.py` is a thin
+  wrapper. ZIP child: `workflows/repo/zip_child.py` (stdlib only, test-enforced), wrapper
+  `workflows/repo/archive.py` re-validates the child's output files.
+- **Two sandboxed passes:** `inspect` reads only the central directory (rejections, entry kinds);
+  `extract` decompresses only entries that pass the path rules and whose declared size is within
+  `ZIP_MAX_FILE_BYTES`. Skipped paths (node_modules, nested archives, ...) are never
+  decompressed, and `ZIP_MAX_TOTAL_BYTES` counts only extracted files.
+- **No file is written under an archive name:** extracted bytes go into `files.bin` at offsets
+  recorded (with SHA-256) in `extract.json`. Names are still validated, because they appear in
+  outputs.
+- **Whole-archive rejection (`zip_unsafe_path`)** for: NUL (checked on `orig_filename`), control
+  characters, backslash, leading `/`, drive letter `^[A-Za-z]:`, empty / `.` / `..` segments, a
+  name whose `realpath` against the job's work folder leaves it, duplicates, NFC+casefold
+  collisions, a path that is both file and folder, a name over 4,096 characters. Both
+  `orig_filename` and `filename` (Unicode extra field) are checked. Names over
+  `ZIP_MAX_PATH_LENGTH` skip `realpath` and the folder-prefix set (cost), and are skipped. Encrypted flag or AES method anywhere → `zip_encrypted`. Any read
+  error → `zip_corrupt`, except host disk errnos (`ENOSPC/EIO/EROFS/EDQUOT/EAGAIN`) →
+  transient `storage_unavailable` (allowed from the ZIP child).
+- **Path too long (240) / too deep (20 components): skipped, not rejected**; the child cuts long
+  names to the limit in `archive.json`.
+- **Bomb defense:** declared sizes only fail fast (declared total, declared ratio) or skip early;
+  real bytes are counted per 64 KiB block (`Budget`): total > limit → `zip_too_large`; per entry
+  or overall `out > ratio × compressed` once `out > ZIP_RATIO_CHECK_MIN_BYTES` (1 MiB) →
+  `zip_bomb`; a file over the per-file limit stops reading and is skipped `too_large`. A header
+  that understates a size ends as `zip_corrupt` (zipfile stops at the stated size; CRC fails).
+- **`filter_files` deletes `files.bin`** when it fails permanently (`repo_no_sources`,
+  `repo_too_large`): no retry can use it. Successful jobs keep it (Phase 12 retention).
+- **Symlinks / special files** from the mode bits (`external_attr >> 16`): skipped `symlink` /
+  `special_file`, content never read.
+- **Filtering** (`workflows/repo/filters.py`, pure): extension allowlist (+ README, LICENSE,
+  Makefile, Dockerfile), 14 skip reasons in `SkipReason`; path rules in a fixed order; content
+  rules: NUL in first 8 KiB or >10 % replacement characters → `binary`, blank → `empty`,
+  JS/TS/CSS/JSON/HTML averaging >250 chars per line → `minified`. Hidden files (incl. `.env`)
+  are skipped. `REPO_EXCLUDED_DIRS` (comma list, empty = default list) matched case-insensitively
+  at any depth.
+- **Chunking by lines** (`workflows/repo/chunking.py`) reuses `pdf/chunking.group_pieces` and
+  `chunk_id` (version `repo-lines-1`); a chunk never spans files; global chunk index.
+- **Summaries:** per file `summarize_document` (map, then combine if >1 chunk); overview =
+  `reduce_summaries` over `"path: summary"` cut to `final_max_chars` (keeps the
+  terminates-guarantee). `planned_calls` is an upper bound checked against
+  `REPO_MAX_PROVIDER_CALLS` (1000) before any call; `filter_files` also stops early once the text
+  can't fit (`calls × chunk_max_chars`). `SummaryCaller` (`workflows/common.py`) is shared with
+  the PDF summarize stage (cache, fault injection, recording, output cap, progress).
+- **Artifacts:** `summary.md` (paths: `escape_markdown` after making category-C characters
+  visible as `\uXXXX`; summaries in `fenced()` blocks with a fence longer than any `~` run
+  inside), `chunks.jsonl` (`application/x-ndjson`) and `manifest.json`
+  (`tasklane.repo_manifest/1`), both written with `ensure_ascii=True`. No migration was needed
+  (`chunks` was already an artifact type; error classes are unconstrained text).
+- **Errors:** nine permanent input errors (`zip_corrupt`, `zip_encrypted`, `zip_unsafe_path`,
+  `zip_too_many_files {entries, limit}`, `zip_too_large {limit}`, `zip_bomb {ratio}`,
+  `zip_too_complex`, `repo_no_sources {files}`, `repo_too_large {limit}`), all in
+  `INPUT_ERROR_CLASSES`.
+- **`escape_markdown` escapes `&`** too (both workflows), so `&#x202e;` stays literal.
+- **Settings** (bytes, validated at startup): `ZIP_MAX_ENTRIES` 5000 (max 100,000; the inspect
+  output limit grows with it), `ZIP_MAX_TOTAL_BYTES`
+  500 MiB, `ZIP_MAX_FILE_BYTES` 5 MiB (≤ total), `ZIP_MAX_COMPRESSION_RATIO` 100,
+  `ZIP_RATIO_CHECK_MIN_BYTES` 1 MiB, `ZIP_MAX_PATH_LENGTH` 240, `ZIP_MAX_PATH_DEPTH` 20, ZIP
+  timeouts 60/300 s, `ZIP_SANDBOX_MEMORY_MB` 512 (≥ 128 + 3 × file MiB), `REPO_EXCLUDED_DIRS`,
+  `REPO_MAX_PROVIDER_CALLS`. `config.py` imports the filter module lazily (reading settings
+  doesn't load `workflows`). The Celery hard limit must exceed the larger workflow's stage sum.
+- **Checkpoint fingerprints:** extract and filter include every path-rule setting (excluded
+  dirs, path length/depth, file limit); `REPO_MAX_PROVIDER_CALLS` is in none (it can only fail a
+  stage, never change a successful output).
+- **`STUB_DELAY_SECONDS`** (default 0, < provider timeout) replaces `DUMMY_STAGE_SECONDS`;
+  e2e timing tests use it. `repo_index` accepts the `fault_injection` option.
+- **Tests:** archives are built in code (`devtools/zip_samples.py`; header patching for
+  encrypted flags, NUL names and lying sizes). Test limits: 50 entries, 512 KiB total, 128 KiB
+  per file, 16 KiB ratio floor. Every rejection test snapshots the storage folder's parent before
+  and after the job.
+
 ## Carry-forward requirements
 
 Items later phases must address. Remove an item only when it is implemented and tested.
@@ -313,18 +394,21 @@ Items later phases must address. Remove an item only when it is implemented and 
   `ProviderRateLimited` for transient failures; add permanent `provider_auth` and
   `provider_rejected` classes. Per-chunk cache keys include provider and model, so switching
   models re-summarizes.
-- **Phase 6 — reuse the sandbox pattern** for anything that parses untrusted ZIP content, and
-  keep e2e processes on the test `STORAGE_ROOT` (the isolation test must keep passing).
+- **All later phases — e2e isolation:** keep e2e processes on the test `STORAGE_ROOT`; the
+  isolation test (now for a PDF and a repo job) must keep passing.
 - **Phase 7/11 — fenced writes to files:** a fenced worker makes no more database writes, but it
   can finish replacing a file under `work/` or `artifacts/` first. Harmless while outputs are
   deterministic; a non-deterministic provider (Phase 11) or recovery that starts a new attempt
   (Phase 7) must write per-attempt files or otherwise prevent two attempts writing the same path.
-- **Phase 9 — rendering `summary.md`:** it contains PDF text as Markdown (only Markdown
-  punctuation is escaped). The dashboard must not render it with raw HTML or active links.
-- **Phase 7 — orphaned parser processes:** the PDF parser runs in its own session so it can be
-  killed as a group; if the *worker* is killed (SIGKILL/OOM), the parser is not killed with it. It
-  exits at its next write to the closed stdout pipe (per page during extraction), when it
-  finishes, or at `RLIMIT_CPU` (deadline + 5 s). Consider a parent-death signal.
+- **Phase 9 — rendering `summary.md`:** the PDF one contains PDF text as Markdown (only
+  Markdown punctuation is escaped); the repo one keeps summaries in fenced blocks. The dashboard
+  must not render either with raw HTML, active links or auto-linked bare URLs, and must escape
+  file paths from `manifest.json` (they are untrusted).
+- **Phase 7 — orphaned parser processes:** the PDF parser and the ZIP child run in their own
+  session so they can be killed as a group; if the *worker* is killed (SIGKILL/OOM), the child is
+  not killed with it. It exits at its next write to the closed stdout pipe (per page / per
+  extracted file), when it finishes, or at `RLIMIT_CPU` (deadline + 5 s). Consider a
+  parent-death signal.
 - **Phase 7 — heartbeats independent of progress updates** (a background heartbeat for stages
   that can't report progress often enough).
 - **Phase 7 — lost messages:** recovery must detect claimable jobs (`queued`, or `retry_wait`
@@ -342,6 +426,22 @@ Items later phases must address. Remove an item only when it is implemented and 
   is the transaction start time).
 - **Phase 9 — queue health:** surface dispatch failures (`dispatch_attempts`,
   `last_dispatch_error`) and the oldest queued job's age.
+- **Phase 11 — repository text sent to a real provider:** indexed files can contain secrets
+  (hidden files like `.env` are skipped, but a key in `config.py` is not). Add secret scanning or
+  redaction before repo text leaves the machine, delimit repo text *and file paths* as data in
+  the prompt, and test with prompt-injection content (`docs/security.md`, "Not covered").
+- **Phase 12 — repo work folders are large:** `work/{job_id}/files.bin` can approach
+  `ZIP_MAX_TOTAL_BYTES` (500 MiB) per *succeeded* job (one upload can feed many jobs), plus
+  `files.jsonl`; retention must clean them. Consider also capping extraction near the text the
+  call limit allows (`calls × chunk_max_chars × 4` bytes) without misfiring on files the filter
+  would skip (minified, binary).
+- **Phase 11 — summarize time vs call limit:** 1,000 calls at ~2 s each exceed the 900 s
+  summarize limit, and combine calls aren't cached across attempts. Revisit
+  `SUMMARIZE_TIMEOUT_SECONDS` / `REPO_MAX_PROVIDER_CALLS` and cache combines for a real provider.
+- **Phase 12 — huge central directories:** the ZIP child reads the whole central directory
+  before checking `ZIP_MAX_ENTRIES` (a ZIP with millions of entries is stopped by the sandbox's
+  memory/time limits as `zip_too_complex`, not `zip_too_many_files`). An end-of-central-directory
+  pre-check would give the clearer error.
 - **Phase 10/11 — log redaction:** worker failure logs include the full exception text (by
   design: details stay out of the database). Add redaction before real providers and API keys
   are involved.
@@ -365,6 +465,7 @@ docker compose run --rm api ruff format app tests migrations devtools
 docker compose run --rm migrate              # apply migrations
 docker compose run --rm migrate alembic check   # do models and database agree?
 docker compose run --rm api alembic revision --autogenerate --rev-id 0005 -m "describe change"
+docker compose run --rm -v "${env:USERPROFILE}\tasklane-demo:/out" api python -m devtools.zip_samples /out   # sample ZIPs
 ```
 
 Regenerate `backend/uv.lock` after editing dependencies (runs uv in a throwaway container):
@@ -383,7 +484,7 @@ docker run --rm -v "${PWD}\backend:/src" -w /src python:3.13.18-slim sh -c "pip 
 | 3 | Upload and job APIs with idempotency and outbox | **Done** |
 | 4 | Dispatcher + Celery worker with one dummy stage | **Done** (awaiting developer verification) |
 | 5 | PDF workflow + retries | **Done** (awaiting developer verification) |
-| 6 | ZIP workflow + security | Not started |
+| 6 | ZIP workflow + security | **Done** (awaiting developer verification) |
 | 7 | Leases, recovery, cancellation, manual retry | Not started |
 | 8 | SSE with replay | Not started |
 | 9 | Dashboard | Not started |

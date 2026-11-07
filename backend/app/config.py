@@ -63,8 +63,6 @@ class Settings(BaseSettings):
     celery_task_time_limit_seconds: int = Field(default=3600, ge=60)
     # Worker processes per worker container.
     worker_concurrency: int = Field(default=2, ge=1, le=32)
-    # How long the placeholder stage takes (the repo_index workflow, until Phase 6).
-    dummy_stage_seconds: float = Field(default=3.0, ge=0, le=3600)
 
     # --- PDF workflow (Phase 5) ---
     # Limits on untrusted PDFs (enforced in a separate parser process; see workflows/pdf).
@@ -85,6 +83,31 @@ class Settings(BaseSettings):
     summary_chunk_max_chars: int = Field(default=600, ge=100)
     summary_final_max_chars: int = Field(default=2000, ge=200)
     summary_combine_max_input_chars: int = Field(default=12000, ge=1000)
+    # Development and tests only: the stub provider waits this long per call (simulated
+    # latency), so a job runs long enough to watch it or to stop a worker in the middle of it.
+    stub_delay_seconds: float = Field(default=0, ge=0, le=60)
+
+    # --- Repository ZIP workflow (Phase 6) ---
+    # Limits on untrusted ZIPs, enforced in a separate process (see workflows/repo). Sizes are
+    # counted from the real decompressed bytes; sizes declared in the ZIP are never trusted.
+    zip_max_entries: int = Field(default=5000, ge=1, le=100_000)
+    zip_max_total_bytes: int = Field(default=500 * 1024 * 1024, ge=1024)
+    zip_max_file_bytes: int = Field(default=5 * 1024 * 1024, ge=1024)
+    zip_max_compression_ratio: int = Field(default=100, ge=2, le=100_000)
+    # Ratios are checked only once an entry (or the whole archive) has produced this many bytes:
+    # a small, very repetitive text file compresses extremely well and is harmless.
+    zip_ratio_check_min_bytes: int = Field(default=1024 * 1024, ge=0)
+    zip_max_path_length: int = Field(default=240, ge=16, le=4096)
+    zip_max_path_depth: int = Field(default=20, ge=1, le=1000)
+    zip_validate_timeout_seconds: float = Field(default=60, gt=0, le=3600)
+    zip_extract_timeout_seconds: float = Field(default=300, gt=0, le=3600)
+    zip_sandbox_memory_mb: int = Field(default=512, ge=128, le=16_384)
+    # Folder names whose contents are never indexed (comma-separated, matched case-insensitively
+    # at any depth). Empty REPO_EXCLUDED_DIRS keeps the default list.
+    repo_excluded_dirs: str = ""
+    # Upper limit on summarization calls for one repository; above it the job fails with
+    # repo_too_large before any call is made.
+    repo_max_provider_calls: int = Field(default=1000, ge=1, le=100_000)
 
     # --- Retries (Phase 5) ---
     # Backoff before automatic retry n: equal jitter over min(base * 2^(n-1), max) seconds, so
@@ -116,15 +139,19 @@ class Settings(BaseSettings):
         # lease would lapse (stages renew the lease after every call).
         if self.provider_timeout_seconds > self.lease_seconds / 2:
             raise ValueError("PROVIDER_TIMEOUT_SECONDS must be at most half of LEASE_SECONDS")
+        if self.stub_delay_seconds >= self.provider_timeout_seconds:
+            raise ValueError("STUB_DELAY_SECONDS must be shorter than PROVIDER_TIMEOUT_SECONDS")
         stage_limits = (
-            self.pdf_validate_timeout_seconds
-            + self.pdf_extract_timeout_seconds
+            max(
+                self.pdf_validate_timeout_seconds + self.pdf_extract_timeout_seconds,
+                self.zip_validate_timeout_seconds + self.zip_extract_timeout_seconds,
+            )
             + self.summarize_timeout_seconds
         )
         if self.celery_task_time_limit_seconds <= stage_limits:
             raise ValueError(
-                "CELERY_TASK_TIME_LIMIT_SECONDS must be longer than the PDF stage time limits "
-                "combined, so a stage's own limit always fires first"
+                "CELERY_TASK_TIME_LIMIT_SECONDS must be longer than the stage time limits of "
+                "each workflow combined, so a stage's own limit always fires first"
             )
         # The parser writes extracted text as ASCII-escaped JSON lines: up to 12 bytes per
         # character (a surrogate pair), plus a little per page. A PDF within the text limit must
@@ -150,6 +177,30 @@ class Settings(BaseSettings):
             combine_max_input_chars=self.summary_combine_max_input_chars,
         )
         return self
+
+    @model_validator(mode="after")
+    def _zip_limits_fit(self) -> "Settings":
+        if self.zip_max_file_bytes > self.zip_max_total_bytes:
+            raise ValueError("ZIP_MAX_FILE_BYTES must not exceed ZIP_MAX_TOTAL_BYTES")
+        # The ZIP child holds one file in memory while counting its bytes (plus a copy when
+        # writing it out), on top of Python itself. Too little memory would make every large
+        # file fail as zip_too_complex instead of being skipped as too_large.
+        needed_mb = 128 + 3 * self.zip_max_file_bytes // (1024 * 1024)
+        if self.zip_sandbox_memory_mb < needed_mb:
+            raise ValueError(
+                f"ZIP_SANDBOX_MEMORY_MB is too small for ZIP_MAX_FILE_BYTES (needs {needed_mb})"
+            )
+        if self.zip_max_total_bytes > 64 * 1024**3:
+            raise ValueError("ZIP_MAX_TOTAL_BYTES is limited to 64 GiB")
+        self.repo_excluded_dir_names  # noqa: B018  (parses the list: fail at startup if invalid)
+        return self
+
+    @property
+    def repo_excluded_dir_names(self) -> frozenset[str]:
+        # Imported here, like the PDF checks above, so reading settings doesn't load workflows.
+        from app.workflows.repo.filters import DEFAULT_EXCLUDED_DIRS, FilterRules
+
+        return FilterRules.parse_excluded_dirs(self.repo_excluded_dirs or DEFAULT_EXCLUDED_DIRS)
 
     @property
     def keep_alive_interval_seconds(self) -> float:

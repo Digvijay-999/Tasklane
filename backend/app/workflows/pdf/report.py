@@ -10,8 +10,14 @@ from typing import Any
 
 MANIFEST_SCHEMA = "tasklane.pdf_manifest/1"
 
+STUB_NOTICE = (
+    "> This summary was produced by the built-in stub provider, which extracts leading "
+    "sentences and frequent terms. It is a placeholder, not an AI-generated summary."
+)
+
 # Characters that can change how a line renders: emphasis, code, links, HTML, headings, tables.
-_MARKDOWN_SPECIAL = re.compile(r"([\\`*_\[\]<>#|~])")
+# "&" too, or "&#x202e;" would render as the invisible character it encodes.
+_MARKDOWN_SPECIAL = re.compile(r"([\\`*_\[\]<>#|~&])")
 
 
 def escape_markdown(text: str) -> str:
@@ -29,11 +35,7 @@ def build_summary_markdown(
         f"Summarized by `{summary['provider']}` / `{summary['model']}`.",
     ]
     if summary["provider"] == "stub":
-        lines += [
-            "",
-            "> This summary was produced by the built-in stub provider, which extracts leading "
-            "sentences and frequent terms. It is a placeholder, not an AI-generated summary.",
-        ]
+        lines += ["", STUB_NOTICE]
     if extract.get("pages_without_text"):
         lines += [
             "",

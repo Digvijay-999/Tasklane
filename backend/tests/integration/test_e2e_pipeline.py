@@ -4,8 +4,8 @@ A job is submitted through the API; the dispatcher publishes it from the outbox;
 it, runs its stages, and finishes it. No eager mode, no mocks: messages go through JSON
 serialization and Redis exactly as in production.
 
-The timing tests use repo_index jobs, which still run the placeholder `dummy` stage (until
-Phase 6), because its duration is configurable. The PDF tests run the real pdf_ingest stages.
+Every job runs its real stages. The timing tests (duplicate delivery, killed worker) slow the
+stub provider down with STUB_DELAY_SECONDS, so a job is still running when they act.
 
 The processes use the test database, Redis database 15 / queue "tasklane-test", and the test's own
 storage folder, so a running dev stack is never involved. Run only these with:  pytest -m e2e
@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import JobAttempt, JobEvent, OutboxMessage, ProviderCall
 from app.queue.celery_app import RUN_JOB_TASK, create_celery_app
-from devtools import pdf_samples
+from devtools import pdf_samples, zip_samples
 from tests.integration.conftest import TEST_QUEUE
 from tests.samples import zip_bytes
 
@@ -37,14 +37,27 @@ pytestmark = pytest.mark.e2e
 BACKEND = Path(__file__).resolve().parents[2]
 E2E_RETRY_BASE_SECONDS = 1
 PDF_STAGES = ["validate_pdf", "extract_text", "chunk_document", "summarize", "write_artifacts"]
+REPO_STAGES = [
+    "validate_archive",
+    "extract_files",
+    "filter_files",
+    "chunk_sources",
+    "summarize",
+    "write_artifacts",
+]
 
 
 @pytest.fixture
 def api_settings(api_settings):
-    """Real sample PDFs need more than the shared fixture's 4 KiB upload limit; the retry tests
-    need the API to accept the fault_injection option (the worker gets the flag below)."""
+    """Real sample PDFs and ZIPs need more than the shared fixture's small upload limits; the
+    retry tests need the API to accept the fault_injection option (the worker gets the flag
+    below)."""
     return api_settings.model_copy(
-        update={"max_pdf_upload_bytes": 1024 * 1024, "enable_fault_injection": True}
+        update={
+            "max_pdf_upload_bytes": 1024 * 1024,
+            "max_zip_upload_bytes": 1024 * 1024,
+            "enable_fault_injection": True,
+        }
     )
 
 
@@ -149,7 +162,7 @@ def start_pipeline(
     assert queue_settings.storage_root != dev_settings.storage_root
     assert queue_settings.storage_root.is_relative_to(tmp_path)
 
-    def start(dummy_stage_seconds: float = 0.5) -> Pipeline:
+    def start(stub_delay_seconds: float = 0.0) -> Pipeline:
         env = {
             # No API keys: the pipeline must work with the stub provider alone.
             **{k: v for k, v in os.environ.items() if "API_KEY" not in k.upper()},
@@ -157,7 +170,7 @@ def start_pipeline(
             "POSTGRES_DB": queue_settings.postgres_db,  # the test database
             "REDIS_URL": queue_settings.redis_url,  # Redis database 15
             "CELERY_QUEUE": TEST_QUEUE,
-            "DUMMY_STAGE_SECONDS": str(dummy_stage_seconds),
+            "STUB_DELAY_SECONDS": str(stub_delay_seconds),
             "DISPATCH_POLL_SECONDS": "0.2",
             "LEASE_SECONDS": str(queue_settings.lease_seconds),
             "PROVIDER_TIMEOUT_SECONDS": str(queue_settings.provider_timeout_seconds),
@@ -187,7 +200,7 @@ def submit_job(
     content: bytes | None = None,
     options: dict | None = None,
 ) -> str:
-    """Upload a file and create a job. Default: a repo_index job (runs the `dummy` stage)."""
+    """Upload a file and create a job. Default: a repo_index job for a two-file repository."""
     if workflow_type == "repo_index":
         filename, content_type, content = "e2e.zip", "application/zip", content or zip_bytes()
     else:
@@ -247,26 +260,28 @@ def test_job_submitted_through_the_api_runs_to_succeeded(api, engine, start_pipe
 
     detail = api.get(f"/v1/jobs/{job_id}").json()
     assert detail["progress_percent"] == 100
-    assert detail["current_stage"] == "dummy"
+    assert detail["current_stage"] == "write_artifacts"
     [attempt] = detail["attempts"]
     assert attempt["outcome"] == "succeeded"
     assert attempt["trigger"] == "initial"
     assert attempt["worker_id"].startswith("worker@")
     assert attempt["task_id"]  # the Celery message id, for tracing
 
-    assert [e.event_type for e in events_of(engine, job_id)] == [
+    history = events_of(engine, job_id)
+    assert [e.event_type for e in history[:4]] == [
         "job.created",
         "job.status_changed",  # queued -> running
         "attempt.started",
         "stage.started",
-        *["stage.progress"] * 5,
-        "stage.completed",
-        "job.status_changed",  # running -> succeeded
     ]
+    assert history[-1].event_type == "job.status_changed"  # running -> succeeded
+    assert history[-1].payload["to"] == "succeeded"
+    completed = [e.payload["stage"] for e in history if e.event_type == "stage.completed"]
+    assert completed == REPO_STAGES
 
 
 def test_duplicate_delivery_runs_the_job_only_once(api, engine, queue_settings, start_pipeline):
-    pipeline = start_pipeline(dummy_stage_seconds=1.0)
+    pipeline = start_pipeline(stub_delay_seconds=1.0)
     job_id = submit_job(api)
     # A second message for the same job, as a dispatcher crash or redelivery would produce.
     create_celery_app(queue_settings, for_publishing=True).send_task(
@@ -285,7 +300,7 @@ def test_worker_process_killed_mid_stage_leaves_the_job_running_until_phase_7(
     api, engine, start_pipeline
 ):
     """Documents the current gap: lease recovery (Phase 7) is what rescues this job."""
-    pipeline = start_pipeline(dummy_stage_seconds=6.0)
+    pipeline = start_pipeline(stub_delay_seconds=2.0)  # 3 provider calls: about 6 s
     job_id = submit_job(api)
     wait_until(lambda: attempts_of(engine, job_id), 60, "job claimed")
     [attempt] = attempts_of(engine, job_id)
@@ -349,13 +364,56 @@ def test_unsupported_pdf_fails_permanently_through_the_real_worker(api, start_pi
     assert detail["artifacts"] == []
 
 
-def test_worker_and_dispatcher_use_the_test_storage_root_never_the_real_volume(
-    api, engine, queue_settings, dev_settings, start_pipeline
+def test_repo_job_succeeds_with_the_stub_provider_and_all_three_artifacts_download(
+    api, engine, start_pipeline
 ):
-    """Carry-forward (Phase 5): e2e processes get STORAGE_ROOT from the test settings."""
+    """Phase 6: a realistic repository ZIP through the real worker, with no LLM API key."""
+    pipeline = start_pipeline()
+    assert not any("API_KEY" in name.upper() for name in pipeline.env)
+    job_id = submit_job(api, content=zip_samples.repo_zip())
+
+    wait_until(lambda: job_status(api, job_id) in ("succeeded", "failed"), 90, "job finished")
+
+    detail = api.get(f"/v1/jobs/{job_id}").json()
+    assert detail["status"] == "succeeded", detail
+    completed = [
+        e.payload["stage"] for e in events_of(engine, job_id) if e.event_type == "stage.completed"
+    ]
+    assert completed == REPO_STAGES
+    downloads = {a["artifact_type"]: api.get(a["download_url"]) for a in detail["artifacts"]}
+    assert set(downloads) == {"summary", "chunks", "manifest"}
+    assert all(response.status_code == 200 for response in downloads.values())
+    manifest = downloads["manifest"].json()
+    assert manifest["summary"]["provider"] == "stub"
+    assert manifest["skip_reasons"]["too_large"] == 1  # the 6 MiB file, never decompressed
+    assert manifest["skip_reasons"]["symlink"] == 1
+    assert downloads["summary"].text.startswith("# Repository summary of e2e.zip")
+    assert len(downloads["chunks"].text.splitlines()) == manifest["chunking"]["chunks"]
+
+
+def test_a_zip_slip_archive_fails_permanently_through_the_real_worker(api, start_pipeline):
+    start_pipeline()
+    job_id = submit_job(api, content=zip_samples.zipslip_zip())
+
+    wait_until(lambda: job_status(api, job_id) == "failed", 90, "job failed")
+
+    detail = api.get(f"/v1/jobs/{job_id}").json()
+    assert detail["error_class"] == "zip_unsafe_path"
+    assert len(detail["attempts"]) == 1
+    assert detail["artifacts"] == []
+
+
+@pytest.mark.parametrize(
+    ("workflow_type", "work_file"),
+    [("pdf_ingest", "pages.jsonl"), ("repo_index", "files.bin")],
+)
+def test_worker_and_dispatcher_use_the_test_storage_root_never_the_real_volume(
+    api, engine, queue_settings, dev_settings, start_pipeline, workflow_type, work_file
+):
+    """Carry-forward (Phases 5-6): e2e processes get STORAGE_ROOT from the test settings."""
     pipeline = start_pipeline()
     test_root, real_root = queue_settings.storage_root, dev_settings.storage_root
-    job_id = submit_job(api, "pdf_ingest")
+    job_id = submit_job(api, workflow_type)
     wait_until(lambda: job_status(api, job_id) == "succeeded", 90, "job succeeded")
 
     # 1. The processes themselves (dispatcher, Celery main process, and the worker child that ran
@@ -368,7 +426,7 @@ def test_worker_and_dispatcher_use_the_test_storage_root_never_the_real_volume(
     # 2. The worker read the upload from, and wrote every file to, the test folder ...
     detail = api.get(f"/v1/jobs/{job_id}").json()
     assert (test_root / "uploads" / detail["upload_id"]).is_dir()
-    assert (test_root / "work" / job_id / "pages.jsonl").is_file()
+    assert (test_root / "work" / job_id / work_file).is_file()
     assert (test_root / "artifacts" / job_id / "summary.md").is_file()
 
     # 3. ... and nothing for this job or its upload exists on the real volume.

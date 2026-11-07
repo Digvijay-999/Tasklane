@@ -282,7 +282,7 @@ TRANSIENT = {
 
 @pytest.mark.parametrize("error_class", sorted(ERRORS))
 def test_every_error_has_a_formattable_safe_message(error_class):
-    error = JobError(error_class, pages=600, limit=500)
+    error = JobError(error_class, pages=600, limit=500, entries=9, files=3, ratio=100)
     assert error.safe_message and "{" not in error.safe_message
     expected = ErrorKind.TRANSIENT if error_class in TRANSIENT else ErrorKind.PERMANENT
     assert error.kind == expected

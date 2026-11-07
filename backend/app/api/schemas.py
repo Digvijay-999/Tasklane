@@ -43,6 +43,9 @@ class PdfIngestOptions(BaseModel):
 class RepoIndexOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Development only, and refused unless the server has ENABLE_FAULT_INJECTION=true.
+    fault_injection: FaultInjection | None = None
+
 
 OPTIONS_MODELS: dict[WorkflowType, type[BaseModel]] = {
     WorkflowType.PDF_INGEST: PdfIngestOptions,
@@ -57,8 +60,8 @@ class CreateJobRequest(BaseModel):
     upload_id: uuid.UUID
     options: dict[str, Any] = Field(
         default_factory=dict,
-        description="Workflow-specific options. pdf_ingest: `fault_injection` (development "
-        "only). repo_index: none yet.",
+        description="Workflow-specific options. pdf_ingest and repo_index: `fault_injection` "
+        "(development only).",
     )
 
 

@@ -31,8 +31,15 @@ class StubProvider:
     name = STUB_PROVIDER
     model = STUB_MODEL
 
+    def __init__(self, delay_seconds: float = 0) -> None:
+        # Simulated latency (development and tests only: STUB_DELAY_SECONDS), so a job runs long
+        # enough to watch its progress or to stop a worker in the middle of it.
+        self.delay_seconds = delay_seconds
+
     def summarize(self, text: str, options: SummarizeOptions) -> SummaryResult:
         started = time.perf_counter()
+        if self.delay_seconds:
+            time.sleep(min(self.delay_seconds, options.timeout_seconds))
         if options.purpose == ProviderCallPurpose.COMBINE:
             # Combining: the input is one summary per line; keep the lead sentence of each.
             sentences = [_first_sentence(line) for line in text.splitlines() if line.strip()]

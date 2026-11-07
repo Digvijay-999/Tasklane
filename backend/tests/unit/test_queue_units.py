@@ -7,8 +7,8 @@ from app.config import Settings
 from app.domain.dispatch import DISPATCH_BACKOFF_MAX_SECONDS, dispatch_backoff_seconds
 from app.domain.enums import WorkflowType
 from app.queue.celery_app import CELERY_TASK_NAMES, RUN_JOB_TASK, create_celery_app
-from app.workflows.dummy import DUMMY_STAGE_NAME, DummyStage
 from app.workflows.registry import stages_for
+from tests.dummy_stage import DummyStage
 
 # --- Backoff ------------------------------------------------------------------------------------
 
@@ -56,8 +56,14 @@ def test_workflow_stages(unit_settings):
         "summarize",
         "write_artifacts",
     ]
-    # repo_index keeps the placeholder stage until Phase 6.
-    assert [s.name for s in stages_for(WorkflowType.REPO_INDEX, config)] == [DUMMY_STAGE_NAME]
+    assert [s.name for s in stages_for(WorkflowType.REPO_INDEX, config)] == [
+        "validate_archive",
+        "extract_files",
+        "filter_files",
+        "chunk_sources",
+        "summarize",
+        "write_artifacts",
+    ]
 
 
 # --- Celery configuration -------------------------------------------------------------------------
@@ -127,7 +133,7 @@ def test_provider_timeout_must_fit_in_half_a_lease(unit_settings):
 
 def test_task_time_limit_must_exceed_the_stage_limits(unit_settings):
     values = {**unit_settings.model_dump(), "celery_task_time_limit_seconds": 1260}
-    with pytest.raises(ValidationError, match="longer than the PDF stage time limits"):
+    with pytest.raises(ValidationError, match="longer than the stage time limits"):
         Settings(**values)  # 60 + 300 + 900 = 1260: not strictly longer
     values["celery_task_time_limit_seconds"] = 1261
     Settings(**values)

@@ -57,8 +57,16 @@ def summarize_document(
     ]
     if len(sections) == 1:
         return DocumentSummary(final=sections[0], sections=sections, combine_rounds=0)
+    final, rounds = reduce_summaries(sections, call, settings)
+    return DocumentSummary(final=final, sections=sections, combine_rounds=rounds)
 
-    level, rounds = sections, 0
+
+def reduce_summaries(
+    summaries: list[str], call: SummarizeCall, settings: SummarySettings
+) -> tuple[str, int]:
+    """Combine two or more summaries (each at most chunk_max_chars or final_max_chars) into one.
+    Returns (final summary, number of combine rounds)."""
+    level, rounds = summaries, 0
     while True:
         rounds += 1
         outputs = [
@@ -66,7 +74,7 @@ def summarize_document(
             for batch in _batches(level, settings.combine_max_input_chars)
         ]
         if len(outputs) == 1:
-            return DocumentSummary(final=outputs[0], sections=sections, combine_rounds=rounds)
+            return outputs[0], rounds
         if len(outputs) >= len(level):  # a round must shrink the list, or this never ends
             raise RuntimeError("combine round did not reduce the number of summaries")
         level = outputs
@@ -101,3 +109,16 @@ def estimated_calls(chunk_count: int, settings: SummarySettings) -> int:
         items = -(-items // per_batch)
         combines += items
     return chunk_count + combines
+
+
+def reduce_calls_bound(items: int, item_max_chars: int, settings: SummarySettings) -> int:
+    """An upper bound on the combine calls reduce_summaries makes for `items` summaries of at most
+    `item_max_chars` each. Greedy packing puts at least combine_max // (item_max + 1) items in
+    every batch but the last, and later rounds combine summaries of at most final_max_chars."""
+    calls = 0
+    while items > 1:
+        per_batch = max(2, settings.combine_max_input_chars // (item_max_chars + 1))
+        items = -(-items // per_batch)
+        calls += items
+        item_max_chars = settings.final_max_chars
+    return calls

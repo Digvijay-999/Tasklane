@@ -8,10 +8,12 @@
 > pipeline: outbox dispatcher, Celery worker, claim with duplicate dropping, lease renewal on
 > progress, and one placeholder stage (Phase 4), and the PDF workflow with the stub provider, the
 > sandboxed parser, artifacts and their download route, error classification, automatic
-> retries with backoff, and resume from verified checkpoints (Phase 5). In the lifecycle below,
-> steps 1–6 are implemented (step 5 runs the real PDF stages; `repo_index` still runs one
-> placeholder stage), and steps 7–8 are planned. The HTTP API is documented in
-> [api.md](api.md); delivery guarantees in [reliability.md](reliability.md).
+> retries with backoff, and resume from verified checkpoints (Phase 5), and the repository ZIP
+> workflow with its sandboxed ZIP reader, allowlist filtering, line chunking and three artifacts
+> (Phase 6). In the lifecycle below, steps 1–6 are implemented (step 5 runs the real stages of
+> both workflows), and steps 7–8 are planned. The HTTP API is documented in [api.md](api.md);
+> delivery guarantees in [reliability.md](reliability.md); the threat model for untrusted
+> uploads in [security.md](security.md).
 
 ## 1. Goal
 
@@ -201,7 +203,7 @@ backend/
     db/             # SQLAlchemy models, session, repositories (implemented)
     storage/        # local files: generated paths, temp writes, atomic renames (implemented)
     queue/          # Celery app, dispatcher, recovery loop, task entry points
-    workflows/      # pdf and zip stage implementations
+    workflows/      # stage implementations (implemented): pdf/, repo/, the shared sandbox
     providers/      # summarizer interface, stub, optional LLM
     observability/  # logging, tracing, metrics
   migrations/       # Alembic
@@ -267,7 +269,7 @@ specific tags.
 | 3 | Upload and job APIs with idempotency and outbox | Upload size/type/signature checks; `POST/GET /v1/jobs`; idempotency + 409; transactional outbox write |
 | 4 | Dispatcher + Celery worker with one dummy stage | Outbox publishing; attempt creation; duplicate-delivery guard |
 | 5 | PDF workflow + retries | **Part A:** stages, sandboxed parser and limits, provider interface + **stub provider**, artifacts and download route, `provider_calls`, lease `keep_alive`. **Part B:** transient vs permanent errors, bounded backoff with jitter via delayed outbox rows, attempt-budget CHECK, fault injection, stage checkpoints/resume (migration `0004`) |
-| 6 | ZIP workflow + security | Path traversal, symlinks, zip bombs, file-count limits, file filtering, manifest + JSONL |
+| 6 | ZIP workflow + security | Path traversal, symlinks, zip bombs, file-count limits, file filtering, manifest + JSONL. Done: six stages, sandboxed ZIP reader shared with the PDF sandbox, allowlist filtering with skip reasons, line chunking, `summary.md` / `chunks.jsonl` / `manifest.json`, [security.md](security.md) |
 | 7 | Leases, recovery, cancellation, manual retry | Heartbeats; recovery loop; cooperative cancellation; `POST /cancel`, `POST /retry` |
 | 8 | SSE with replay | `Last-Event-ID` replay, then live polling; paginated event history |
 | 9 | Dashboard | Overview, new job, job detail, live events |
@@ -288,6 +290,9 @@ specific tags.
 - Idempotency keys live as long as their job row (to be documented with the API in Phase 3).
 - Integration tests run against `<POSTGRES_DB>_test`, never the development database.
 - Local uploads and artifacts live under `storage/`, which is gitignored.
+- Names from inside an uploaded ZIP are data, never filesystem paths: extracted bytes go into one
+  generated file (`work/{job_id}/files.bin`) at recorded offsets (Phase 6; see
+  `PHASE6_NOTES.md`).
 
 ## 10. Open questions
 

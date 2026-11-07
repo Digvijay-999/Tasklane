@@ -23,17 +23,15 @@ after a failure on chunk 37 of 40 only sends chunks 37-40 to the provider.
 
 import json
 import logging
-import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from app.domain.enums import ArtifactType, ProviderCallPurpose
+from app.domain.enums import ArtifactType
 from app.domain.errors import JobError
-from app.providers.base import Provider, ProviderCallRecord, ProviderError, SummarizeOptions
-from app.providers.faults import with_fault_injection
-from app.storage.workspace import JobWorkspace, sha256_file
-from app.workflows.base import ArtifactOutput, JobInput, StageContext
+from app.providers.base import Provider
+from app.storage.workspace import JobWorkspace
+from app.workflows.base import JobInput, StageContext
+from app.workflows.common import SummaryCaller, Throttle, register_artifact, verified_input_path
 from app.workflows.pdf.chunking import CHUNKER_VERSION, ChunkingSettings, chunk_pages
 from app.workflows.pdf.report import build_manifest, build_summary_markdown
 from app.workflows.pdf.sandbox import ParserLimits, run_parser
@@ -52,7 +50,6 @@ PAGES_FILE = "pages.jsonl"
 EXTRACT_FILE = "extract.json"
 CHUNKS_FILE = "chunks.jsonl"
 SUMMARY_FILE = "summary.json"
-CHUNK_SUMMARY_DIR = "summaries"  # summaries/{chunk_id}.json: per-chunk cache inside summarize
 SUMMARY_ARTIFACT = "summary.md"
 MANIFEST_ARTIFACT = "manifest.json"
 
@@ -67,32 +64,6 @@ class PdfConfig:
     keep_alive_interval_seconds: float
     chunking: ChunkingSettings
     summary: SummarySettings
-
-
-def _input_path(context: StageContext):  # type: ignore[no-untyped-def]
-    """The uploaded file, after checking it still exists and hasn't changed."""
-    upload = context.job.upload
-    path = context.workspace.absolute(upload.storage_path)
-    if not path.is_file():
-        raise JobError("input_unavailable")
-    return path
-
-
-class _Throttle:
-    """Report progress at most every `seconds` or every `step` percent, whichever comes first."""
-
-    def __init__(self, report: Callable[[int], None], *, seconds: float = 2.0, step: int = 5):
-        self.report = report
-        self.seconds = seconds
-        self.step = step
-        self.last_percent = -100
-        self.last_time = 0.0
-
-    def __call__(self, percent: int) -> None:
-        now = time.monotonic()
-        if percent - self.last_percent >= self.step or now - self.last_time >= self.seconds:
-            self.report(percent)
-            self.last_percent, self.last_time = percent, now
 
 
 class ValidatePdfStage:
@@ -115,12 +86,7 @@ class ValidatePdfStage:
 
     def run(self, context: StageContext) -> None:
         upload = context.job.upload
-        path = _input_path(context)
-        if sha256_file(path) != upload.sha256:
-            logger.error(
-                "uploaded file no longer matches its hash", extra={"upload": str(upload.upload_id)}
-            )
-            raise JobError("input_unavailable")
+        path = verified_input_path(context, check_hash=True)
         workspace = context.workspace
         scratch = workspace.temp_path(workspace.work(VALIDATE_FILE))
         try:
@@ -166,10 +132,10 @@ class ExtractTextStage:
         }
 
     def run(self, context: StageContext) -> None:
-        path = _input_path(context)
+        path = verified_input_path(context, check_hash=False)
         workspace = context.workspace
         raw = workspace.temp_path(workspace.work("pages.raw.jsonl"))
-        report = _Throttle(context.report_progress)
+        report = Throttle(context.report_progress)
         try:
             result = run_parser(
                 "extract",
@@ -273,106 +239,18 @@ class SummarizeStage:
 
     def run(self, context: StageContext) -> None:
         workspace = context.workspace
-        # Wrapped only when the job asked for fault injection (development); see providers/faults.
-        provider = with_fault_injection(self.provider, context.job.options, context.job.attempt_no)
         chunks = list(workspace.iter_jsonl(workspace.work(CHUNKS_FILE)))
-        chunk_sha256 = {c["chunk_id"]: c["sha256"] for c in chunks}
-        expected = max(1, estimated_calls(len(chunks), self.config.summary))
-        deadline = time.monotonic() + self.config.summarize_timeout_seconds
-        # "done" counts the summaries the result is built from (cached or not), so summary.json
-        # is the same whether or not a retry reused cached chunk summaries.
-        calls: dict[str, Any] = {"done": 0, "tokens": 0, "tokens_known": True, "reused": 0}
-
-        def account(total_tokens: int | None) -> None:
-            calls["done"] += 1
-            if total_tokens is None:
-                calls["tokens_known"] = False
-            else:
-                calls["tokens"] += total_tokens
-            context.report_progress(min(99, round(calls["done"] * 100 / expected)))
-
-        def call(
-            text: str, purpose: ProviderCallPurpose, chunk_id: str | None, max_chars: int
-        ) -> str:
-            cache_path = None
-            if purpose == ProviderCallPurpose.CHUNK and chunk_id is not None:
-                cache_path = workspace.work(f"{CHUNK_SUMMARY_DIR}/{chunk_id}.json")
-                cached = self._cached_summary(
-                    workspace, cache_path, chunk_sha256[chunk_id], max_chars
-                )
-                if cached is not None:  # summarized by an earlier attempt: no provider call
-                    calls["reused"] += 1
-                    account(cached.get("total_tokens"))
-                    return str(cached["summary"])
-            if time.monotonic() > deadline:
-                raise JobError("stage_timeout", limit=int(self.config.summarize_timeout_seconds))
-            options = SummarizeOptions(
-                purpose=purpose,
-                max_output_chars=max_chars,
-                timeout_seconds=self.config.provider_timeout_seconds,
-            )
-            started = time.perf_counter()
-            try:
-                result = provider.summarize(text, options)
-            except Exception as exc:
-                error_class = exc.error_class if isinstance(exc, ProviderError) else None
-                context.record_provider_call(
-                    ProviderCallRecord(
-                        purpose=purpose,
-                        provider=provider.name,
-                        model=provider.model,
-                        latency_ms=round((time.perf_counter() - started) * 1000),
-                        success=False,
-                        input_chars=len(text),
-                        chunk_id=chunk_id,
-                        # Never None: the table requires an error class for failed calls.
-                        error_class=error_class or "internal_error",
-                    )
-                )
-                if error_class is not None:
-                    # An expected provider failure: its class decides whether the job retries.
-                    raise JobError(error_class) from exc
-                raise
-            # A provider may ignore max_output_chars; enforce it here, so every combine round
-            # really shrinks the text (otherwise map-reduce could loop until the stage timeout).
-            text_out = result.text[:max_chars]
-            # Recording the call also renews the lease, so each call's timeout (at most half the
-            # lease) bounds the longest time between renewals.
-            context.record_provider_call(
-                ProviderCallRecord(
-                    purpose=purpose,
-                    provider=result.provider,
-                    model=result.model,
-                    latency_ms=result.latency_ms,
-                    success=True,
-                    input_chars=len(text),
-                    output_chars=len(text_out),
-                    chunk_id=chunk_id,
-                    usage=result.usage,
-                )
-            )
-            total_tokens = result.usage.total_tokens if result.usage is not None else None
-            if cache_path is not None:
-                workspace.write_json(
-                    cache_path,
-                    {
-                        "chunk_id": chunk_id,
-                        "chunk_sha256": chunk_sha256[chunk_id],
-                        # The configured provider and model (what the check compares), not
-                        # result.model: a real provider may answer with a resolved model id.
-                        "provider": self.provider.name,
-                        "model": self.provider.model,
-                        "stage_version": self.stage_version,
-                        "max_output_chars": max_chars,
-                        "summary": text_out,
-                        "total_tokens": total_tokens,
-                    },
-                )
-            account(total_tokens)
-            return text_out
-
+        caller = SummaryCaller(
+            context,
+            self.provider,
+            stage_version=self.stage_version,
+            chunk_sha256={c["chunk_id"]: c["sha256"] for c in chunks},
+            expected_calls=estimated_calls(len(chunks), self.config.summary),
+            stage_timeout_seconds=self.config.summarize_timeout_seconds,
+            provider_timeout_seconds=self.config.provider_timeout_seconds,
+        )
         document = summarize_document(
-            [(c["chunk_id"], c["text"]) for c in chunks], call, self.config.summary
+            [(c["chunk_id"], c["text"]) for c in chunks], caller, self.config.summary
         )
         workspace.write_json(
             workspace.work(SUMMARY_FILE),
@@ -390,39 +268,12 @@ class SummarizeStage:
                 "combine_rounds": document.combine_rounds,
                 "provider": self.provider.name,
                 "model": self.provider.model,
-                "calls": calls["done"],
-                "total_tokens": calls["tokens"] if calls["tokens_known"] else None,
+                "calls": caller.done,
+                "total_tokens": caller.total_tokens,
             },
         )
-        if calls["reused"]:
-            logger.info(
-                "reused chunk summaries from an earlier attempt",
-                extra={"job_id": str(context.job.job_id), "reused": calls["reused"]},
-            )
+        caller.log_reuse()
         context.report_progress(100)
-
-    def _cached_summary(
-        self, workspace: JobWorkspace, path: str, chunk_sha256: str, max_chars: int
-    ) -> dict[str, Any] | None:
-        """A chunk summary from an earlier attempt, if it was made from exactly this chunk text
-        by the same provider, model and stage version, with the same length limit."""
-        if not workspace.exists(path):
-            return None
-        try:
-            cached = workspace.read_json(path)
-        except ValueError:  # damaged: summarize again
-            return None
-        matches = (
-            isinstance(cached, dict)
-            and cached.get("chunk_sha256") == chunk_sha256
-            and cached.get("provider") == self.provider.name
-            and cached.get("model") == self.provider.model
-            and cached.get("max_output_chars") == max_chars
-            # Bumping stage_version (the stage's logic changed) re-summarizes every chunk.
-            and cached.get("stage_version") == self.stage_version
-            and isinstance(cached.get("summary"), str)
-        )
-        return cached if matches else None
 
 
 class WriteArtifactsStage:
@@ -447,7 +298,7 @@ class WriteArtifactsStage:
                 display_filename=job.upload.original_filename, extract=extract, summary=summary
             ),
         )
-        summary_artifact = self._register(
+        summary_artifact = register_artifact(
             context,
             ArtifactType.SUMMARY,
             summary_path,
@@ -489,25 +340,10 @@ class WriteArtifactsStage:
                 ],
             ),
         )
-        self._register(
+        register_artifact(
             context, ArtifactType.MANIFEST, manifest_path, MANIFEST_ARTIFACT, "application/json"
         )
         context.report_progress(100)
-
-    @staticmethod
-    def _register(
-        context: StageContext, artifact_type: str, path: str, filename: str, content_type: str
-    ) -> ArtifactOutput:
-        artifact = ArtifactOutput(
-            artifact_type=str(artifact_type),
-            relative_path=path,
-            filename=filename,
-            content_type=content_type,
-            size_bytes=context.workspace.size(path),
-            sha256=context.workspace.sha256(path),
-        )
-        context.save_artifact(artifact)
-        return artifact
 
 
 def pdf_stages(config: PdfConfig, provider: Provider) -> list:  # type: ignore[type-arg]

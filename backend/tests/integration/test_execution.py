@@ -22,8 +22,8 @@ from app.services.execution import (
     JobExecutionService,
     RunOutcome,
 )
-from app.workflows.dummy import DummyStage
 from tests.db_utils import backend_pid, wait_until_blocked_by
+from tests.dummy_stage import DummyStage
 from tests.factories import make_attempt, make_job, utcnow
 
 S = JobStatus

@@ -14,8 +14,8 @@ from app.db.session import create_session_factory
 from app.queue.celery_app import RUN_JOB_TASK, create_celery_app
 from app.queue.dispatcher import CeleryPublisher, Dispatcher
 from app.services.execution import JobExecutionService, RunOutcome
-from app.workflows.dummy import DummyStage
 from tests.broker_utils import queued_messages
+from tests.dummy_stage import DummyStage
 from tests.factories import make_job, make_outbox, utcnow
 from tests.integration.conftest import TEST_QUEUE
 

@@ -98,12 +98,17 @@ def test_every_service_error_code_has_an_http_status():
 
 @pytest.mark.parametrize(
     ("script", "allowed"),
-    [("parse_child.py", {"pypdf"}), ("limited_launcher.py", set())],
+    [
+        ("pdf/parse_child.py", {"pypdf"}),
+        ("repo/zip_child.py", set()),
+        ("limited_launcher.py", set()),
+    ],
 )
 def test_sandboxed_scripts_import_only_the_standard_library(script, allowed):
     """These run with `python -I`: application code isn't importable there, and they must stay
-    small enough to reason about. The parser may also use pypdf."""
-    imports = _imports(APP / "workflows" / "pdf" / script)
+    small enough to reason about. The PDF parser may also use pypdf; the ZIP reader uses only
+    the standard library (never app code, settings or the database)."""
+    imports = _imports(APP / "workflows" / script)
     assert allowed <= {name.split(".")[0] for name in imports}
     bad = [name for name in imports if name.split(".")[0] not in sys.stdlib_module_names | allowed]
     assert bad == []

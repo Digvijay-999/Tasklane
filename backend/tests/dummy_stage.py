@@ -1,8 +1,7 @@
-"""A placeholder stage that only waits and reports progress.
+"""A stand-in stage for tests: it only waits and reports progress.
 
-The repo_index workflow runs this single stage until Phase 6 replaces it with real stages. It
-exercises the whole pipeline: outbox -> dispatcher -> Redis -> worker -> claim -> stage events and
-progress -> succeeded.
+Phases 4-5 ran it as the repo_index workflow; since Phase 6 it is used only by tests that need
+a stage without real work (execution, dispatcher).
 """
 
 import time

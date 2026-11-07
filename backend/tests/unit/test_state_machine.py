@@ -224,7 +224,22 @@ def test_manual_retry_only_for_failed_jobs(status):
     assert decision.message
 
 
-@pytest.mark.parametrize("error_class", [ErrorClass.INVALID_INPUT, ErrorClass.UNSUPPORTED_INPUT])
+@pytest.mark.parametrize(
+    "error_class",
+    [
+        ErrorClass.INVALID_INPUT,
+        ErrorClass.UNSUPPORTED_INPUT,
+        "zip_corrupt",
+        "zip_encrypted",
+        "zip_unsafe_path",
+        "zip_too_many_files",
+        "zip_too_large",
+        "zip_bomb",
+        "zip_too_complex",
+        "repo_no_sources",
+        "repo_too_large",
+    ],
+)
 def test_manual_retry_not_offered_for_input_errors(error_class):
     decision = can_manual_retry(S.FAILED, error_class, 1)
     assert not decision.allowed

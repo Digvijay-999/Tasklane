@@ -32,6 +32,8 @@ from app.workflows.pdf.sandbox import ParserLimits
 from app.workflows.pdf.stages import PdfConfig
 from app.workflows.pdf.summarize import SummarySettings
 from app.workflows.registry import WorkflowConfig, stages_for
+from app.workflows.repo.archive import ZipLimits
+from app.workflows.repo.stages import RepoConfig
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,16 @@ def _create_state() -> _ProcessState:
 def workflow_config(settings: Settings) -> WorkflowConfig:
     """Translate settings into the plain configuration objects that stage code receives."""
     mib = 1024 * 1024
+    chunking = ChunkingSettings(
+        target_chars=settings.chunk_target_chars,
+        max_chars=settings.chunk_max_chars,
+        overlap_chars=settings.chunk_overlap_chars,
+    )
+    summary = SummarySettings(
+        chunk_max_chars=settings.summary_chunk_max_chars,
+        final_max_chars=settings.summary_final_max_chars,
+        combine_max_input_chars=settings.summary_combine_max_input_chars,
+    )
     return WorkflowConfig(
         pdf=PdfConfig(
             limits=ParserLimits(
@@ -115,17 +127,29 @@ def workflow_config(settings: Settings) -> WorkflowConfig:
             summarize_timeout_seconds=settings.summarize_timeout_seconds,
             provider_timeout_seconds=settings.provider_timeout_seconds,
             keep_alive_interval_seconds=settings.keep_alive_interval_seconds,
-            chunking=ChunkingSettings(
-                target_chars=settings.chunk_target_chars,
-                max_chars=settings.chunk_max_chars,
-                overlap_chars=settings.chunk_overlap_chars,
-            ),
-            summary=SummarySettings(
-                chunk_max_chars=settings.summary_chunk_max_chars,
-                final_max_chars=settings.summary_final_max_chars,
-                combine_max_input_chars=settings.summary_combine_max_input_chars,
-            ),
+            chunking=chunking,
+            summary=summary,
         ),
-        provider=create_provider(settings.provider),
-        dummy_stage_seconds=settings.dummy_stage_seconds,
+        repo=RepoConfig(
+            zip=ZipLimits(
+                max_entries=settings.zip_max_entries,
+                max_total_bytes=settings.zip_max_total_bytes,
+                max_file_bytes=settings.zip_max_file_bytes,
+                max_compression_ratio=settings.zip_max_compression_ratio,
+                ratio_check_min_bytes=settings.zip_ratio_check_min_bytes,
+                max_path_length=settings.zip_max_path_length,
+                max_path_depth=settings.zip_max_path_depth,
+                memory_bytes=settings.zip_sandbox_memory_mb * mib,
+            ),
+            excluded_dirs=settings.repo_excluded_dir_names,
+            validate_timeout_seconds=settings.zip_validate_timeout_seconds,
+            extract_timeout_seconds=settings.zip_extract_timeout_seconds,
+            summarize_timeout_seconds=settings.summarize_timeout_seconds,
+            provider_timeout_seconds=settings.provider_timeout_seconds,
+            keep_alive_interval_seconds=settings.keep_alive_interval_seconds,
+            chunking=chunking,
+            summary=summary,
+            max_provider_calls=settings.repo_max_provider_calls,
+        ),
+        provider=create_provider(settings.provider, stub_delay_seconds=settings.stub_delay_seconds),
     )

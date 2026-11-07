@@ -1,5 +1,5 @@
 """Apply operating-system resource limits to this process, then run a script. Started ONLY by
-sandbox.py as:
+app/workflows/sandbox.py as:
 
     python -I limited_launcher.py <memory_bytes> <cpu_seconds> <file_size_bytes> <script> [args...]
 

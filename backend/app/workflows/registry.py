@@ -5,19 +5,20 @@ from dataclasses import dataclass
 from app.domain.enums import WorkflowType
 from app.providers.base import Provider
 from app.workflows.base import Stage
-from app.workflows.dummy import DummyStage
 from app.workflows.pdf.stages import PdfConfig, pdf_stages
+from app.workflows.repo.stages import RepoConfig, repo_stages
 
 
 @dataclass(frozen=True)
 class WorkflowConfig:
     pdf: PdfConfig
+    repo: RepoConfig
     provider: Provider
-    dummy_stage_seconds: float
 
 
 def stages_for(workflow_type: WorkflowType, config: WorkflowConfig) -> list[Stage]:
     if workflow_type == WorkflowType.PDF_INGEST:
         return pdf_stages(config.pdf, config.provider)
-    # repo_index keeps the placeholder stage until Phase 6.
-    return [DummyStage(duration_seconds=config.dummy_stage_seconds)]
+    if workflow_type == WorkflowType.REPO_INDEX:
+        return repo_stages(config.repo, config.provider)
+    raise ValueError(f"no stages for workflow {workflow_type!r}")

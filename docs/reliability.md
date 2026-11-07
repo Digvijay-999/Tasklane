@@ -292,11 +292,13 @@ more. Finishing closes the attempt and transitions the job in one transaction.
 
 ### Keeping the lease alive during long stages (Phase 5)
 
-A lease is 60 s (`LEASE_SECONDS`). Every PDF stage renews it well within that time:
+A lease is 60 s (`LEASE_SECONDS`). Every PDF and repository stage renews it well within that
+time:
 
-- While the sandboxed parser runs, the worker waits on it and wakes at least every
+- While a sandboxed parser (PDF or ZIP) runs, the worker waits on it and wakes at least every
   `LEASE_SECONDS / 4` (15 s) to renew the lease (`keep_alive`), even if the parser reports no
-  progress. Per-page progress reports renew it too.
+  progress. Per-page (PDF) and per-file (ZIP extraction) progress reports renew it too, and so
+  do the throttled progress reports of `filter_files`.
 - The summarize stage renews it after every summarizer call (each call is recorded in
   `provider_calls` in the same transaction as the renewal). A single call can't renew while it
   waits, so `PROVIDER_TIMEOUT_SECONDS` must be at most half the lease (the settings refuse to
@@ -331,13 +333,14 @@ closing the parent's connections (tested with a real `fork`).
   by an independent heartbeat. A stage that forgot to do either would let its lease lapse
   (harmless until Phase 7).
 
-## Untrusted PDFs: the parser sandbox (Phase 5)
+## Untrusted input: the parser sandbox (Phases 5-6)
 
-A PDF upload is untrusted input. A crafted file can make a parser loop forever, use huge amounts
-of memory, or produce gigabytes of "text". Python code can't reliably stop a stuck function from
-inside its own process, so the PDF is opened in a **separate child process**
-(`workflows/pdf/parse_child.py`), started by `workflows/pdf/sandbox.py` (like spawning a child
-process in Node and killing it on a timer).
+PDF and ZIP uploads are untrusted input. A crafted file can make a parser loop forever, use huge
+amounts of memory, or produce gigabytes of output. Python code can't reliably stop a stuck
+function from inside its own process, so untrusted files are opened in a **separate child
+process** (`workflows/pdf/parse_child.py` for PDFs, `workflows/repo/zip_child.py` for ZIPs),
+started by the shared runner `workflows/sandbox.py` (like spawning a child process in Node and
+killing it on a timer). The table shows the PDF values; the ZIP values follow it.
 
 | Limit | Enforced by |
 |---|---|
@@ -347,7 +350,12 @@ process in Node and killing it on a timer).
 | Output size (64 MiB) | `RLIMIT_FSIZE`: the child can't write more extracted text than that |
 | Pages (500), characters (2,000,000) | Checked inside the child, which stops as soon as a limit is passed |
 
-The `RLIMIT`s are applied by a tiny launcher script (`limited_launcher.py`) inside the new
+For ZIPs: validate 60 s and extract 300 s (`ZIP_*_TIMEOUT_SECONDS`), 512 MiB of memory
+(`ZIP_SANDBOX_MEMORY_MB`), output 64 MiB for the table of contents and `ZIP_MAX_TOTAL_BYTES` +
+16 MiB for the extracted files. Entry count, total and per-file bytes, and compression ratios
+are counted inside the child; see [security.md](security.md) for every ZIP defense.
+
+The `RLIMIT`s are applied by a tiny launcher script (`workflows/limited_launcher.py`) inside the new
 process, before the parser is loaded, rather than with `preexec_fn` (Python code run between
 `fork` and `exec`, which Python documents as unsafe in a process with threads, like a Celery
 worker). The settings refuse an output-size limit too small for the text limit, so a legitimate
@@ -355,12 +363,16 @@ PDF can't be mistaken for an attack.
 
 Isolation: the child runs `python -I` (application code isn't importable, `PYTHON*` variables
 are ignored), gets an environment with only `PATH` and `LANG` (no database password, no API
-keys), cannot write core dumps, and may import only the standard library and pypdf (a test
-enforces that). It talks to the worker through one JSON object per line on stdout; the worker
-trusts only known error classes and numeric parameters from it.
+keys), cannot write core dumps, and may import only the standard library (plus pypdf for the
+PDF parser; tests enforce both). It talks to the worker through one JSON object per line on
+stdout; the worker trusts only the error classes allowed for that child and numeric parameters.
+The ZIP child's output files are checked again by the worker (`workflows/repo/archive.py`):
+exactly the requested entries, offsets that tile the extracted-files blob, sizes within the
+limits.
 
 Every way the child can end maps to a fixed result: a result message (success), an error
-message (a specific `error_class`), killed at the deadline or by a limit (`pdf_too_complex`), or
+message (a specific `error_class`), killed at the deadline or by a limit (`pdf_too_complex` /
+`zip_too_complex`), or
 any other exit (a bug: `internal_error`, with the child's stderr only in the worker log).
 
 ### Stages are safe to run twice
@@ -373,7 +385,14 @@ chunk ids are hashes of the input hash, the chunking settings, and the text), so
 again produces byte-identical files, and artifact rows are upserted on `(job_id, artifact_type)`,
 so a re-run replaces the row instead of adding one. Artifact rows are written only in the
 transaction that marks the job `succeeded`, so a job that fails after its files were written
-lists no artifacts. Tests run every stage twice and compare the files byte for byte.
+lists no artifacts. Tests run every stage of both workflows twice and compare the files byte
+for byte.
+
+The repository workflow writes these files in `work/{job_id}/`, all with generated names (never
+a name from inside the archive): `archive.json` (the table of contents), `files.bin` (the bytes
+of every extracted file, one after another) and `extract.json` (each file's offset, size and
+SHA-256 in `files.bin`), `files.jsonl` and `filter.json` (the indexed files' text, and every
+skip reason), `chunks.jsonl`, `summary.json`.
 
 ## Failures, retries, and resume (Phase 5)
 
@@ -386,7 +405,8 @@ full list is in [api.md](api.md#failures-and-retries)):
   `stage_timeout`; database connection trouble (`database_unavailable`) and deadlock or
   serialization aborts, Postgres `40P01`/`40001` (`database_conflict`); disk trouble such as
   `ENOSPC`, `EIO`, `EROFS` (`storage_unavailable`); and `injected_transient`.
-- **Permanent:** problems with the input (`pdf_*`, `input_unavailable`), configuration
+- **Permanent:** problems with the input (`pdf_*`, `zip_*`, `repo_*`, `input_unavailable`),
+  configuration
   (`fault_injection_disabled`), and `injected_permanent`.
 - **Anything else** becomes the permanent `internal_error`. Retrying an unknown bug would only
   repeat it, and the brief says to retry only errors known to be transient.
@@ -437,8 +457,9 @@ When a checkpointed stage completes, the same transaction as its `stage.complete
 
 - `stage_version`: a constant in the stage's code, bumped whenever its output for the same
   input changes;
-- `input_fingerprint`: SHA-256 over the stage's relevant settings (page and text limits, chunk
-  sizes, provider and model, ...) and the size and SHA-256 of **every upstream output file**;
+- `input_fingerprint`: SHA-256 over the stage's relevant settings (page and text limits, ZIP
+  limits and excluded folders, chunk sizes, provider and model, ...) and the size and SHA-256
+  of **every upstream output file**;
 - `outputs`: each file the stage wrote, with its size and SHA-256.
 
 On a retry, a stage is skipped (event `stage.skipped`, `reason: checkpoint_reused`) only if all of
@@ -454,7 +475,11 @@ therefore never rests on another attempt's stale upstream files. The one deliber
 rerun stage is the per-chunk cache below, and it is keyed tightly enough to be safe. Examples: an edited `pages.jsonl` reruns
 `extract_text`, `chunk_document`, `summarize`, and `write_artifacts`; changed chunk sizes rerun
 everything from `chunk_document` on. `write_artifacts` has no checkpoint: it's cheap, and it must
-register the artifacts in the successful attempt.
+register the artifacts in the successful attempt. The repository workflow checkpoints its first
+five stages the same way (`validate_archive`, `extract_files`, `filter_files`, `chunk_sources`,
+`summarize`), so a transient summarizer failure retries without reading the ZIP again.
+`REPO_MAX_PROVIDER_CALLS` is not part of any fingerprint: it can only make a stage fail, never
+change a successful output, and it is checked again each time `summarize` starts.
 
 **Inside `summarize`**, each chunk's summary is cached in `work/{job_id}/summaries/{chunk_id}.json`
 with the chunk's SHA-256, the configured provider and model, the stage version, and the length
@@ -495,5 +520,10 @@ it without the requested failures. Both processes log a warning at startup when 
   and that Redis database. Celery's eager mode is never used.
 - Files: every API and service test gets its own temporary storage folder. The end-to-end worker
   and dispatcher processes receive that folder as `STORAGE_ROOT`, never the real `storage`
-  volume; a test reads the environment of the running processes and checks that nothing for the
-  test job appears in the real volume.
+  volume; a test (for a PDF job and a repository job) reads the environment of the running
+  processes and checks that nothing for the test job appears in the real volume.
+- Malicious ZIPs: every rejection test snapshots the whole test storage folder and the folder
+  around it before and after the job, and requires them to be identical outside the job's own
+  `work/{job_id}/` folder.
+- Slow jobs: the end-to-end timing tests (duplicate delivery, killed worker) slow the stub
+  summarizer with `STUB_DELAY_SECONDS` instead of using a placeholder stage.

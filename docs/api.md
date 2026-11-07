@@ -1,11 +1,12 @@
 # Tasklane HTTP API
 
-> **Status (Phase 5):** the routes marked **implemented** below work. `pdf_ingest` jobs
-> really process the PDF (with the built-in **stub** summarizer, not an AI model) and produce
-> downloadable artifacts; see [What a pdf_ingest job does](#what-a-pdf_ingest-job-does).
-> Transient failures are retried automatically with backoff, resuming after the stages that
-> already finished; see [Failures and retries](#failures-and-retries). `repo_index` jobs still
-> run a placeholder stage (`dummy`) until Phase 6. Routes marked **planned** don't exist yet.
+> **Status (Phase 6):** the routes marked **implemented** below work. `pdf_ingest` and
+> `repo_index` jobs really process their input (with the built-in **stub** summarizer, not an AI
+> model) and produce downloadable artifacts; see
+> [What a pdf_ingest job does](#what-a-pdf_ingest-job-does) and
+> [What a repo_index job does](#what-a-repo_index-job-does). Transient failures are retried
+> automatically with backoff, resuming after the stages that already finished; see
+> [Failures and retries](#failures-and-retries). Routes marked **planned** don't exist yet.
 
 | Route | Status |
 |---|---|
@@ -200,7 +201,7 @@ with `GET /v1/jobs/{job_id}`). If Redis is down, it stays `queued` until Redis i
 |---|---|---|
 | `workflow_type` | yes | `pdf_ingest` (needs a PDF upload) or `repo_index` (needs a ZIP upload) |
 | `upload_id` | yes | A `ready`, unexpired upload of the matching kind |
-| `options` | no | Workflow-specific options; unknown fields are rejected. `pdf_ingest`: only `fault_injection` (development only, see [Fault injection](#fault-injection-development-only)). `repo_index`: none, so `{}` if sent. Options that are off are not stored. |
+| `options` | no | Workflow-specific options; unknown fields are rejected. Both workflows: only `fault_injection` (development only, see [Fault injection](#fault-injection-development-only)). Options that are off are not stored. |
 
 ```powershell
 $upload = curl.exe -s -X POST "$api/v1/uploads?filename=report.pdf" -H "Content-Type: application/pdf" --data-binary "@report.pdf" | ConvertFrom-Json
@@ -302,10 +303,11 @@ Returns the [job object](#job-object) plus:
   `error_summary`). Filled in once a worker claims the job.
 - `artifacts`: the job's outputs (`id`, `artifact_type`, `attempt_no`, `filename`,
   `size_bytes`, `content_type`, `sha256`, `created_at`, `download_url`). A succeeded
-  `pdf_ingest` job has two: `summary` (`summary.md`) and `manifest` (`manifest.json`).
+  `pdf_ingest` job has two: `summary` (`summary.md`) and `manifest` (`manifest.json`). A
+  succeeded `repo_index` job has three: `summary`, `chunks` (`chunks.jsonl`) and `manifest`.
   Artifacts are registered in the same database transaction that marks the job `succeeded`, so
   they are listed only for succeeded jobs: never while the job is running, and never for a
-  failed one. Always empty for `repo_index` (until Phase 6).
+  failed one.
 
 An unknown id, or one that isn't a UUID, returns `404 job_not_found`.
 
@@ -319,8 +321,8 @@ $summary = $detail.artifacts | Where-Object artifact_type -eq "summary"
 curl.exe -s -o summary.md "$api$($summary.download_url)"
 ```
 
-- `200` with the file. Headers: `Content-Type` as recorded (`text/markdown; charset=utf-8` or
-  `application/json`), `Content-Disposition: attachment; filename="summary.md"`,
+- `200` with the file. Headers: `Content-Type` as recorded (`text/markdown; charset=utf-8`,
+  `application/json`, or `application/x-ndjson` for `chunks.jsonl`), `Content-Disposition: attachment; filename="summary.md"`,
   `X-Content-Type-Options: nosniff` (browsers must not guess another type),
   `ETag: "<sha256>"`, `Cache-Control: private, no-cache`.
 - `404 artifact_not_found`: unknown id, or an artifact that belongs to a *different* job.
@@ -360,10 +362,76 @@ Inconsistent values (for example a text limit too large for `PDF_PARSER_OUTPUT_M
 overlap not smaller than the chunk target) stop the services at startup with a message naming
 the setting, instead of failing jobs later.
 
+### What a repo_index job does
+
+The upload must be a ZIP of a source repository. The job runs six stages; nothing from the
+archive is ever executed, imported, or built. Threat model and defenses:
+[security.md](security.md).
+
+| Stage | Share | What it does |
+|---|---|---|
+| `validate_archive` | 5 % | Checks the upload is unchanged (SHA-256), then reads the ZIP's table of contents in a separate, limited process: rejects encrypted or damaged archives, too many entries, and any unsafe or conflicting name. Nothing is decompressed yet |
+| `extract_files` | 15 % | In the same kind of limited process, decompresses the files that could be indexed into one generated file, counting the real bytes (never trusting the sizes written in the ZIP) and stopping at the limits |
+| `filter_files` | 5 % | Decides, for every file, whether it is indexed or skipped and why |
+| `chunk_sources` | 5 % | Splits each file into chunks of whole lines (same sizes as PDFs: target 4,000 characters, at most 6,000, 400 overlap) |
+| `summarize` | 65 % | Summarizes every chunk, combines each file's chunk summaries into a file summary, then combines the file summaries into a repository overview (map-reduce) |
+| `write_artifacts` | 5 % | Writes `summary.md`, `chunks.jsonl` and `manifest.json` and records them as artifacts |
+
+**Which files are indexed.** Only an allowlist: known text and code extensions (`.py`, `.js`,
+`.ts`, `.java`, `.go`, `.rs`, `.c`, `.md`, `.json`, `.yaml`, `.toml`, `.sql`, `.html`, `.css`, and
+about 60 more, see `backend/app/workflows/repo/filters.py`) plus the names `README`, `LICENSE`,
+`Makefile` and `Dockerfile`. Every other file is skipped with one reason:
+
+| Reason | Meaning |
+|---|---|
+| `excluded_dir` | Inside a folder from `REPO_EXCLUDED_DIRS` (default: `.git`, `node_modules`, `dist`, `build`, `target`, `__pycache__`, `.venv`, `venv`, `.idea`, `.vscode`, `coverage`, `vendor`, and similar), at any depth. These are never decompressed |
+| `hidden` | A file or folder name starting with `.` (for example `.env`, which may hold secrets) |
+| `system_file` | `__MACOSX/`, `.DS_Store`, `Thumbs.db`, `desktop.ini` |
+| `nested_archive` | `.zip`, `.tar`, `.gz`, `.7z`, `.rar`, `.jar`, `.whl`, ...: never extracted |
+| `lockfile` | `package-lock.json`, `yarn.lock`, `poetry.lock`, `uv.lock`, `Cargo.lock`, `go.sum`, ... |
+| `minified` | `*.min.js`-style names, or JS/TS/CSS/JSON/HTML whose lines average over 250 characters |
+| `unsupported_type` | Not on the allowlist (images, executables, unknown extensions) |
+| `too_large` | Over `ZIP_MAX_FILE_BYTES` (5 MiB), by its declared size (then never decompressed) or while decompressing |
+| `binary` | A NUL byte in the first 8 KiB, or more than 10 % invalid UTF-8 |
+| `empty` | No visible characters |
+| `symlink` | A symbolic link entry: never created, never followed, its target never read |
+| `special_file` | A device, pipe or socket entry |
+| `path_too_long` / `path_too_deep` | More than 240 characters / more than 20 path components |
+
+**Artifacts.**
+
+- `summary.md`: the overview, then one section per indexed file (language, lines, chunks, and
+  its summary), then a table of skip reasons. File names are escaped (Markdown punctuation, and
+  invisible characters such as right-to-left overrides shown as their code, e.g. `\u202e`);
+  summaries are in fenced blocks they can't break out of, so they render as plain text. The
+  stub-provider notice is at the top.
+- `chunks.jsonl`: one JSON object per line: `chunk_id` (deterministic, same scheme as PDFs),
+  `path`, `line_start`, `line_end`, `sha256` (of `text`), `text`. ASCII-only JSON.
+- `manifest.json` (schema `tasklane.repo_manifest/1`): `input` (upload, archive entries,
+  folders), `totals` (files, included, skipped, bytes, lines), `skip_reasons` (count per
+  reason), `languages` (files, lines, bytes per language), `included` (path, language, bytes,
+  lines, sha256 per file), `skipped` (path and reason per file), `chunking`, `summary`
+  (provider and model), `usage` (provider calls, tokens if reported), `limits` (every limit
+  that applied), and `artifacts`. No timestamps: the same input gives the same bytes.
+  ASCII-only JSON.
+
+**Limits** (settings in `.env`; sizes are real decompressed bytes):
+
+| Setting | Default | Over the limit |
+|---|---|---|
+| `ZIP_MAX_ENTRIES` | 5,000 (at most 100,000) | `zip_too_many_files` |
+| `ZIP_MAX_TOTAL_BYTES` | 500 MiB (of the files that are extracted) | `zip_too_large` |
+| `ZIP_MAX_FILE_BYTES` | 5 MiB | file skipped as `too_large` |
+| `ZIP_MAX_COMPRESSION_RATIO` | 100 (per entry and overall, once past `ZIP_RATIO_CHECK_MIN_BYTES`, 1 MiB) | `zip_bomb` |
+| `ZIP_MAX_PATH_LENGTH` / `ZIP_MAX_PATH_DEPTH` | 240 / 20 | file skipped |
+| `ZIP_VALIDATE_TIMEOUT_SECONDS` / `ZIP_EXTRACT_TIMEOUT_SECONDS` | 60 / 300 | `zip_too_complex` |
+| `ZIP_SANDBOX_MEMORY_MB` | 512 | `zip_too_complex` |
+| `REPO_MAX_PROVIDER_CALLS` | 1,000 | `repo_too_large` (checked before the first call) |
+
 #### Failures and retries
 
 When an attempt fails, `error_class` says why and `error_summary` holds a fixed, safe message
-(never a stack trace, a file path, or text from the PDF). Each class is either:
+(never a stack trace, a file path, text from the PDF, or a name from inside a ZIP). Each class is either:
 
 - **transient**, meaning it might work if tried again. While attempts remain (3 per job), the job
   goes to `retry_wait` with `retry_at` set, and is retried automatically after a backoff. The
@@ -389,7 +457,16 @@ Permanent:
 | `pdf_no_text` | `extract_text` / `chunk_document` | The PDF contains little or no extractable text (it may be scanned images). Scanned PDFs aren't supported yet. |
 | `pdf_text_too_large` | `extract_text` | The PDF contains more than L characters of text, which is over the limit. |
 | `pdf_too_complex` | `validate_pdf` / `extract_text` | The PDF took too long or needed too much memory to process. |
-| `input_unavailable` | `validate_pdf` / `extract_text` | The uploaded file is no longer available. Upload it again and create a new job. |
+| `zip_unsafe_path` | `validate_archive` | The archive contains an entry with an unsafe or conflicting name (for example an absolute path, a '..' segment, a drive letter, a backslash, or two names that differ only in letter case), so the whole archive was rejected. |
+| `zip_encrypted` | `validate_archive` | The archive contains password-protected entries. Upload an archive without encryption. |
+| `zip_corrupt` | `validate_archive` / `extract_files` | The archive is damaged or is not a valid ZIP file, so it could not be read. |
+| `zip_too_many_files` | `validate_archive` | The archive has N entries; the limit is L. |
+| `zip_too_large` | `extract_files` | The archive's files add up to more than the limit of L bytes when extracted. |
+| `zip_bomb` | `extract_files` | The archive is compressed more than R:1, which is how zip bombs work, so it was not extracted. |
+| `zip_too_complex` | `validate_archive` / `extract_files` | The archive took too long or needed too much memory to process. |
+| `repo_no_sources` | `filter_files` | None of the N files in the archive can be indexed (unsupported file types, excluded folders, binary, empty, or too large files). |
+| `repo_too_large` | `filter_files` / `summarize` | The repository has too much source code to summarize within the limit of L summarization calls. |
+| `input_unavailable` | the first two stages | The uploaded file is no longer available. Upload it again and create a new job. |
 | `injected_permanent` | `summarize` | Injected permanent failure (fault injection test). |
 | `fault_injection_disabled` | (before any stage) | The job asks for fault injection, but fault injection is disabled on the worker. |
 | `internal_error` | any | An unexpected error occurred while running the job. (Details are only in the worker logs.) Any error that isn't classified ends up here: retrying an unknown bug would only repeat it. |
@@ -402,7 +479,7 @@ Transient (retried):
 | `provider_timeout`, `provider_unavailable`, `provider_rate_limited` | The summarizer timed out, was down, or refused for rate limiting (real providers arrive in Phase 11) | The summarization provider did not respond in time. / ... is temporarily unavailable. / ... is limiting requests right now. |
 | `database_unavailable` | The database connection failed during a stage | The database was temporarily unavailable. |
 | `database_conflict` | A deadlock or serialization failure (Postgres `40P01`, `40001`) | A temporary database conflict interrupted the job. |
-| `storage_unavailable` | The disk was full, read-only, or failed (`ENOSPC`, `EIO`, ...) | File storage was temporarily unavailable. |
+| `storage_unavailable` | The disk was full, read-only, or failed (`ENOSPC`, `EIO`, ...), also while reading a ZIP | File storage was temporarily unavailable. |
 | `injected_transient` | Fault injection | Injected transient failure (fault injection test). |
 
 "Little or no text" means fewer than 100 visible characters in total, or fewer than 20 per page
@@ -412,7 +489,8 @@ password needed to open) are processed normally; `manifest.json` records
 
 #### Fault injection (development only)
 
-To watch retries happen, a `pdf_ingest` job can ask its summarizer to fail on purpose:
+To watch retries happen, a `pdf_ingest` or `repo_index` job can ask its summarizer to fail on
+purpose:
 
 | `options.fault_injection` | Effect |
 |---|---|
@@ -429,7 +507,7 @@ if they disagree. When the setting is on, the API and worker log a warning at st
 | Field | Notes |
 |---|---|
 | `id`, `workflow_type`, `status`, `upload_id`, `input_sha256` | `input_sha256` is the upload's hash at submission |
-| `current_stage`, `progress_percent` | Set by the worker as stages run (`pdf_ingest`: see [stages](#what-a-pdf_ingest-job-does); `repo_index`: `dummy`, 0–100 in steps of 20) |
+| `current_stage`, `progress_percent` | Set by the worker as stages run (see the stages of [`pdf_ingest`](#what-a-pdf_ingest-job-does) and [`repo_index`](#what-a-repo_index-job-does)) |
 | `options` | Resolved options, defaults included |
 | `attempt_count`, `max_attempts`, `manual_retry_count` | The retry budget is 3 automatic attempts |
 | `retry_at` | When a `retry_wait` job runs again |
