@@ -21,10 +21,16 @@ from datetime import timedelta
 
 from sqlalchemy import Engine
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.db.session import create_db_engine, create_session_factory
+from app.providers.factory import create_provider
 from app.services.execution import JobExecutionService
-from app.workflows.dummy import stages_for
+from app.storage.local import LocalStorage
+from app.workflows.pdf.chunking import ChunkingSettings
+from app.workflows.pdf.sandbox import ParserLimits
+from app.workflows.pdf.stages import PdfConfig
+from app.workflows.pdf.summarize import SummarySettings
+from app.workflows.registry import WorkflowConfig, stages_for
 
 logger = logging.getLogger(__name__)
 
@@ -73,13 +79,48 @@ def _create_state() -> _ProcessState:
     engine = create_db_engine(
         settings, pool_size=WORKER_POOL_SIZE, max_overflow=0, application_name="tasklane-worker"
     )
+    config = workflow_config(settings)
     service = JobExecutionService(
         create_session_factory(engine),
         worker_id=worker_id(),
         lease=timedelta(seconds=settings.lease_seconds),
-        stages_for=lambda workflow_type: stages_for(
-            workflow_type, dummy_stage_seconds=settings.dummy_stage_seconds
-        ),
+        stages_for=lambda workflow_type: stages_for(workflow_type, config),
+        storage=LocalStorage(settings.storage_root),
     )
-    logger.info("worker process ready", extra={"worker_id": service.worker_id})
+    logger.info(
+        "worker process ready",
+        extra={"worker_id": service.worker_id, "provider": config.provider.name},
+    )
     return _ProcessState(pid=os.getpid(), engine=engine, service=service)
+
+
+def workflow_config(settings: Settings) -> WorkflowConfig:
+    """Translate settings into the plain configuration objects that stage code receives."""
+    mib = 1024 * 1024
+    return WorkflowConfig(
+        pdf=PdfConfig(
+            limits=ParserLimits(
+                max_pages=settings.pdf_max_pages,
+                max_chars=settings.pdf_max_text_chars,
+                memory_bytes=settings.pdf_parser_memory_mb * mib,
+                output_max_bytes=settings.pdf_parser_output_max_mb * mib,
+            ),
+            validate_timeout_seconds=settings.pdf_validate_timeout_seconds,
+            extract_timeout_seconds=settings.pdf_extract_timeout_seconds,
+            summarize_timeout_seconds=settings.summarize_timeout_seconds,
+            provider_timeout_seconds=settings.provider_timeout_seconds,
+            keep_alive_interval_seconds=settings.keep_alive_interval_seconds,
+            chunking=ChunkingSettings(
+                target_chars=settings.chunk_target_chars,
+                max_chars=settings.chunk_max_chars,
+                overlap_chars=settings.chunk_overlap_chars,
+            ),
+            summary=SummarySettings(
+                chunk_max_chars=settings.summary_chunk_max_chars,
+                final_max_chars=settings.summary_final_max_chars,
+                combine_max_input_chars=settings.summary_combine_max_input_chars,
+            ),
+        ),
+        provider=create_provider(settings.provider),
+        dummy_stage_seconds=settings.dummy_stage_seconds,
+    )

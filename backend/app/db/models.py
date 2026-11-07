@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     ForeignKey,
     Identity,
@@ -30,6 +31,7 @@ from app.domain.enums import (
     AttemptTrigger,
     JobStatus,
     OutboxTask,
+    ProviderCallPurpose,
     UploadKind,
     UploadRejectionReason,
     UploadStatus,
@@ -322,4 +324,47 @@ class OutboxMessage(Base):
             postgresql_where=text("published_at IS NULL"),
         ),
         Index("ix_outbox_job_id", "job_id"),  # makes cascading job deletes fast
+    )
+
+
+class ProviderCall(Base):
+    """One call to a summarization provider (success or failure), for usage and debugging."""
+
+    __tablename__ = "provider_calls"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"))
+    attempt_no: Mapped[int] = mapped_column(SmallInteger)
+    stage: Mapped[str]
+    chunk_id: Mapped[str | None]  # set for per-chunk calls
+    purpose: Mapped[str]
+    provider: Mapped[str]
+    model: Mapped[str]
+    started_at: Mapped[datetime] = mapped_column(server_default=now())
+    latency_ms: Mapped[int]
+    success: Mapped[bool] = mapped_column(Boolean)
+    error_class: Mapped[str | None]
+    input_chars: Mapped[int]
+    output_chars: Mapped[int | None]
+    # Token counts only when the provider reports them (never estimated).
+    prompt_tokens: Mapped[int | None]
+    completion_tokens: Mapped[int | None]
+    total_tokens: Mapped[int | None]
+
+    __table_args__ = (
+        CheckConstraint("attempt_no >= 1", name="attempt_no_positive"),
+        CheckConstraint(one_of("purpose", ProviderCallPurpose), name="purpose"),
+        CheckConstraint("latency_ms >= 0", name="latency_nonneg"),
+        CheckConstraint(
+            "input_chars >= 0 AND (output_chars IS NULL OR output_chars >= 0)",
+            name="chars_nonneg",
+        ),
+        CheckConstraint(
+            "coalesce(prompt_tokens, 0) >= 0 AND coalesce(completion_tokens, 0) >= 0 "
+            "AND coalesce(total_tokens, 0) >= 0",
+            name="tokens_nonneg",
+        ),
+        # A call either succeeded, or failed with a recorded error class.
+        CheckConstraint("success = (error_class IS NULL)", name="success_iff_no_error"),
+        Index("ix_provider_calls_job_id", "job_id"),
     )

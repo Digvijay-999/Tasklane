@@ -287,6 +287,24 @@ If the lease renewal matches nothing, the attempt was closed by someone else (Ph
 deciding the worker was dead), so the worker is **fenced out**: it stops without writing anything
 more. Finishing closes the attempt and transitions the job in one transaction.
 
+### Keeping the lease alive during long stages (Phase 5)
+
+A lease is 60 s (`LEASE_SECONDS`). Every PDF stage renews it well within that time:
+
+- While the sandboxed parser runs, the worker waits on it and wakes at least every
+  `LEASE_SECONDS / 4` (15 s) to renew the lease (`keep_alive`), even if the parser reports no
+  progress. Per-page progress reports renew it too.
+- The summarize stage renews it after every summarizer call (each call is recorded in
+  `provider_calls` in the same transaction as the renewal). A single call can't renew while it
+  waits, so `PROVIDER_TIMEOUT_SECONDS` must be at most half the lease (the settings refuse to
+  start otherwise).
+- If a renewal matches nothing, the worker is fenced out: it kills the parser if one is running
+  and makes no more database writes. (It may still finish replacing a file in the job's work or
+  artifact folder that it had started; because outputs are deterministic, the file's content is
+  the same either way.)
+
+A background heartbeat independent of the stage code comes in Phase 7.
+
 ### Worker processes and database connections
 
 Celery forks worker processes from a parent. Forked processes must not share database sockets, so
@@ -296,17 +314,64 @@ closing the parent's connections (tested with a real `fork`).
 
 ### Known gaps until Phase 7
 
-- **Unexpected errors** fail the job permanently (`internal_error`); there are no retries until
-  Phase 5.
+- **There are no automatic retries yet** (Phase 5, part B). Every failure is permanent: expected
+  input problems get a specific `error_class` (see [api.md](api.md#failure-classes)), anything
+  unexpected becomes `internal_error`. Transient database errors inside a running stage are
+  among them for now.
 - **A worker killed mid-stage**, or a task hitting the hard time limit, leaves the job `running`
   with an open attempt whose lease simply lapses. Nothing acts on an expired lease until Phase 7.
   A redelivered message for that job is dropped, because the job is still `running`.
 - **A message lost by Redis** after the outbox row was marked published leaves the job `queued`
   until Phase 7 recovery re-queues it. The same happens if a task fails with a non-database error
   before its claim commits (the message is acknowledged); that would be a bug, and it is logged.
-- **Leases are renewed only by progress reports.** A stage that runs longer than the lease without
-  reporting progress lets it lapse (harmless until Phase 7; independent heartbeats come in
-  Phase 7).
+- **Leases are renewed by the stage code** (progress reports and `keep_alive`, see above), not
+  by an independent heartbeat. A stage that forgot to do either would let its lease lapse
+  (harmless until Phase 7).
+
+## Untrusted PDFs: the parser sandbox (Phase 5)
+
+A PDF upload is untrusted input. A crafted file can make a parser loop forever, use huge amounts
+of memory, or produce gigabytes of "text". Python code can't reliably stop a stuck function from
+inside its own process, so the PDF is opened in a **separate child process**
+(`workflows/pdf/parse_child.py`), started by `workflows/pdf/sandbox.py` (like spawning a child
+process in Node and killing it on a timer).
+
+| Limit | Enforced by |
+|---|---|
+| Wall-clock time (validate 60 s, extract 300 s) | The worker waits with a deadline and kills the child's whole process group (`SIGKILL`) |
+| Memory (1 GiB address space) | `RLIMIT_AS`, set by the operating system before the parser starts |
+| CPU time | `RLIMIT_CPU` (deadline + 5 s), a backstop in case the worker itself stalls |
+| Output size (64 MiB) | `RLIMIT_FSIZE`: the child can't write more extracted text than that |
+| Pages (500), characters (2,000,000) | Checked inside the child, which stops as soon as a limit is passed |
+
+The `RLIMIT`s are applied by a tiny launcher script (`limited_launcher.py`) inside the new
+process, before the parser is loaded, rather than with `preexec_fn` (Python code run between
+`fork` and `exec`, which Python documents as unsafe in a process with threads, like a Celery
+worker). The settings refuse an output-size limit too small for the text limit, so a legitimate
+PDF can't be mistaken for an attack.
+
+Isolation: the child runs `python -I` (application code isn't importable, `PYTHON*` variables
+are ignored), gets an environment with only `PATH` and `LANG` (no database password, no API
+keys), cannot write core dumps, and may import only the standard library and pypdf (a test
+enforces that). It talks to the worker through one JSON object per line on stdout; the worker
+trusts only known error classes and numeric parameters from it.
+
+Every way the child can end maps to a fixed result: a result message (success), an error
+message (a specific `error_class`), killed at the deadline or by a limit (`pdf_too_complex`), or
+any other exit (a bug: `internal_error`, with the child's stderr only in the worker log).
+
+### Stages are safe to run twice
+
+Each stage reads its inputs from the job's work folder (`work/{job_id}/` in the storage volume)
+and writes its outputs there with an atomic write: a temporary file in the same folder, `fsync`,
+`os.replace`, `fsync` of the folder. A reader therefore sees either the old complete file or the
+new complete file, never half of one. Outputs are deterministic (no timestamps or random ids;
+chunk ids are hashes of the input hash, the chunking settings, and the text), so running a stage
+again produces byte-identical files, and artifact rows are upserted on `(job_id, artifact_type)`,
+so a re-run replaces the row instead of adding one. Artifact rows are written only in the
+transaction that marks the job `succeeded`, so a job that fails after its files were written
+lists no artifacts. Tests run every stage twice and compare the files byte for byte. (Phase 5, part B uses this to resume a retried job from its last completed
+stage.)
 
 ## Test isolation
 
@@ -322,3 +387,7 @@ closing the parent's connections (tested with a real `fork`).
   before and after each test, so a running dev worker (database 0, queue `tasklane`) never sees test
   messages. End-to-end tests start real dispatcher and worker processes against the test database
   and that Redis database. Celery's eager mode is never used.
+- Files: every API and service test gets its own temporary storage folder. The end-to-end worker
+  and dispatcher processes receive that folder as `STORAGE_ROOT`, never the real `storage`
+  volume; a test reads the environment of the running processes and checks that nothing for the
+  test job appears in the real volume.

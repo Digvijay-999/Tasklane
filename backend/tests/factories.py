@@ -10,7 +10,15 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Artifact, Job, JobAttempt, JobEvent, OutboxMessage, Upload
+from app.db.models import (
+    Artifact,
+    Job,
+    JobAttempt,
+    JobEvent,
+    OutboxMessage,
+    ProviderCall,
+    Upload,
+)
 from app.domain.enums import (
     ArtifactType,
     AttemptTrigger,
@@ -142,3 +150,20 @@ def make_outbox(session: Session, job: Job, **overrides: Any) -> OutboxMessage:
     }
     values.update(overrides)
     return _add(session, OutboxMessage(**values))
+
+
+def make_provider_call(session: Session, job: Job, **overrides: Any) -> ProviderCall:
+    values: dict[str, Any] = {
+        "job_id": job.id,
+        "attempt_no": 1,
+        "stage": "summarize",
+        "purpose": "chunk",
+        "provider": "stub",
+        "model": "stub-extractive-v1",
+        "latency_ms": 1,
+        "success": True,
+        "input_chars": 100,
+        "output_chars": 20,
+    }
+    values.update(overrides)
+    return _add(session, ProviderCall(**values))

@@ -5,7 +5,7 @@ processing jobs (PDF ingestion and repository ZIP indexing), with a focus on dur
 retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the goals and
 [docs/architecture.md](docs/architecture.md) for the planned design.
 
-## Current status: Phase 4 of 12
+## Current status: Phase 5 of 12 (part A done)
 
 **What works today:**
 
@@ -41,15 +41,27 @@ retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) fo
     a job is never run twice at the same time.
   - While Redis is down, new jobs stay `queued` and visible; the dispatcher backs off and
     publishes them when Redis returns.
-  - **For now every job runs a placeholder stage** (`dummy`, about 3 seconds of simulated
-    progress, `DUMMY_STAGE_SECONDS`). No PDF or ZIP content is processed yet (Phases 5–6).
-  - Any error during a stage fails the job (no automatic retries until Phase 5).
+  - Any error during a stage fails the job permanently (no automatic retries yet: Phase 5,
+    part B).
   - A worker killed mid-job leaves that job `running` until lease recovery exists (Phase 7).
   See [docs/reliability.md](docs/reliability.md#delivery-outbox--dispatcher--redis--worker).
+- **PDF ingestion** (`pdf_ingest`): validate, extract text, chunk, summarize, and write two
+  artifacts, `summary.md` and `manifest.json`, downloadable with
+  `GET /v1/jobs/{id}/artifacts/{artifact_id}`.
+  - **The summarizer is a stub, not an AI model**: it picks the first sentences of each chunk
+    and frequent key terms. It needs no API key and is deterministic. A real (optional) LLM
+    provider is Phase 11.
+  - The PDF is opened in a separate process with time, memory, CPU, and output-size limits, so
+    a malicious or broken file can't hang or exhaust the worker.
+  - Password-protected, damaged, image-only (scanned), too-long, and too-large PDFs fail with a
+    clear message after one attempt. Scanned PDFs are not supported (no OCR).
+  - Details: [docs/api.md](docs/api.md#what-a-pdf_ingest-job-does).
+- `repo_index` jobs still run a placeholder stage (`dummy`, about 3 seconds of simulated
+  progress, `DUMMY_STAGE_SECONDS`). ZIP contents are processed in Phase 6.
 
-**Not implemented yet:** real PDF/ZIP processing, retries, lease recovery, cancellation, manual
-retry, the event stream, artifact downloads, the dashboard, and metrics. See the phase list in
-[CLAUDE.md](CLAUDE.md).
+**Not implemented yet:** automatic retries (Phase 5, part B), ZIP processing, lease recovery,
+cancellation, manual retry, the event stream, the dashboard, metrics, and any real LLM provider.
+See the phase list in [CLAUDE.md](CLAUDE.md).
 
 ## Requirements
 
@@ -83,8 +95,20 @@ Watch jobs being published and run:
 docker compose logs -f worker dispatcher
 ```
 
-To have time to watch a job (or to stop the worker mid-job), make the placeholder stage longer,
-e.g. `DUMMY_STAGE_SECONDS=30` in `.env`, then `docker compose up -d worker`.
+To have time to watch a `repo_index` job (or to stop the worker mid-job), make the placeholder
+stage longer, e.g. `DUMMY_STAGE_SECONDS=30` in `.env`, then `docker compose up -d worker`.
+
+### Sample PDFs
+
+The repository contains no PDF files; a script generates small samples (a text report, a scanned
+look-alike with no text, a password-protected one, one with only an owner password, and a damaged
+one) into a folder you choose:
+
+```powershell
+$demo = "$env:USERPROFILE\tasklane-demo"
+New-Item -ItemType Directory -Force $demo | Out-Null
+docker compose run --rm -v "${demo}:/out" api python -m devtools.pdf_samples /out
+```
 
 ## Try the API (PowerShell)
 
@@ -111,9 +135,15 @@ curl.exe -i -X POST "$api/v1/jobs" -H "Content-Type: application/json" -H "Idemp
 curl.exe -s "$api/v1/jobs?limit=5"
 $job = (curl.exe -s "$api/v1/jobs?limit=1" | ConvertFrom-Json).items[0]
 curl.exe -s "$api/v1/jobs/$($job.id)"
+
+# Once it has succeeded, download the summary
+$detail = curl.exe -s "$api/v1/jobs/$($job.id)" | ConvertFrom-Json
+$summary = $detail.artifacts | Where-Object artifact_type -eq "summary"
+curl.exe -s -o summary.md "$api$($summary.download_url)"
 ```
 
-Uploaded files live in the `storage` Docker volume, not in your project folder:
+Uploaded files, intermediate files (`work/`), and artifacts live in the `storage` Docker volume,
+not in your project folder:
 
 ```powershell
 docker compose exec api find /data/storage -type f
@@ -129,7 +159,7 @@ docker compose run --rm migrate alembic current                   # show the app
 docker compose run --rm migrate alembic history                   # list migrations
 docker compose run --rm migrate alembic check                     # "No new upgrade operations
                                                                   #  detected" = models match DB
-docker compose run --rm api alembic revision --autogenerate --rev-id 0003 -m "describe change"
+docker compose run --rm api alembic revision --autogenerate --rev-id 0004 -m "describe change"
 ```
 
 Autogenerate writes a *draft* into `backend/migrations/versions/`. Always review it by hand: it

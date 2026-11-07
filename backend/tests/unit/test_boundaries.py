@@ -4,6 +4,7 @@
 """
 
 import ast
+import sys
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,20 @@ FORBIDDEN = {
         "app.queue",
         "app.services",
     ),
+    # Providers turn text into summaries. They know nothing about jobs, storage, or transport.
+    "providers": (
+        "fastapi",
+        "starlette",
+        "celery",
+        "kombu",
+        "sqlalchemy",
+        "app.api",
+        "app.db",
+        "app.queue",
+        "app.services",
+        "app.storage",
+        "app.workflows",
+    ),
 }
 
 
@@ -79,3 +94,16 @@ def test_package_respects_its_boundary(package, path):
 def test_every_service_error_code_has_an_http_status():
     """A code missing from the table would silently become a 400."""
     assert set(ErrorCode) <= set(STATUS_BY_CODE)
+
+
+@pytest.mark.parametrize(
+    ("script", "allowed"),
+    [("parse_child.py", {"pypdf"}), ("limited_launcher.py", set())],
+)
+def test_sandboxed_scripts_import_only_the_standard_library(script, allowed):
+    """These run with `python -I`: application code isn't importable there, and they must stay
+    small enough to reason about. The parser may also use pypdf."""
+    imports = _imports(APP / "workflows" / "pdf" / script)
+    assert allowed <= {name.split(".")[0] for name in imports}
+    bad = [name for name in imports if name.split(".")[0] not in sys.stdlib_module_names | allowed]
+    assert bad == []

@@ -416,8 +416,14 @@ def test_if_recording_the_failure_fails_the_error_propagates_and_the_job_stays_r
 def test_finishing_retries_when_a_cancel_request_lands_mid_transaction(
     engine, session_factory, monkeypatch
 ):
-    """A user's cancel can commit between reading the status and the conditional update that
-    finishes the job; the finish re-reads and applies the right outcome instead of giving up."""
+    """If the conditional update that finishes the job loses (the status changed after it was
+    read), the finish re-reads and applies the right outcome instead of giving up.
+
+    Since Phase 5 the failing transaction appends `stage.failed` first, which locks the job row,
+    so a real concurrent cancel simply waits for the worker's commit (and running the cancel on a
+    second connection here would wait forever). The lost race is therefore simulated inside the
+    worker's own transaction: the status changes right before the update that read the old one.
+    """
     import app.services.execution as execution
 
     job_id = new_job(engine)
@@ -427,8 +433,8 @@ def test_finishing_retries_when_a_cancel_request_lands_mid_transaction(
     def cancel_first_then_transition(session, jid, *, from_status, to_status, **kwargs):
         if from_status == S.RUNNING and to_status == S.FAILED and not injected:
             injected.append(True)
-            with Session(engine) as other, other.begin():  # the user's cancel request
-                original(other, jid, from_status=S.RUNNING, to_status=S.CANCEL_REQUESTED)
+            # Stands in for the user's cancel request committing just before this update.
+            original(session, jid, from_status=S.RUNNING, to_status=S.CANCEL_REQUESTED)
         return original(session, jid, from_status=from_status, to_status=to_status, **kwargs)
 
     monkeypatch.setattr(execution.job_rows, "transition_job", cancel_first_then_transition)

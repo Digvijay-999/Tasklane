@@ -16,6 +16,9 @@ dependencies = [
     "celery[redis]>=5.6.3,<5.7",          # task queue (like BullMQ); Redis is the broker
     # Celery 5.6 sets no upper bound on kombu; stay on the 5.6 line it was released with.
     "kombu>=5.6.2,<5.7",
+    # PDF parsing (pure Python, BSD-3). [crypto] adds `cryptography`, needed to open PDFs that
+    # are encrypted with only an owner password (print/copy restrictions).
+    "pypdf[crypto]>=6.21.4,<7",
 ]
 
 [dependency-groups]

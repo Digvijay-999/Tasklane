@@ -7,7 +7,8 @@ from app.config import Settings
 from app.domain.dispatch import DISPATCH_BACKOFF_MAX_SECONDS, dispatch_backoff_seconds
 from app.domain.enums import WorkflowType
 from app.queue.celery_app import CELERY_TASK_NAMES, RUN_JOB_TASK, create_celery_app
-from app.workflows.dummy import DUMMY_STAGE_NAME, DummyStage, stages_for
+from app.workflows.dummy import DUMMY_STAGE_NAME, DummyStage
+from app.workflows.registry import stages_for
 
 # --- Backoff ------------------------------------------------------------------------------------
 
@@ -44,10 +45,19 @@ def test_dummy_stage_reports_progress_in_steps_and_sleeps_for_its_duration():
     assert sum(slept) == pytest.approx(2.5)
 
 
-def test_every_workflow_runs_the_single_dummy_stage_in_this_phase():
-    for workflow_type in WorkflowType:
-        stages = stages_for(workflow_type, dummy_stage_seconds=1.0)
-        assert [s.name for s in stages] == [DUMMY_STAGE_NAME]
+def test_workflow_stages(unit_settings):
+    from app.queue.worker_process import workflow_config
+
+    config = workflow_config(unit_settings)
+    assert [s.name for s in stages_for(WorkflowType.PDF_INGEST, config)] == [
+        "validate_pdf",
+        "extract_text",
+        "chunk_document",
+        "summarize",
+        "write_artifacts",
+    ]
+    # repo_index keeps the placeholder stage until Phase 6.
+    assert [s.name for s in stages_for(WorkflowType.REPO_INDEX, config)] == [DUMMY_STAGE_NAME]
 
 
 # --- Celery configuration -------------------------------------------------------------------------
@@ -105,6 +115,38 @@ def test_visibility_timeout_must_exceed_the_lease(unit_settings):
     values["celery_visibility_timeout_seconds"] = 600
     with pytest.raises(ValidationError, match="longer than LEASE_SECONDS"):
         Settings(**values)
+
+
+def test_provider_timeout_must_fit_in_half_a_lease(unit_settings):
+    values = {**unit_settings.model_dump(), "lease_seconds": 30, "provider_timeout_seconds": 16}
+    with pytest.raises(ValidationError, match="at most half of LEASE_SECONDS"):
+        Settings(**values)
+    values["provider_timeout_seconds"] = 15
+    assert Settings(**values).keep_alive_interval_seconds == 7.5  # lease / 4
+
+
+def test_task_time_limit_must_exceed_the_stage_limits(unit_settings):
+    values = {**unit_settings.model_dump(), "celery_task_time_limit_seconds": 1260}
+    with pytest.raises(ValidationError, match="longer than the PDF stage time limits"):
+        Settings(**values)  # 60 + 300 + 900 = 1260: not strictly longer
+    values["celery_task_time_limit_seconds"] = 1261
+    Settings(**values)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"chunk_overlap_chars": 4000}, "overlap < target"),
+        ({"chunk_target_chars": 7000}, "target <= max"),
+        ({"summary_final_max_chars": 6000}, "more than twice summary_final_max_chars"),
+        ({"summary_chunk_max_chars": 6000}, "more than twice summary_chunk_max_chars"),
+        ({"pdf_max_text_chars": 10_000_000}, "PDF_PARSER_OUTPUT_MAX_MB is too small"),
+    ],
+)
+def test_inconsistent_pdf_settings_are_refused_at_startup(unit_settings, overrides, message):
+    """Not on the first job: a bad value would otherwise leave every job stuck."""
+    with pytest.raises(ValidationError, match=message):
+        Settings(**{**unit_settings.model_dump(), **overrides})
 
 
 def test_only_the_dispatchers_app_fails_fast_on_connection_errors(unit_settings):

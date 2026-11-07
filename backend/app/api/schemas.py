@@ -128,6 +128,7 @@ class ArtifactResponse(BaseModel):
     content_type: str
     sha256: str
     created_at: datetime
+    download_url: str = Field(description="GET this URL to download the file.")
 
 
 class JobDetailResponse(JobResponse):

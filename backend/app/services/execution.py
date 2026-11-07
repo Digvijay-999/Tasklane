@@ -9,15 +9,16 @@ is always a **claim** against the database, which is the source of truth:
    is inserted; `attempt.started` is recorded. Anything else (already running, finished,
    cancelled, not due, lost the race to another worker) means the message is a duplicate or
    stale: it is **dropped without writing anything**.
-2. Stages: each progress report renews the lease and records progress and an event. If the
-   attempt was closed by someone else (recovery, Phase 7), the worker is *fenced out*: it stops
-   without writing anything further.
-3. Finish (one transaction): close the attempt and move the job to `succeeded` (or record the
-   failure).
+2. Stages: every report from a stage (progress, keep-alive, provider call, artifact) renews the
+   lease in the same short transaction as its write. If the attempt was closed by someone else
+   (recovery, Phase 7), the worker is *fenced out*: it stops without writing anything further.
+3. Finish (one transaction): close the attempt and move the job to `succeeded`, or record the
+   failure.
 
-Phase 4 failure handling: any unexpected exception fails the job permanently with error class
-`internal_error` (no retries yet; Phase 5 adds transient/permanent classification). If even that
-can't be recorded (e.g. the database is down), or the worker process dies, the job stays
+Failure handling (Phase 5 Part A): a JobError (an expected failure such as an encrypted PDF) fails
+the job with its own error class and safe message; any other exception fails it with
+`internal_error`. Nothing is retried yet (Part B adds transient errors and retries). If even the
+failure can't be recorded (e.g. the database is down), or the worker process dies, the job stays
 `running` with an open attempt until its lease expires; recovering it is Phase 7's job.
 """
 
@@ -32,28 +33,34 @@ from enum import StrEnum
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.db.models import Job
+from app.db.models import Job, Upload
+from app.db.repositories import artifacts as artifact_rows
 from app.db.repositories import attempts as attempt_rows
 from app.db.repositories import jobs as job_rows
+from app.db.repositories import provider_calls as provider_call_rows
 from app.domain.enums import (
     AttemptOutcome,
     AttemptTrigger,
-    ErrorClass,
     EventType,
     JobStatus,
     WorkflowType,
 )
+from app.domain.errors import ERRORS, JobError
 from app.domain.state_machine import (
     CLAIMABLE_STATUSES,
     FailureKind,
     status_after_failure,
     status_after_success,
 )
-from app.workflows.base import Stage
+from app.providers.base import ProviderCallRecord
+from app.storage.local import LocalStorage
+from app.storage.workspace import JobWorkspace
+from app.workflows.base import ArtifactOutput, JobInput, Stage, UploadInput
 
 logger = logging.getLogger(__name__)
 
-INTERNAL_ERROR_SUMMARY = "An unexpected error occurred while running the job."
+INTERNAL_ERROR = "internal_error"
+INTERNAL_ERROR_SUMMARY = ERRORS[INTERNAL_ERROR].message
 EXECUTING_STATUSES = frozenset({JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED})
 
 
@@ -83,6 +90,7 @@ class RunResult:
     drop_reason: DropReason | None = None
     job_status: JobStatus | None = None  # for DROPPED: the status that caused it
     attempt_no: int | None = None
+    error_class: str | None = None  # for FAILED
 
 
 @dataclass(frozen=True)
@@ -91,6 +99,14 @@ class ClaimedAttempt:
     attempt_id: uuid.UUID
     attempt_no: int
     workflow_type: WorkflowType
+    job_input: JobInput
+
+
+@dataclass(frozen=True)
+class _Failure:
+    error_class: str
+    summary: str
+    stage: str | None
 
 
 class JobExecutionService:
@@ -101,11 +117,13 @@ class JobExecutionService:
         worker_id: str,
         lease: timedelta,
         stages_for: Callable[[WorkflowType], list[Stage]],
+        storage: LocalStorage | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.worker_id = worker_id
         self.lease = lease
         self.stages_for = stages_for
+        self.storage = storage
 
     # --- Entry point -----------------------------------------------------------------------------
 
@@ -130,17 +148,36 @@ class JobExecutionService:
             "worker_id": self.worker_id,
         }
         logger.info("job claimed", extra=log_extra)
+        progress = _StageTracker()
         try:
-            last_stage = self._run_stages(claim)
-            self._succeed(claim, last_stage)
+            self._run_stages(claim, progress)
+            self._succeed(claim, progress)
         except AttemptFencedError:
             logger.warning("attempt fenced out; stopping without further writes", extra=log_extra)
             return RunResult(RunOutcome.FENCED, attempt_no=claim.attempt_no)
+        except JobError as error:
+            # An expected failure (e.g. an encrypted PDF): its class and safe message are recorded.
+            logger.warning(
+                "job failed",
+                extra={
+                    **log_extra,
+                    "error_class": error.error_class,
+                    "stage": progress.current_stage,
+                },
+            )
+            failure = _Failure(error.error_class, error.safe_message, progress.current_stage)
+            return RunResult(
+                self._fail(claim, failure),
+                attempt_no=claim.attempt_no,
+                error_class=error.error_class,
+            )
         except Exception:
-            # The traceback goes to the logs; the database only gets a safe summary.
+            # Unexpected: the traceback goes to the logs; the database only gets a safe summary.
             logger.exception("job failed with an unexpected error", extra=log_extra)
-            outcome = self._fail_permanently(claim)
-            return RunResult(outcome, attempt_no=claim.attempt_no)
+            failure = _Failure(INTERNAL_ERROR, INTERNAL_ERROR_SUMMARY, progress.current_stage)
+            return RunResult(
+                self._fail(claim, failure), attempt_no=claim.attempt_no, error_class=INTERNAL_ERROR
+            )
         logger.info("job succeeded", extra=log_extra)
         return RunResult(RunOutcome.SUCCEEDED, attempt_no=claim.attempt_no)
 
@@ -152,9 +189,15 @@ class JobExecutionService:
             # count, and trigger read here can't change before the update below. A concurrent
             # claimer waits here, then sees the job already `running` and drops its message.
             row = session.execute(
-                select(Job.status, Job.attempt_count, Job.workflow_type)
+                select(
+                    Job.status,
+                    Job.attempt_count,
+                    Job.workflow_type,
+                    Job.options,
+                    Job.upload_id,
+                )
                 .where(Job.id == job_id)
-                .with_for_update()
+                .with_for_update(of=Job)
             ).one_or_none()
             if row is None:
                 return RunResult(RunOutcome.DROPPED, DropReason.JOB_NOT_FOUND)
@@ -162,6 +205,7 @@ class JobExecutionService:
             if status not in CLAIMABLE_STATUSES:
                 return RunResult(RunOutcome.DROPPED, DropReason.NOT_CLAIMABLE, job_status=status)
             workflow_type = WorkflowType(row.workflow_type)  # validate before changing anything
+            upload = session.get(Upload, row.upload_id)
 
             attempt_no = row.attempt_count + 1
             if status == JobStatus.RETRY_WAIT:
@@ -205,19 +249,39 @@ class JobExecutionService:
                 {"attempt_no": attempt_no, "trigger": trigger.value, "worker_id": self.worker_id},
                 attempt_no=attempt_no,
             )
+            job_input = JobInput(
+                job_id=job_id,
+                attempt_no=attempt_no,
+                workflow_type=workflow_type.value,
+                upload=UploadInput(
+                    upload_id=upload.id,
+                    storage_path=upload.storage_path,
+                    sha256=upload.sha256 or "",
+                    size_bytes=upload.size_bytes or 0,
+                    original_filename=upload.original_filename,
+                ),
+                options=dict(row.options or {}),
+            )
         return ClaimedAttempt(
             job_id=job_id,
             attempt_id=attempt_id,
             attempt_no=attempt_no,
             workflow_type=workflow_type,
+            job_input=job_input,
         )
 
     # --- Stages ----------------------------------------------------------------------------------
 
-    def _run_stages(self, claim: ClaimedAttempt) -> str:
+    def _run_stages(self, claim: ClaimedAttempt, tracker: "_StageTracker") -> None:
         stages = self.stages_for(claim.workflow_type)
-        for index, stage in enumerate(stages):
-            context = _AttemptContext(self, claim, stage.name, index, len(stages))
+        weights = [max(1, int(getattr(stage, "weight", 1))) for stage in stages]
+        total = sum(weights) or 1
+        done = 0
+        for stage, weight in zip(stages, weights, strict=True):
+            tracker.current_stage = stage.name
+            context = _AttemptContext(
+                self, claim, tracker, stage.name, done / total, weight / total
+            )
             context.record(EventType.STAGE_STARTED, {"stage": stage.name}, stage_percent=0)
             started = time.monotonic()
             stage.run(context)
@@ -227,41 +291,64 @@ class JobExecutionService:
                 {"stage": stage.name, "duration_ms": duration_ms},
                 stage_percent=100,
             )
-        return stages[-1].name if stages else ""
+            done += weight
 
     # --- Finish ----------------------------------------------------------------------------------
 
-    def _succeed(self, claim: ClaimedAttempt, last_stage: str) -> None:
+    def _succeed(self, claim: ClaimedAttempt, tracker: "_StageTracker") -> None:
+        """Close the attempt, register the artifacts, and finish the job in ONE transaction, so
+        artifacts become visible exactly when the job succeeds (never for a failed or running
+        job)."""
         with self.session_factory.begin() as session:
             if not attempt_rows.close_attempt(session, claim.attempt_id, AttemptOutcome.SUCCEEDED):
                 raise AttemptFencedError
-            if last_stage:
-                job_rows.update_progress(session, claim.job_id, stage=last_stage, percent=100)
+            for artifact in tracker.artifacts.values():
+                artifact_rows.upsert_artifact(
+                    session,
+                    job_id=claim.job_id,
+                    attempt_no=claim.attempt_no,
+                    artifact_type=artifact.artifact_type,
+                    storage_path=artifact.relative_path,
+                    filename=artifact.filename,
+                    content_type=artifact.content_type,
+                    size_bytes=artifact.size_bytes,
+                    sha256=artifact.sha256,
+                )
+            if tracker.current_stage:
+                job_rows.update_progress(
+                    session, claim.job_id, stage=tracker.current_stage, percent=100
+                )
             # status_after_success: a pending cancel request is superseded by the success.
             self._move_to_outcome(session, claim, status_after_success)
 
-    def _fail_permanently(self, claim: ClaimedAttempt) -> RunOutcome:
+    def _fail(self, claim: ClaimedAttempt, failure: _Failure) -> RunOutcome:
+        """Record a failed attempt and fail the job (Part A: every failure is permanent)."""
         try:
             with self.session_factory.begin() as session:
                 closed = attempt_rows.close_attempt(
                     session,
                     claim.attempt_id,
                     AttemptOutcome.FAILED_PERMANENT,
-                    error_class=ErrorClass.INTERNAL_ERROR,
-                    error_summary=INTERNAL_ERROR_SUMMARY,
+                    error_class=failure.error_class,
+                    error_summary=failure.summary,
                 )
                 if not closed:
                     raise AttemptFencedError
+                if failure.stage:
+                    job_rows.append_event(
+                        session,
+                        claim.job_id,
+                        EventType.STAGE_FAILED,
+                        {"stage": failure.stage, "error_class": failure.error_class},
+                        attempt_no=claim.attempt_no,
+                    )
                 self._move_to_outcome(
                     session,
                     claim,
                     lambda current: status_after_failure(
                         current, FailureKind.PERMANENT, attempt_count=0, max_attempts=0
                     ),
-                    changes={
-                        "error_class": ErrorClass.INTERNAL_ERROR,
-                        "error_summary": INTERNAL_ERROR_SUMMARY,
-                    },
+                    changes={"error_class": failure.error_class, "error_summary": failure.summary},
                 )
         except AttemptFencedError:
             return RunOutcome.FENCED
@@ -298,22 +385,43 @@ class JobExecutionService:
         raise AttemptFencedError
 
 
+class _StageTracker:
+    """Per-run state: which stage is running (so a failure can name it) and the artifacts the
+    stages produced (registered only when the job succeeds)."""
+
+    def __init__(self) -> None:
+        self.current_stage: str | None = None
+        self.artifacts: dict[str, ArtifactOutput] = {}  # by artifact type; a re-save replaces
+
+
 class _AttemptContext:
-    """StageContext for one stage of one attempt: records progress, renews the lease."""
+    """StageContext for one stage of one attempt. Every write renews the lease (fencing check)
+    in the same short transaction."""
 
     def __init__(
         self,
         service: JobExecutionService,
         claim: ClaimedAttempt,
+        tracker: _StageTracker,
         stage_name: str,
-        stage_index: int,
-        stage_count: int,
+        progress_start: float,
+        progress_share: float,
     ) -> None:
         self.service = service
         self.claim = claim
+        self.tracker = tracker
         self.stage_name = stage_name
-        self.stage_index = stage_index
-        self.stage_count = stage_count
+        self.progress_start = progress_start
+        self.progress_share = progress_share
+        self.job = claim.job_input
+
+    @property
+    def workspace(self) -> JobWorkspace:
+        if self.service.storage is None:
+            raise RuntimeError("this execution service was created without storage")
+        return JobWorkspace(self.service.storage, self.claim.job_id)
+
+    # --- StageContext ---------------------------------------------------------------------------
 
     def report_progress(self, percent: int) -> None:
         percent = max(0, min(100, percent))
@@ -321,12 +429,45 @@ class _AttemptContext:
             EventType.STAGE_PROGRESS, {"stage": self.stage_name, "percent": percent}, percent
         )
 
+    def keep_alive(self) -> None:
+        with self.service.session_factory.begin() as session:
+            self._renew(session)
+
+    def record_provider_call(self, call: ProviderCallRecord) -> None:
+        usage = call.usage
+        with self.service.session_factory.begin() as session:
+            self._renew(session)
+            provider_call_rows.insert_provider_call(
+                session,
+                job_id=self.claim.job_id,
+                attempt_no=self.claim.attempt_no,
+                stage=self.stage_name,
+                purpose=call.purpose.value,
+                provider=call.provider,
+                model=call.model,
+                latency_ms=call.latency_ms,
+                success=call.success,
+                input_chars=call.input_chars,
+                output_chars=call.output_chars,
+                chunk_id=call.chunk_id,
+                error_class=call.error_class,
+                prompt_tokens=usage.prompt_tokens if usage else None,
+                completion_tokens=usage.completion_tokens if usage else None,
+                total_tokens=usage.total_tokens if usage else None,
+            )
+
+    def save_artifact(self, artifact: ArtifactOutput) -> None:
+        """Remember the artifact; its row is written when the job succeeds (see _succeed)."""
+        self.keep_alive()  # fencing check: a fenced-out worker stops here
+        self.tracker.artifacts[artifact.artifact_type] = artifact
+
+    # --- Internals ------------------------------------------------------------------------------
+
     def record(self, event_type: EventType, payload: dict[str, object], stage_percent: int) -> None:
         """One short transaction: renew the lease (fencing check), update progress, add event."""
-        overall = round((self.stage_index * 100 + stage_percent) / self.stage_count)
+        overall = round((self.progress_start + self.progress_share * stage_percent / 100) * 100)
         with self.service.session_factory.begin() as session:
-            if not attempt_rows.renew_lease(session, self.claim.attempt_id, self.service.lease):
-                raise AttemptFencedError
+            self._renew(session)
             if not job_rows.update_progress(
                 session, self.claim.job_id, stage=self.stage_name, percent=overall
             ):
@@ -334,3 +475,7 @@ class _AttemptContext:
             job_rows.append_event(
                 session, self.claim.job_id, event_type, payload, attempt_no=self.claim.attempt_no
             )
+
+    def _renew(self, session: Session) -> None:
+        if not attempt_rows.renew_lease(session, self.claim.attempt_id, self.service.lease):
+            raise AttemptFencedError

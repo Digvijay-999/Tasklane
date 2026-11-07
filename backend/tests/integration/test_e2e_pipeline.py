@@ -1,11 +1,14 @@
 """End to end: real dispatcher and real Celery worker processes, real Redis, real PostgreSQL.
 
 A job is submitted through the API; the dispatcher publishes it from the outbox; a worker claims
-it, runs the placeholder stage, and finishes it. No eager mode, no mocks: messages go through
-JSON serialization and Redis exactly as in production.
+it, runs its stages, and finishes it. No eager mode, no mocks: messages go through JSON
+serialization and Redis exactly as in production.
 
-The processes use the test database and Redis database 15 / queue "tasklane-test", so a running
-dev stack is never involved. Run only these with:  pytest -m e2e
+The timing tests use repo_index jobs, which still run the placeholder `dummy` stage (until
+Phase 6), because its duration is configurable. The PDF tests run the real pdf_ingest stages.
+
+The processes use the test database, Redis database 15 / queue "tasklane-test", and the test's own
+storage folder, so a running dev stack is never involved. Run only these with:  pytest -m e2e
 """
 
 import json
@@ -22,14 +25,28 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import JobAttempt, JobEvent
+from app.db.models import JobAttempt, JobEvent, ProviderCall
 from app.queue.celery_app import RUN_JOB_TASK, create_celery_app
+from devtools import pdf_samples
 from tests.integration.conftest import TEST_QUEUE
-from tests.samples import pdf_bytes
+from tests.samples import zip_bytes
 
 pytestmark = pytest.mark.e2e
 
 BACKEND = Path(__file__).resolve().parents[2]
+PDF_STAGES = ["validate_pdf", "extract_text", "chunk_document", "summarize", "write_artifacts"]
+
+
+@pytest.fixture
+def api_settings(api_settings):
+    """The shared fixture's 4 KiB upload limit is too small for real sample PDFs."""
+    return api_settings.model_copy(update={"max_pdf_upload_bytes": 1024 * 1024})
+
+
+def process_environment(pid: int) -> dict[str, str]:
+    """The environment a running process actually has (read from Linux /proc)."""
+    raw = Path(f"/proc/{pid}/environ").read_bytes().decode(errors="replace")
+    return dict(item.split("=", 1) for item in raw.split("\0") if "=" in item)
 
 
 def wait_until(predicate: Callable[[], object], timeout: float, what: str) -> object:
@@ -81,7 +98,11 @@ class Pipeline:
         )
         # Celery logs "<name>@<host> ready." once it is consuming.
         ready = re.compile(r"@\S+ ready\.")
-        wait_until(lambda: ready.search(self.read(self.worker_log)), 60, "worker ready")
+        try:
+            wait_until(lambda: ready.search(self.read(self.worker_log)), 60, "worker ready")
+        except TimeoutError:
+            print(self.read(self.worker_log)[-3000:])  # shown by pytest on failure
+            raise
 
     def start_dispatcher(self) -> None:
         log = self.log_dir / "dispatcher.log"
@@ -115,18 +136,26 @@ class Pipeline:
 
 
 @pytest.fixture
-def start_pipeline(queue_settings, broker, tmp_path) -> Iterator[Callable[..., Pipeline]]:
+def start_pipeline(
+    queue_settings, dev_settings, broker, tmp_path
+) -> Iterator[Callable[..., Pipeline]]:
     pipelines: list[Pipeline] = []
+    # Never let test processes read or write the real storage volume.
+    assert queue_settings.storage_root != dev_settings.storage_root
+    assert queue_settings.storage_root.is_relative_to(tmp_path)
 
     def start(dummy_stage_seconds: float = 0.5) -> Pipeline:
         env = {
-            **os.environ,
+            # No API keys: the pipeline must work with the stub provider alone.
+            **{k: v for k, v in os.environ.items() if "API_KEY" not in k.upper()},
+            "PROVIDER": "stub",
             "POSTGRES_DB": queue_settings.postgres_db,  # the test database
             "REDIS_URL": queue_settings.redis_url,  # Redis database 15
             "CELERY_QUEUE": TEST_QUEUE,
             "DUMMY_STAGE_SECONDS": str(dummy_stage_seconds),
             "DISPATCH_POLL_SECONDS": "0.2",
-            "LEASE_SECONDS": "30",
+            "LEASE_SECONDS": str(queue_settings.lease_seconds),
+            "PROVIDER_TIMEOUT_SECONDS": str(queue_settings.provider_timeout_seconds),
             "WORKER_CONCURRENCY": "2",
             "LOG_LEVEL": "INFO",
             "PYTHONUNBUFFERED": "1",
@@ -144,19 +173,26 @@ def start_pipeline(queue_settings, broker, tmp_path) -> Iterator[Callable[..., P
         pipeline.stop()
 
 
-def submit_job(api) -> str:
+def submit_job(api, workflow_type: str = "repo_index", content: bytes | None = None) -> str:
+    """Upload a file and create a job. Default: a repo_index job (runs the `dummy` stage)."""
+    if workflow_type == "repo_index":
+        filename, content_type, content = "e2e.zip", "application/zip", content or zip_bytes()
+    else:
+        filename, content_type = "e2e.pdf", "application/pdf"
+        content = content or pdf_samples.report_pdf(page_count=4)
     upload = api.post(
         "/v1/uploads",
-        params={"filename": "e2e.pdf"},
-        content=pdf_bytes(),
-        headers={"Content-Type": "application/pdf"},
-    ).json()
+        params={"filename": filename},
+        content=content,
+        headers={"Content-Type": content_type},
+    )
+    assert upload.status_code == 201, upload.text
     response = api.post(
         "/v1/jobs",
-        json={"workflow_type": "pdf_ingest", "upload_id": upload["id"]},
+        json={"workflow_type": workflow_type, "upload_id": upload.json()["id"]},
         headers={"Idempotency-Key": f"e2e-{uuid.uuid4()}"},
     )
-    assert response.status_code == 201
+    assert response.status_code == 201, response.text
     return response.json()["id"]
 
 
@@ -257,3 +293,73 @@ def test_worker_process_killed_mid_stage_leaves_the_job_running_until_phase_7(
     [still_open] = attempts_of(engine, job_id)  # no second attempt was started
     assert still_open.id == attempt.id and still_open.ended_at is None
     assert dropped_messages_for(pipeline, job_id)[0]["job_status"] == "running"
+
+
+# --- PDF workflow (Phase 5) ----------------------------------------------------------------------
+
+
+def test_pdf_job_succeeds_with_the_stub_provider_and_no_api_key(api, engine, start_pipeline):
+    """Acceptance #9: the full PDF workflow runs with no LLM API key configured."""
+    pipeline = start_pipeline()
+    assert not any("API_KEY" in name.upper() for name in pipeline.env)
+    job_id = submit_job(api, "pdf_ingest")
+
+    wait_until(lambda: job_status(api, job_id) in ("succeeded", "failed"), 90, "job finished")
+
+    detail = api.get(f"/v1/jobs/{job_id}").json()
+    assert detail["status"] == "succeeded", detail
+    completed = [
+        e.payload["stage"] for e in events_of(engine, job_id) if e.event_type == "stage.completed"
+    ]
+    assert completed == PDF_STAGES
+    downloads = {a["artifact_type"]: api.get(a["download_url"]) for a in detail["artifacts"]}
+    assert set(downloads) == {"summary", "manifest"}
+    assert all(response.status_code == 200 for response in downloads.values())
+    assert downloads["manifest"].json()["summary"]["provider"] == "stub"
+    with Session(engine) as session:
+        providers = set(
+            session.scalars(
+                select(ProviderCall.provider).where(ProviderCall.job_id == uuid.UUID(job_id))
+            )
+        )
+    assert providers == {"stub"}
+
+
+def test_unsupported_pdf_fails_permanently_through_the_real_worker(api, start_pipeline):
+    start_pipeline()
+    job_id = submit_job(api, "pdf_ingest", pdf_samples.image_only_pdf(page_count=2))
+
+    wait_until(lambda: job_status(api, job_id) == "failed", 90, "job failed")
+
+    detail = api.get(f"/v1/jobs/{job_id}").json()
+    assert detail["error_class"] == "pdf_no_text"
+    assert len(detail["attempts"]) == 1
+    assert detail["artifacts"] == []
+
+
+def test_worker_and_dispatcher_use_the_test_storage_root_never_the_real_volume(
+    api, engine, queue_settings, dev_settings, start_pipeline
+):
+    """Carry-forward (Phase 5): e2e processes get STORAGE_ROOT from the test settings."""
+    pipeline = start_pipeline()
+    test_root, real_root = queue_settings.storage_root, dev_settings.storage_root
+    job_id = submit_job(api, "pdf_ingest")
+    wait_until(lambda: job_status(api, job_id) == "succeeded", 90, "job succeeded")
+
+    # 1. The processes themselves (dispatcher, Celery main process, and the worker child that ran
+    #    the job) were started with the test folder.
+    [attempt] = attempts_of(engine, job_id)
+    worker_child = int(attempt.worker_id.rsplit(":", 1)[1])
+    for pid in [p.pid for p in pipeline.processes] + [worker_child]:
+        assert process_environment(pid)["STORAGE_ROOT"] == str(test_root)
+
+    # 2. The worker read the upload from, and wrote every file to, the test folder ...
+    detail = api.get(f"/v1/jobs/{job_id}").json()
+    assert (test_root / "uploads" / detail["upload_id"]).is_dir()
+    assert (test_root / "work" / job_id / "pages.jsonl").is_file()
+    assert (test_root / "artifacts" / job_id / "summary.md").is_file()
+
+    # 3. ... and nothing for this job or its upload exists on the real volume.
+    assert not (real_root / "uploads" / detail["upload_id"]).exists()
+    assert not (real_root / "work" / job_id).exists()
+    assert not (real_root / "artifacts" / job_id).exists()

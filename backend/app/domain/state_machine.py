@@ -20,7 +20,8 @@ Two kinds of functions live here:
 from dataclasses import dataclass
 from enum import StrEnum
 
-from app.domain.enums import ErrorClass, JobStatus
+from app.domain.enums import JobStatus
+from app.domain.errors import INPUT_ERROR_CLASSES
 
 # --- Status groups -------------------------------------------------------------------------------
 
@@ -38,8 +39,8 @@ ATTEMPTS_PER_RUN = 3
 # can_manual_retry() refuses before that constraint could ever be hit.
 MAX_ATTEMPTS_LIMIT = 20
 
-# Errors caused by the input itself: rerunning the job would fail the same way.
-INPUT_ERROR_CLASSES = frozenset({ErrorClass.INVALID_INPUT, ErrorClass.UNSUPPORTED_INPUT})
+# Errors caused by the input itself (rerunning would fail the same way) are listed in
+# app.domain.errors.INPUT_ERROR_CLASSES (imported above); can_manual_retry() refuses them.
 
 # --- Transition table ----------------------------------------------------------------------------
 

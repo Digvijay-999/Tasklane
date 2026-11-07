@@ -23,6 +23,7 @@ from tests.factories import (
     make_event,
     make_job,
     make_outbox,
+    make_provider_call,
     make_upload,
     utcnow,
 )
@@ -222,6 +223,33 @@ CASES["ck_uploads_rejection_reason"] = lambda s: make_upload(
     s, status=UploadStatus.REJECTED, rejection_reason="bored"
 )
 
+# Phase 5 (migration 0003): provider call records.
+CASES["pk_provider_calls"] = _with_job(
+    lambda s, j: _duplicate_pk(
+        lambda s2: make_provider_call(s2, j),
+        lambda s2, first: make_provider_call(s2, j, id=first.id),
+    )(s)
+)
+CASES["fk_provider_calls_job_id_jobs"] = lambda s: make_provider_call(s, _missing_job())
+CASES["ck_provider_calls_attempt_no_positive"] = _with_job(
+    lambda s, j: make_provider_call(s, j, attempt_no=0)
+)
+CASES["ck_provider_calls_purpose"] = _with_job(
+    lambda s, j: make_provider_call(s, j, purpose="vibes")
+)
+CASES["ck_provider_calls_latency_nonneg"] = _with_job(
+    lambda s, j: make_provider_call(s, j, latency_ms=-1)
+)
+CASES["ck_provider_calls_chars_nonneg"] = _with_job(
+    lambda s, j: make_provider_call(s, j, input_chars=-1)
+)
+CASES["ck_provider_calls_tokens_nonneg"] = _with_job(
+    lambda s, j: make_provider_call(s, j, total_tokens=-5)
+)
+CASES["ck_provider_calls_success_iff_no_error"] = _with_job(
+    lambda s, j: make_provider_call(s, j, success=True, error_class="provider_timeout")
+)
+
 CASES["ck_jobs_no_cancel_while_active"] = lambda s: make_job(
     s, status=JobStatus.QUEUED, cancel_requested_at=utcnow()
 )
@@ -229,6 +257,16 @@ CASES["ck_jobs_no_cancel_while_active"] = lambda s: make_job(
 # Extra cases for constraints with more than one way to break them, e.g. both directions of an
 # "if and only if" CHECK.
 MORE_CASES: list[tuple[str, str, Case]] = [
+    (
+        "ck_provider_calls_success_iff_no_error",
+        "failure without an error class",
+        _with_job(lambda s, j: make_provider_call(s, j, success=False, error_class=None)),
+    ),
+    (
+        "ck_provider_calls_chars_nonneg",
+        "negative output characters",
+        _with_job(lambda s, j: make_provider_call(s, j, output_chars=-1)),
+    ),
     (
         "ck_uploads_ready_has_content",
         "ready without a size",

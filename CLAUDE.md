@@ -171,7 +171,7 @@ The full product brief is in `PROJECT_BRIEF.md`; the planned design is in `docs/
 - **Phase 4 failure handling:** any exception in a stage fails the job permanently with
   `error_class = internal_error` and a safe summary (traceback only in logs). No retries yet.
 - **Placeholder workflow:** every workflow type runs one `dummy` stage (`DUMMY_STAGE_SECONDS`,
-  default 3, five progress steps) until Phases 5-6.
+  default 3, five progress steps) until Phases 5-6. (Since Phase 5 only `repo_index` does.)
 - **Compose:** `dispatcher` and `worker` services, Redis with append-only persistence on the
   `redisdata` volume (`docker compose down -v` also deletes queued messages).
 - **Dev reload runner** (`backend/devtools/reload.py`), not the `watchfiles` CLI: watchfiles 1.3.0
@@ -183,32 +183,95 @@ The full product brief is in `PROJECT_BRIEF.md`; the planned design is in `docs/
   Celery or the Celery modules of `queue` (only `app.queue.broker`, a Redis ping); `api` never
   imports `queue`.
 
+## Decisions made (Phase 5, part A)
+
+- **pypdf `>=6.21.4,<7` with the `crypto` extra** (pypdf 6.21.4, cryptography 50.0.2), for
+  AES-encrypted PDFs. Owner-password-only PDFs (`decrypt("")` succeeds) are processed and flagged
+  `owner_password_only` in the manifest.
+- **Stages** (`app/workflows/pdf/stages.py`, progress weights in brackets): `validate_pdf` [5],
+  `extract_text` [30], `chunk_document` [5], `summarize` [55], `write_artifacts` [5].
+  `workflows/registry.py` maps workflow type → stages; `repo_index` keeps `dummy` until Phase 6.
+- **Parser sandbox** (`workflows/pdf/sandbox.py` + `limited_launcher.py` + `parse_child.py`):
+  `python -I` child, env only `PATH`/`LANG`, own session, `RLIMIT_AS` (1 GiB), `RLIMIT_CPU`
+  (deadline + 5 s), `RLIMIT_FSIZE` (64 MiB), no core dumps, all set by `limited_launcher.py`
+  inside the child (no `preexec_fn`: unsafe in a threaded worker); parent deadline + `killpg(SIGKILL)`; JSON lines on stdout; parent trusts
+  only known error classes and int params. Killed/out of memory/EFBIG → `pdf_too_complex`; any
+  other unexpected exit → `internal_error` (stderr tail only in logs). `parse_child.py` imports
+  only stdlib + pypdf, the launcher only stdlib (tests). Python ignores SIGXFSZ, so the file-size
+  limit shows up as `EFBIG`.
+- **Limits:** 500 pages, 2,000,000 raw characters (fail, never truncate), validate 60 s,
+  extract 300 s, summarize stage 900 s (`stage_timeout`), provider call 20 s. Settings refuse
+  `PROVIDER_TIMEOUT_SECONDS > LEASE_SECONDS / 2` and a Celery hard limit not longer than the sum
+  of stage limits, an output limit below `PDF_MAX_TEXT_CHARS * 12 + pages * 64` bytes, and
+  invalid chunk/summary sizes (all checked at startup). Tests with a 30 s lease set the provider
+  timeout to 10 s. Provider output is cut to `max_output_chars` by the stage, and a combine round
+  that doesn't shrink raises (map-reduce always terminates).
+- **Scanned rule:** fewer than 100 visible characters in total, or fewer than 20 per page on
+  average → `pdf_no_text`.
+- **Errors** (`app/domain/errors.py`): `JobError(error_class, **params)` with a fixed message
+  template per class (`ERRORS`); `INPUT_ERROR_CLASSES` lives there (state machine imports it).
+  In part A every class is PERMANENT; unknown exceptions → `internal_error`. A failure appends
+  `stage.failed {stage, error_class}`.
+- **Lease keep-alive:** `StageContext.keep_alive()` renews the lease; the sandbox calls it every
+  `LEASE_SECONDS / 4` while waiting; summarize renews after every provider call. Fenced → the
+  parser is killed and nothing more is written.
+- **Storage layout:** `work/{job_id}/` (intermediate: `validate.json`, `pages.jsonl`,
+  `extract.json`, `chunks.jsonl`, `summary.json`) and `artifacts/{job_id}/` (`summary.md`,
+  `manifest.json`), via `storage/workspace.py` (atomic writes: temp in same dir, fsync,
+  `os.replace`, fsync dir). Outputs are deterministic (no timestamps; chunk ids hash input sha,
+  chunker version, settings, index, text), so every stage is safe to re-run (tested byte for byte).
+- **Artifacts:** `save_artifact` only remembers them (and checks the lease); the rows are upserted
+  on `(job_id, artifact_type)` in the `_succeed` transaction, so artifacts are visible only for
+  succeeded jobs; `GET /v1/jobs/{id}/artifacts/{artifact_id}`
+  returns `FileResponse` with `nosniff`, `ETag: "<sha256>"`, `Cache-Control: private, no-cache`;
+  404 `artifact_not_found` (also other job's artifact / malformed id), 410 `artifact_gone` (file
+  missing or size mismatch). Job detail artifacts include `download_url`.
+- **Providers** (`app/providers/`): `Provider` protocol, `StubProvider` (`stub-extractive-v1`,
+  deterministic, no usage), `create_provider("stub")`. Providers import nothing from db, storage,
+  workflows, services, queue, api (test). Map-reduce summarization; chunk 600 / final 2000 /
+  combine input 12000 characters.
+- **`provider_calls` table (migration 0003):** one row per call (attempt, stage, purpose
+  `chunk`/`combine`, provider, model, latency, success, error class, char counts, tokens); never
+  the text. Recorded in the same transaction as the lease renewal.
+- **Samples:** `python -m devtools.pdf_samples <folder>` writes `report.pdf`, `scanned.pdf`,
+  `encrypted.pdf`, `owner_locked.pdf`, `corrupt.pdf`; tests import the same generators.
+- **E2E isolation:** e2e processes get the test `STORAGE_ROOT` (guarded in the fixture) and no
+  `*API_KEY*` variables; a test reads `/proc/<pid>/environ` of the dispatcher, the Celery main
+  process and the worker child, and checks the real volume has nothing for the job.
+- **Part B (when asked):** backoff 5 s base doubling, 300 s cap, equal jitter: the first retry is
+  2.5–5 s out and the second 5–10 s (use these ranges in docs and walkthroughs); budget CHECK;
+  fault injection (`ENABLE_FAULT_INJECTION` + per-job option, 422 when disabled); stage
+  checkpoints and resume (migration 0004).
+
 ## Carry-forward requirements
 
 Items later phases must address. Remove an item only when it is implemented and tested.
 
-- **Phase 5 — leases during long stages:** any stage that can run longer than the lease
-  (`LEASE_SECONDS`, 60 s) without reporting progress must not let its lease silently expire. Stages
-  must call `report_progress` well within the lease (e.g. per page or chunk), and single slow
-  calls (e.g. a provider request) need timeouts shorter than the lease. *Until Phase 7*, nothing
-  acts on an expired lease, so expiry has no effect yet; it starts to matter as soon as recovery
-  exists.
-- **Phase 5 — error classification:** replace the Phase 4 "any exception fails permanently"
-  stopgap with transient vs permanent errors, `retry_wait` + delayed outbox rows, and the attempt
-  budget.
-- **Phase 5 — retry timing:** a retry's outbox `available_at` must be >= the job's `retry_at`,
+- **Phase 5B — error classification:** replace the "any exception fails permanently" stopgap
+  with transient vs permanent errors, `retry_wait` + delayed outbox rows, and the attempt budget.
+  New stages must keep calling `report_progress`/`keep_alive` within the lease, and any new slow
+  call needs a timeout of at most half the lease.
+- **Phase 5B — retry timing:** a retry's outbox `available_at` must be >= the job's `retry_at`,
   both computed from the same database clock in the same transaction (e.g. `now() + interval`),
   never Python time. Otherwise the one legitimate retry message can be dropped as
   `retry_not_due` and the job stalls in `retry_wait`.
-- **Phase 5 — attempt budget at claim:** the claim relies on the invariant
+- **Phase 5B — attempt budget at claim:** the claim relies on the invariant
   `attempt_count < max_attempts` for claimable jobs (the DB CHECK would reject a violation). Keep
   it true in every path that moves a job to `queued`/`retry_wait`.
-- **Phase 5 — transient database errors inside a running stage** (in `report_progress`, deadlock
-  aborts) currently fail the job permanently; classify them as transient.
-- **Phase 5 — e2e storage:** e2e worker processes get `STORAGE_ROOT` from the test settings; keep
-  it that way when workers start reading uploads.
-- **Phase 5 — artifact download route** (`GET /v1/jobs/{id}/artifacts/{artifact_id}`), when
-  artifacts first exist.
+- **Phase 5B — transient database errors inside a running stage** (in `report_progress`,
+  `keep_alive`, deadlock aborts) currently fail the job permanently; classify them as transient.
+- **Phase 6 — reuse the sandbox pattern** for anything that parses untrusted ZIP content, and
+  keep e2e processes on the test `STORAGE_ROOT` (the isolation test must keep passing).
+- **Phase 7/11 — fenced writes to files:** a fenced worker makes no more database writes, but it
+  can finish replacing a file under `work/` or `artifacts/` first. Harmless while outputs are
+  deterministic; a non-deterministic provider (Phase 11) or recovery that starts a new attempt
+  (Phase 7) must write per-attempt files or otherwise prevent two attempts writing the same path.
+- **Phase 9 — rendering `summary.md`:** it contains PDF text as Markdown (only Markdown
+  punctuation is escaped). The dashboard must not render it with raw HTML or active links.
+- **Phase 7 — orphaned parser processes:** the PDF parser runs in its own session so it can be
+  killed as a group; if the *worker* is killed (SIGKILL/OOM), the parser is not killed with it. It
+  exits at its next write to the closed stdout pipe (per page during extraction), when it
+  finishes, or at `RLIMIT_CPU` (deadline + 5 s). Consider a parent-death signal.
 - **Phase 7 — heartbeats independent of progress updates** (a background heartbeat for stages
   that can't report progress often enough).
 - **Phase 7 — lost messages:** recovery must detect claimable jobs (`queued`, or `retry_wait`
@@ -231,6 +294,9 @@ Items later phases must address. Remove an item only when it is implemented and 
   are involved.
 - **Phase 12 — uploads:** clean up interrupted uploads (`receiving` rows and their files), and make
   retention never delete files of uploads referenced by unfinished jobs.
+- **Phase 12 — work folders:** `work/{job_id}/` intermediate files are kept forever for now;
+  retention must clean them (never for unfinished jobs), along with stray `.*.tmp` files left by
+  a crash mid-write.
 - **Dev note:** restarting the worker (including by live reload after a code change) interrupts
   running jobs; they stay `running` until Phase 7 recovery.
 
@@ -263,7 +329,7 @@ docker run --rm -v "${PWD}\backend:/src" -w /src python:3.13.18-slim sh -c "pip 
 | 2 | Migrations + state machine | **Done** |
 | 3 | Upload and job APIs with idempotency and outbox | **Done** |
 | 4 | Dispatcher + Celery worker with one dummy stage | **Done** (awaiting developer verification) |
-| 5 | PDF workflow + retries | Not started |
+| 5 | PDF workflow + retries | **Part A done** (awaiting developer verification); Part B not started |
 | 6 | ZIP workflow + security | Not started |
 | 7 | Leases, recovery, cancellation, manual retry | Not started |
 | 8 | SSE with replay | Not started |

@@ -32,6 +32,8 @@ STATUS_BY_CODE: dict[str, int] = {
     ErrorCode.EMPTY_FILE: 400,
     ErrorCode.UPLOAD_INTERRUPTED: 400,
     ErrorCode.JOB_NOT_FOUND: 404,
+    ErrorCode.ARTIFACT_NOT_FOUND: 404,
+    ErrorCode.ARTIFACT_GONE: 410,
     ErrorCode.IDEMPOTENCY_KEY_REUSED: 409,
     ErrorCode.UPLOAD_TOO_LARGE: 413,
     ErrorCode.UNSUPPORTED_FILE_TYPE: 415,

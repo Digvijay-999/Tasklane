@@ -68,8 +68,8 @@ class LocalStorage:
         os.replace(source, target)
         # Make the rename durable: fsync the directory holding the file, and its parent, which
         # holds the newly created per-upload directory's entry.
-        _fsync_directory(target.parent)
-        _fsync_directory(target.parent.parent)
+        fsync_directory(target.parent)
+        fsync_directory(target.parent.parent)
 
     def delete(self, relative: str) -> None:
         """Delete a file if it exists (used to clean up rejected or interrupted uploads)."""
@@ -89,7 +89,7 @@ class LocalStorage:
         return self.absolute(relative).is_file()
 
 
-def _fsync_directory(path: Path) -> None:
+def fsync_directory(path: Path) -> None:
     try:
         fd = os.open(path, os.O_RDONLY)
     except OSError:  # not supported on some platforms (e.g. Windows); best effort

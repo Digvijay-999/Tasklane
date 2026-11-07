@@ -87,6 +87,14 @@ class EventType(StrEnum):
     STAGE_STARTED = "stage.started"
     STAGE_PROGRESS = "stage.progress"
     STAGE_COMPLETED = "stage.completed"
+    STAGE_FAILED = "stage.failed"
+
+
+class ProviderCallPurpose(StrEnum):
+    """Why a summarization provider was called."""
+
+    CHUNK = "chunk"  # summarize one chunk of the document
+    COMBINE = "combine"  # combine chunk (or batch) summaries into one
 
 
 class ErrorClass(StrEnum):

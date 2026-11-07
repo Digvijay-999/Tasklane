@@ -5,6 +5,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ValidationError
 
 from app.api.pagination import decode_cursor, encode_cursor, filters_fingerprint
@@ -127,8 +128,50 @@ def get_job(job_id: str, request: Request) -> JobDetailResponse:
             **JobResponse.model_validate(detail.job).model_dump(),
             "upload": detail.upload,
             "attempts": detail.attempts,
-            "artifacts": detail.artifacts,
+            "artifacts": [
+                {
+                    "id": a.id,
+                    "artifact_type": a.artifact_type,
+                    "attempt_no": a.attempt_no,
+                    "filename": a.filename,
+                    "size_bytes": a.size_bytes,
+                    "content_type": a.content_type,
+                    "sha256": a.sha256,
+                    "created_at": a.created_at,
+                    "download_url": f"/v1/jobs/{parsed_id}/artifacts/{a.id}",
+                }
+                for a in detail.artifacts
+            ],
         }
+    )
+
+
+@router.get(
+    "/jobs/{job_id}/artifacts/{artifact_id}",
+    response_class=FileResponse,
+    responses={
+        200: {"description": "The artifact file", "content": {"application/octet-stream": {}}},
+        404: {"model": ErrorResponse},
+        410: {"model": ErrorResponse},
+    },
+)
+def download_artifact(job_id: str, artifact_id: str, request: Request) -> FileResponse:
+    try:
+        parsed_job, parsed_artifact = uuid.UUID(job_id), uuid.UUID(artifact_id)
+    except ValueError:
+        raise ServiceError(
+            ErrorCode.ARTIFACT_NOT_FOUND, "No artifact with this id for this job."
+        ) from None
+    artifact = request.app.state.artifact_service.open(parsed_job, parsed_artifact)
+    return FileResponse(
+        artifact.path,
+        media_type=artifact.content_type,
+        filename=artifact.filename,  # Content-Disposition: attachment (RFC 5987 if non-ASCII)
+        headers={
+            "X-Content-Type-Options": "nosniff",  # browsers must not guess another type
+            "ETag": f'"{artifact.sha256}"',
+            "Cache-Control": "private, no-cache",
+        },
     )
 
 

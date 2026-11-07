@@ -1,9 +1,11 @@
 # Tasklane HTTP API
 
-> **Status (Phase 4):** the routes marked **implemented** below work. Created jobs are picked up
-> by the dispatcher and a worker and run to `succeeded`, but every job currently runs a single
-> placeholder stage (`dummy`) instead of real PDF/ZIP processing (Phases 5–6). Routes marked
-> **planned** don't exist yet.
+> **Status (Phase 5, part A):** the routes marked **implemented** below work. `pdf_ingest` jobs
+> really process the PDF (with the built-in **stub** summarizer, not an AI model) and produce
+> downloadable artifacts; see [What a pdf_ingest job does](#what-a-pdf_ingest-job-does).
+> `repo_index` jobs still run a placeholder stage (`dummy`) until Phase 6. There are **no
+> automatic retries yet** (Phase 5, part B): every failure is final. Routes marked **planned**
+> don't exist yet.
 
 | Route | Status |
 |---|---|
@@ -14,7 +16,7 @@
 | `GET /v1/jobs/{job_id}` | implemented |
 | `POST /v1/jobs/{job_id}/cancel`, `POST /v1/jobs/{job_id}/retry` | planned (Phase 7) |
 | `GET /v1/jobs/{job_id}/events` (SSE) | planned (Phase 8) |
-| Artifact download | planned (Phase 5) |
+| `GET /v1/jobs/{job_id}/artifacts/{artifact_id}` | implemented (Phase 5) |
 | `GET /metrics` | planned (Phase 10) |
 
 Interactive docs generated from the code: http://127.0.0.1:8000/docs
@@ -71,9 +73,11 @@ Every error, on every route, has this shape:
 | 400 | `upload_interrupted` | The client disconnected mid-upload |
 | 400 | `malformed_body` | The request body couldn't be read or parsed at all |
 | 404 | `job_not_found` | No job with that id (also for ids that aren't UUIDs) |
+| 404 | `artifact_not_found` | No artifact with that id *for that job* (also for ids that aren't UUIDs) |
 | 404 | `not_found` | No route matches the URL |
 | 405 | `method_not_allowed` | Wrong HTTP method for the URL |
 | 409 | `idempotency_key_reused` | The key was used before with a *different* request |
+| 410 | `artifact_gone` | The artifact is recorded, but its file is missing or no longer matches the recorded size |
 | 413 | `upload_too_large` | The file exceeds the limit for its type |
 | 413 | `request_too_large` | A JSON body exceeds 64 KiB |
 | 415 | `unsupported_file_type` | The filename doesn't end in `.pdf` or `.zip` |
@@ -295,18 +299,95 @@ Returns the [job object](#job-object) plus:
 - `attempts`: one entry per execution attempt (`attempt_no`, `trigger`, `worker_id`, `task_id`,
   `started_at`, `heartbeat_at`, `lease_expires_at`, `ended_at`, `outcome`, `error_class`,
   `error_summary`). Filled in once a worker claims the job.
-- `artifacts`: output metadata (`id`, `artifact_type`, `attempt_no`, `filename`, `size_bytes`,
-  `content_type`, `sha256`, `created_at`). No download link yet. **Empty until workflows produce
-  outputs (Phase 5).**
+- `artifacts`: the job's outputs (`id`, `artifact_type`, `attempt_no`, `filename`,
+  `size_bytes`, `content_type`, `sha256`, `created_at`, `download_url`). A succeeded
+  `pdf_ingest` job has two: `summary` (`summary.md`) and `manifest` (`manifest.json`).
+  Artifacts are registered in the same database transaction that marks the job `succeeded`, so
+  they are listed only for succeeded jobs: never while the job is running, and never for a
+  failed one. Always empty for `repo_index` (until Phase 6).
 
 An unknown id, or one that isn't a UUID, returns `404 job_not_found`.
+
+### `GET /v1/jobs/{job_id}/artifacts/{artifact_id}` — implemented
+
+Downloads one artifact file. Use the `download_url` from the job detail.
+
+```powershell
+$detail = curl.exe -s "$api/v1/jobs/<job_id>" | ConvertFrom-Json
+$summary = $detail.artifacts | Where-Object artifact_type -eq "summary"
+curl.exe -s -o summary.md "$api$($summary.download_url)"
+```
+
+- `200` with the file. Headers: `Content-Type` as recorded (`text/markdown; charset=utf-8` or
+  `application/json`), `Content-Disposition: attachment; filename="summary.md"`,
+  `X-Content-Type-Options: nosniff` (browsers must not guess another type),
+  `ETag: "<sha256>"`, `Cache-Control: private, no-cache`.
+- `404 artifact_not_found`: unknown id, or an artifact that belongs to a *different* job.
+- `410 artifact_gone`: the database row exists but the file is missing or its size changed
+  (for example, it was deleted by hand inside the `storage` volume).
+
+### What a pdf_ingest job does
+
+The job runs five stages in order. `current_stage` and `progress_percent` show where it is;
+each stage gets a fixed share of the progress bar.
+
+| Stage | Share | What it does |
+|---|---|---|
+| `validate_pdf` | 5 % | Checks the upload file is still there and unchanged (SHA-256), then opens the PDF in a separate, limited process and counts its pages |
+| `extract_text` | 30 % | Extracts the text of every page (in the same kind of limited process), normalizes it, and decides whether there is enough text |
+| `chunk_document` | 5 % | Splits the text into overlapping chunks (target 4,000 characters, at most 6,000, 400 overlap) |
+| `summarize` | 55 % | Summarizes each chunk, then combines the chunk summaries (map-reduce) |
+| `write_artifacts` | 5 % | Writes `summary.md` and `manifest.json` and records them as artifacts |
+
+**The summarizer is a stub.** With `PROVIDER=stub` (the only option until Phase 11) "summaries"
+are the first sentences of each chunk plus frequent key terms. It needs no API key and gives the
+same output for the same input every time. `summary.md` says so at the top. Every summarizer
+call is recorded (provider, model, duration, success, sizes) in the `provider_calls` table.
+
+**Limits** (settings in `.env`):
+
+| Setting | Default | Over the limit |
+|---|---|---|
+| `PDF_MAX_PAGES` | 500 | `pdf_too_many_pages` |
+| `PDF_MAX_TEXT_CHARS` | 2,000,000 | `pdf_text_too_large` (never silently truncated) |
+| `PDF_VALIDATE_TIMEOUT_SECONDS` / `PDF_EXTRACT_TIMEOUT_SECONDS` | 60 / 300 | `pdf_too_complex` |
+| `PDF_PARSER_MEMORY_MB` | 1024 | `pdf_too_complex` |
+| `SUMMARIZE_TIMEOUT_SECONDS` | 900 | `stage_timeout` |
+| `PROVIDER_TIMEOUT_SECONDS` | 20 (must be at most half of `LEASE_SECONDS`) | — |
+
+Inconsistent values (for example a text limit too large for `PDF_PARSER_OUTPUT_MAX_MB`, or chunk
+overlap not smaller than the chunk target) stop the services at startup with a message naming
+the setting, instead of failing jobs later.
+
+#### Failure classes
+
+When a job fails, `error_class` says why and `error_summary` holds a fixed, safe message (never
+a stack trace, a file path, or text from the PDF). In this part of Phase 5 **every failure is
+permanent**: the job goes straight to `failed` after one attempt.
+
+| `error_class` | Stage | `error_summary` |
+|---|---|---|
+| `pdf_encrypted` | `validate_pdf` | The PDF is password-protected. Upload an unprotected copy. |
+| `pdf_corrupt` | `validate_pdf` / `extract_text` | The PDF is damaged or is not a valid PDF, so it could not be read. |
+| `pdf_too_many_pages` | `validate_pdf` | The PDF has N pages; the limit is L. |
+| `pdf_no_text` | `extract_text` / `chunk_document` | The PDF contains little or no extractable text (it may be scanned images). Scanned PDFs aren't supported yet. |
+| `pdf_text_too_large` | `extract_text` | The PDF contains more than L characters of text, which is over the limit. |
+| `pdf_too_complex` | `validate_pdf` / `extract_text` | The PDF took too long or needed too much memory to process. |
+| `input_unavailable` | `validate_pdf` / `extract_text` | The uploaded file is no longer available. Upload it again and create a new job. |
+| `stage_timeout` | `summarize` | Processing took longer than the N-second limit for this step. |
+| `internal_error` | any | An unexpected error occurred while running the job. (Details are only in the worker logs.) |
+
+"Little or no text" means fewer than 100 visible characters in total, or fewer than 20 per page
+on average. PDFs protected only by an *owner* password (printing/copying restrictions, no
+password needed to open) are processed normally; `manifest.json` records
+`"owner_password_only": true`.
 
 ### Job object
 
 | Field | Notes |
 |---|---|
 | `id`, `workflow_type`, `status`, `upload_id`, `input_sha256` | `input_sha256` is the upload's hash at submission |
-| `current_stage`, `progress_percent` | Set by the worker as stages run (Phase 4: `dummy`, 0–100 in steps of 20) |
+| `current_stage`, `progress_percent` | Set by the worker as stages run (`pdf_ingest`: see [stages](#what-a-pdf_ingest-job-does); `repo_index`: `dummy`, 0–100 in steps of 20) |
 | `options` | Resolved options, defaults included |
 | `attempt_count`, `max_attempts`, `manual_retry_count` | The retry budget is 3 automatic attempts |
 | `retry_at` | When a `retry_wait` job runs again |

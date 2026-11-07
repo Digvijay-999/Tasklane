@@ -16,6 +16,7 @@ from app.domain.enums import (
     AttemptTrigger,
     JobStatus,
     OutboxTask,
+    ProviderCallPurpose,
     UploadKind,
     UploadRejectionReason,
     UploadStatus,
@@ -24,7 +25,15 @@ from app.domain.enums import (
 from app.domain.state_machine import TERMINAL_STATUSES
 from tests.db_utils import alembic_config, recreate_database, run_alembic, settings_for_database
 
-APP_TABLES = {"uploads", "jobs", "job_attempts", "job_events", "artifacts", "outbox"}
+APP_TABLES = {
+    "uploads",
+    "jobs",
+    "job_attempts",
+    "job_events",
+    "artifacts",
+    "outbox",
+    "provider_calls",
+}
 
 
 @pytest.fixture
@@ -172,6 +181,7 @@ ENUM_CONSTRAINTS = {
     "ck_job_attempts_outcome": AttemptOutcome,
     "ck_artifacts_artifact_type": ArtifactType,
     "ck_outbox_task_name": OutboxTask,
+    "ck_provider_calls_purpose": ProviderCallPurpose,
 }
 
 

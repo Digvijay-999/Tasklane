@@ -17,6 +17,7 @@ from app.config import Settings, get_settings
 from app.db.session import create_db_engine, create_session_factory
 from app.observability.logging import RequestContextMiddleware, configure_logging
 from app.queue.broker import create_broker_client
+from app.services.artifacts import ArtifactService
 from app.services.jobs import JobService
 from app.services.uploads import UploadLimits, UploadService
 from app.storage.local import LocalStorage
@@ -44,6 +45,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ttl=timedelta(hours=settings.upload_ttl_hours),
         )
         app.state.job_service = JobService(session_factory)
+        app.state.artifact_service = ArtifactService(session_factory, storage)
         try:
             yield
         finally:
