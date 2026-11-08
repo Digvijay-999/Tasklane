@@ -6,7 +6,7 @@ Used by the tests, and by the manual walkthrough:
 
 writes report.pdf (text, several pages), scanned.pdf (images only, no text), encrypted.pdf
 (needs a password), owner_locked.pdf (has only an owner password, opens without one), and
-corrupt.pdf (a truncated file).
+corrupt.pdf (a truncated file), and large.pdf (500 pages, a few seconds of parsing).
 
 The text PDFs use Helvetica, one of the 14 standard fonts every PDF reader has built in, so no
 font data needs embedding and the files stay tiny and byte-for-byte deterministic.
@@ -172,6 +172,9 @@ SAMPLES = {
     "encrypted.pdf": lambda: encrypted_pdf(),
     "owner_locked.pdf": lambda: encrypted_pdf(user_password=""),
     "corrupt.pdf": corrupt_pdf,
+    # 500 pages (the page limit): its text extraction takes a few seconds, long enough to stop a
+    # worker in the middle of parsing (Phase 7 walkthrough).
+    "large.pdf": lambda: report_pdf(page_count=500, paragraphs_per_page=12),
 }
 
 

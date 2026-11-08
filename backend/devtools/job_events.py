@@ -35,6 +35,13 @@ def describe(event_type: str, payload: Mapping[str, Any]) -> str:
         return text
     if event_type == "attempt.started":
         return f"trigger={payload.get('trigger')}"
+    if event_type == "attempt.lease_expired":
+        return f"worker {payload.get('worker_id')} last seen {payload.get('last_heartbeat_at')}"
+    if event_type == "job.requeued":
+        return f"{payload.get('reason')} (was {payload.get('status')})"
+    if event_type == "job.manual_retry":
+        count, error = payload.get("manual_retry_count"), payload.get("previous_error_class")
+        return f"retry #{count} after {error}, max_attempts now {payload.get('max_attempts')}"
     if event_type == "stage.failed":
         kind = "retryable" if payload.get("retryable") else "permanent"
         return f"{payload.get('stage')}: {payload.get('error_class')} ({kind})"
@@ -50,13 +57,13 @@ def describe(event_type: str, payload: Mapping[str, Any]) -> str:
 
 
 def format_rows(events: Iterable[Any], *, show_all: bool = False) -> list[str]:
-    lines = [f"{'seq':>4}  {'attempt':>7}  {'event':<20}  details"]
+    lines = [f"{'seq':>4}  {'attempt':>7}  {'event':<21}  details"]
     for event in events:
         if not show_all and event.event_type in HIDDEN_BY_DEFAULT:
             continue
         attempt = "-" if event.attempt_no is None else str(event.attempt_no)
         details = describe(event.event_type, event.payload or {})
-        lines.append(f"{event.seq:>4}  {attempt:>7}  {event.event_type:<20}  {details}".rstrip())
+        lines.append(f"{event.seq:>4}  {attempt:>7}  {event.event_type:<21}  {details}".rstrip())
     return lines
 
 

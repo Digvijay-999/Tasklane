@@ -571,7 +571,7 @@ def test_a_transient_failure_while_a_cancel_is_pending_ends_cancelled(engine, wo
 
 
 def test_a_fenced_worker_records_nothing_for_a_transient_error(engine, worker):
-    """Someone else (Phase 7 recovery) closed the attempt: no retry, no events, no message."""
+    """Someone else (recovery) closed the attempt: no retry, no events, no message."""
     with Session(engine) as session, session.begin():
         job_id = str(make_job(session).id)
 
@@ -591,7 +591,7 @@ def test_a_fenced_worker_records_nothing_for_a_transient_error(engine, worker):
 
     assert result.outcome == RunOutcome.FENCED
     job, attempts, events, outbox = load(engine, job_id)
-    assert job.status == "running"  # left for recovery (Phase 7)
+    assert job.status == "running"  # left for recovery to decide
     assert [a.outcome for a in attempts] == ["lease_expired"]
     assert not [e for e in events if e.event_type == "stage.failed"]
     assert all(m.published_at for m in outbox)

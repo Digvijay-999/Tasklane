@@ -37,8 +37,12 @@ from app.workflows.repo.stages import RepoConfig
 
 logger = logging.getLogger(__name__)
 
-# Each worker process runs one task at a time (prefetch 1), so it needs very few connections.
-WORKER_POOL_SIZE = 2
+# Each worker process runs one task at a time (prefetch 1): one connection for the task's own
+# writes, one for its heartbeat thread, and one spare.
+WORKER_POOL_SIZE = 3
+# How often a waiting parser sandbox checks whether the worker was fenced out (a flag check, no
+# database): a fenced worker's parser is killed within about this long.
+FENCE_CHECK_SECONDS = 1.0
 
 
 @dataclass
@@ -93,6 +97,7 @@ def _create_state() -> _ProcessState:
             base_seconds=settings.retry_base_seconds, max_seconds=settings.retry_max_seconds
         ),
         fault_injection_enabled=settings.enable_fault_injection,
+        heartbeat_interval=settings.heartbeat_seconds,
     )
     logger.info(
         "worker process ready",
@@ -126,7 +131,7 @@ def workflow_config(settings: Settings) -> WorkflowConfig:
             extract_timeout_seconds=settings.pdf_extract_timeout_seconds,
             summarize_timeout_seconds=settings.summarize_timeout_seconds,
             provider_timeout_seconds=settings.provider_timeout_seconds,
-            keep_alive_interval_seconds=settings.keep_alive_interval_seconds,
+            keep_alive_interval_seconds=FENCE_CHECK_SECONDS,
             chunking=chunking,
             summary=summary,
         ),
@@ -146,7 +151,7 @@ def workflow_config(settings: Settings) -> WorkflowConfig:
             extract_timeout_seconds=settings.zip_extract_timeout_seconds,
             summarize_timeout_seconds=settings.summarize_timeout_seconds,
             provider_timeout_seconds=settings.provider_timeout_seconds,
-            keep_alive_interval_seconds=settings.keep_alive_interval_seconds,
+            keep_alive_interval_seconds=FENCE_CHECK_SECONDS,
             chunking=chunking,
             summary=summary,
             max_provider_calls=settings.repo_max_provider_calls,

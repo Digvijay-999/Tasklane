@@ -22,14 +22,15 @@ a status change plus an outbox row) into one all-or-nothing transaction.
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Select, func, insert, select, tuple_, update
+from sqlalchemy import Select, exists, func, insert, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.util import identity_key
 
-from app.db.models import Artifact, Job, JobAttempt, JobEvent, Upload
+from app.db.models import Artifact, Job, JobAttempt, JobEvent, OutboxMessage, Upload
 from app.domain.enums import EventType, JobStatus
 from app.domain.listing import JobListPosition
 from app.domain.state_machine import cancel_supersedes, ensure_transition, is_terminal
@@ -281,6 +282,75 @@ def update_progress(session: Session, job_id: uuid.UUID, *, stage: str, percent:
     ).scalar_one_or_none()
     _expire_cached_job(session, job_id)
     return updated is not None
+
+
+@dataclass(frozen=True)
+class LostMessageJob:
+    id: uuid.UUID
+    status: JobStatus
+    last_published_at: datetime | None
+
+
+def lock_next_lost_message_job(
+    session: Session, grace: timedelta, skip: Sequence[uuid.UUID] = ()
+) -> LostMessageJob | None:
+    """Lock one job that should be running soon but evidently has no message on its way.
+
+    All of these must hold (database clock):
+    - claimable: `queued`, or `retry_wait` whose retry has been due for longer than `grace`;
+    - it hasn't changed status within `grace` (a job queued a moment ago is not lost);
+    - no open attempt (no worker is on it);
+    - no outbox row that is unpublished (the dispatcher will still send it) or was published
+      within `grace` (that message may still be waiting in Redis for a free worker).
+    FOR UPDATE SKIP LOCKED, so concurrent recovery passes each take different jobs. Every change
+    that could make a job stop matching (a claim, a cancel, a requeue) locks or updates the job
+    row, so the check holds until the caller commits.
+    """
+    outbox = OutboxMessage.__table__
+    attempts = JobAttempt.__table__
+    cutoff = func.now() - grace
+    conditions = [
+        or_(
+            jobs.c.status == JobStatus.QUEUED.value,
+            (jobs.c.status == JobStatus.RETRY_WAIT.value) & (jobs.c.retry_at <= cutoff),
+        ),
+        jobs.c.updated_at <= cutoff,
+        ~exists().where(attempts.c.job_id == jobs.c.id, attempts.c.ended_at.is_(None)),
+        ~exists().where(
+            outbox.c.job_id == jobs.c.id,
+            or_(outbox.c.published_at.is_(None), outbox.c.published_at > cutoff),
+        ),
+    ]
+    if skip:
+        conditions.append(jobs.c.id.not_in(list(skip)))
+    row = session.execute(
+        select(jobs.c.id, jobs.c.status, _last_published(outbox))
+        .where(*conditions)
+        .order_by(jobs.c.updated_at)
+        .limit(1)
+        .with_for_update(of=jobs, skip_locked=True)
+    ).one_or_none()
+    return LostMessageJob(row.id, JobStatus(row.status), row.last_published) if row else None
+
+
+def _last_published(outbox: Any) -> Any:
+    return (
+        select(func.max(outbox.c.published_at))
+        .where(outbox.c.job_id == jobs.c.id)
+        .scalar_subquery()
+        .label("last_published")
+    )
+
+
+def lock_job(session: Session, job_id: uuid.UUID) -> Job | None:
+    """Load the job with its row locked (FOR UPDATE) until the caller's transaction ends."""
+    session.flush()
+    return session.execute(
+        select(Job)
+        .where(Job.id == job_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
 
 
 # --- Creating and reading jobs --------------------------------------------------------------------

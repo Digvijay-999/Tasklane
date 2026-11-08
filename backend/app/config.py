@@ -14,7 +14,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(extra="ignore")
+    # env_ignore_empty: an empty variable (Compose turns `${NAME:-}` into "") means "use the
+    # default".
+    model_config = SettingsConfigDict(extra="ignore", env_ignore_empty=True)
 
     # PostgreSQL. The connection URL is assembled in app/db/session.py so that special characters
     # in the password are escaped correctly.
@@ -54,15 +56,27 @@ class Settings(BaseSettings):
     dispatch_batch_size: int = Field(default=50, ge=1, le=1000)
     # Seconds the dispatcher waits for Redis when publishing before treating it as down.
     publish_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
-    # A claimed attempt's lease (renewed on every progress update). If it isn't renewed in
-    # time, the worker is presumed dead (recovery acts on that in Phase 7).
+    # A claimed attempt's lease, renewed by the worker's heartbeat thread. If it isn't renewed in
+    # time, the worker is presumed dead and recovery retries (or fails) the job.
     lease_seconds: int = Field(default=60, ge=5, le=3600)
+    # How often the heartbeat renews the lease. Empty = a quarter of the lease (the default);
+    # at most a third, so two missed beats in a row still leave the lease alive.
+    heartbeat_interval_seconds: float | None = Field(default=None, ge=0.5)
     # Redis redelivers a message that wasn't acknowledged within this time. Must exceed the lease.
     celery_visibility_timeout_seconds: int = Field(default=900, ge=60)
     # Last-resort limit after which Celery kills a task.
     celery_task_time_limit_seconds: int = Field(default=3600, ge=60)
     # Worker processes per worker container.
     worker_concurrency: int = Field(default=2, ge=1, le=32)
+
+    # --- Recovery (Phase 7), runs inside the dispatcher process ---
+    # How often recovery looks for expired leases and lost messages.
+    recovery_interval_seconds: float = Field(default=5, gt=0, le=300)
+    # A claimable job whose last message went out longer ago than this, with no worker on it and
+    # nothing waiting in the outbox, is sent again (its message was probably lost). Shorter
+    # recovers faster; longer sends fewer harmless duplicates for jobs that are just waiting
+    # behind a long queue.
+    lost_message_grace_seconds: float = Field(default=300, ge=5, le=86_400)
 
     # --- PDF workflow (Phase 5) ---
     # Limits on untrusted PDFs (enforced in a separate parser process; see workflows/pdf).
@@ -124,6 +138,27 @@ class Settings(BaseSettings):
             raise ValueError(
                 "CELERY_VISIBILITY_TIMEOUT_SECONDS must be longer than LEASE_SECONDS, or Redis "
                 "would redeliver messages for work that is still legitimately leased"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _recovery_timings(self) -> "Settings":
+        if self.heartbeat_seconds > self.lease_seconds / 3:
+            raise ValueError(
+                "HEARTBEAT_INTERVAL_SECONDS must be at most a third of LEASE_SECONDS, so a missed "
+                "heartbeat or two doesn't let a healthy worker's lease expire"
+            )
+        if self.recovery_interval_seconds > self.lease_seconds:
+            raise ValueError(
+                "RECOVERY_INTERVAL_SECONDS must not exceed LEASE_SECONDS, or recovery would notice "
+                "a dead worker much later than its lease says"
+            )
+        if self.lost_message_grace_seconds < 2 * max(
+            self.recovery_interval_seconds, self.dispatch_poll_seconds
+        ):
+            raise ValueError(
+                "LOST_MESSAGE_GRACE_SECONDS must be at least twice RECOVERY_INTERVAL_SECONDS and "
+                "DISPATCH_POLL_SECONDS, or messages still on their way would count as lost"
             )
         return self
 
@@ -203,9 +238,10 @@ class Settings(BaseSettings):
         return FilterRules.parse_excluded_dirs(self.repo_excluded_dirs or DEFAULT_EXCLUDED_DIRS)
 
     @property
-    def keep_alive_interval_seconds(self) -> float:
-        """How often long waits renew the lease: a quarter of it."""
-        return self.lease_seconds / 4
+    def heartbeat_seconds(self) -> float:
+        """How often the heartbeat thread renews the lease: HEARTBEAT_INTERVAL_SECONDS, or a
+        quarter of the lease."""
+        return self.heartbeat_interval_seconds or self.lease_seconds / 4
 
 
 @lru_cache

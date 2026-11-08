@@ -4,8 +4,10 @@ A job is submitted through the API; the dispatcher publishes it from the outbox;
 it, runs its stages, and finishes it. No eager mode, no mocks: messages go through JSON
 serialization and Redis exactly as in production.
 
-Every job runs its real stages. The timing tests (duplicate delivery, killed worker) slow the
-stub provider down with STUB_DELAY_SECONDS, so a job is still running when they act.
+Every job runs its real stages. The timing tests (duplicate delivery, killed worker, cancel) slow
+the stub provider down with STUB_DELAY_SECONDS, so a job is still running when they act. The
+recovery tests use a 6-second lease and a 1-second recovery interval, so a killed worker's job is
+picked up again within seconds.
 
 The processes use the test database, Redis database 15 / queue "tasklane-test", and the test's own
 storage folder, so a running dev stack is never involved. Run only these with:  pytest -m e2e
@@ -162,7 +164,9 @@ def start_pipeline(
     assert queue_settings.storage_root != dev_settings.storage_root
     assert queue_settings.storage_root.is_relative_to(tmp_path)
 
-    def start(stub_delay_seconds: float = 0.0) -> Pipeline:
+    def start(
+        stub_delay_seconds: float = 0.0, *, with_worker: bool = True, **env_overrides: str
+    ) -> Pipeline:
         env = {
             # No API keys: the pipeline must work with the stub provider alone.
             **{k: v for k, v in os.environ.items() if "API_KEY" not in k.upper()},
@@ -182,10 +186,13 @@ def start_pipeline(
             # Fault injection for the retry tests, with 1 s backoff (0.5-1 s, then 1-2 s).
             "ENABLE_FAULT_INJECTION": "true",
             "RETRY_BASE_SECONDS": str(E2E_RETRY_BASE_SECONDS),
+            "RECOVERY_INTERVAL_SECONDS": "1",
+            **env_overrides,
         }
         pipeline = Pipeline(env, tmp_path)
         pipelines.append(pipeline)
-        pipeline.start_worker()
+        if with_worker:
+            pipeline.start_worker()
         pipeline.start_dispatcher()
         return pipeline
 
@@ -296,30 +303,129 @@ def test_duplicate_delivery_runs_the_job_only_once(api, engine, queue_settings, 
     assert dropped["reason"] in ("not_claimable", "claim_lost")
 
 
-def test_worker_process_killed_mid_stage_leaves_the_job_running_until_phase_7(
-    api, engine, start_pipeline
-):
-    """Documents the current gap: lease recovery (Phase 7) is what rescues this job."""
-    pipeline = start_pipeline(stub_delay_seconds=2.0)  # 3 provider calls: about 6 s
-    job_id = submit_job(api)
-    wait_until(lambda: attempts_of(engine, job_id), 60, "job claimed")
-    [attempt] = attempts_of(engine, job_id)
-    wait_until(lambda: api.get(f"/v1/jobs/{job_id}").json()["progress_percent"] > 0, 30, "progress")
+# Short leases for the recovery tests: a killed worker's job is picked up within seconds.
+SHORT_LEASE = {"LEASE_SECONDS": "6", "PROVIDER_TIMEOUT_SECONDS": "3"}
 
-    # Kill the worker *process* running the task (worker_id ends in its pid), like an OOM kill.
+
+def kill_worker_process(attempt: JobAttempt) -> None:
+    """SIGKILL the worker *process* running the attempt (worker_id ends in its pid), like the
+    out-of-memory killer would. Celery's main process starts a replacement."""
     os.kill(int(attempt.worker_id.rsplit(":", 1)[1]), signal.SIGKILL)
 
-    # task_reject_on_worker_lost puts the message back; another process picks it up and drops it,
-    # because the job is still `running` under the (dead) attempt.
-    wait_until(lambda: dropped_messages_for(pipeline, job_id), 30, "redelivered message dropped")
-    time.sleep(1)
 
+def open_attempt_in_stage(engine, job_id: str, attempt_no: int, stage: str) -> JobAttempt | None:
+    """The job's open attempt number `attempt_no`, once it has started `stage`."""
+    started = any(
+        e.event_type == "stage.started"
+        and e.payload["stage"] == stage
+        and e.attempt_no == attempt_no
+        for e in events_of(engine, job_id)
+    )
+    return next(
+        (
+            a
+            for a in attempts_of(engine, job_id)
+            if a.attempt_no == attempt_no and a.ended_at is None and started
+        ),
+        None,
+    )
+
+
+def test_worker_process_killed_mid_stage_is_recovered_and_succeeds(
+    api, engine, queue_settings, start_pipeline
+):
+    """Acceptance #4 (the job left `running` by a killed worker in Phase 4 now recovers) and #7
+    (redelivered and duplicate messages during recovery start no extra attempt)."""
+    pipeline = start_pipeline(stub_delay_seconds=2.0, **SHORT_LEASE)
+    job_id = submit_job(api)
+    attempt = wait_until(
+        lambda: open_attempt_in_stage(engine, job_id, 1, "summarize"), 60, "summarizing"
+    )
+
+    kill_worker_process(attempt)
+    # A duplicate on top, as a dispatcher crash would produce, while the job is being recovered.
+    create_celery_app(queue_settings, for_publishing=True).send_task(
+        RUN_JOB_TASK, kwargs={"job_id": job_id}, queue=TEST_QUEUE, retry=False
+    )
+
+    wait_until(lambda: job_status(api, job_id) == "succeeded", 90, "job recovered and succeeded")
     detail = api.get(f"/v1/jobs/{job_id}").json()
-    assert detail["status"] == "running"
-    assert 0 < detail["progress_percent"] < 100  # frozen where the process died
-    [still_open] = attempts_of(engine, job_id)  # no second attempt was started
-    assert still_open.id == attempt.id and still_open.ended_at is None
-    assert dropped_messages_for(pipeline, job_id)[0]["job_status"] == "running"
+    assert [(a["attempt_no"], a["outcome"], a["trigger"]) for a in detail["attempts"]] == [
+        (1, "lease_expired", "initial"),
+        (2, "succeeded", "recovery"),
+    ]
+    assert sorted(a["artifact_type"] for a in detail["artifacts"]) == [
+        "chunks",
+        "manifest",
+        "summary",
+    ]
+    assert {a["attempt_no"] for a in detail["artifacts"]} == {2}
+    history = events_of(engine, job_id)
+    assert status_history(history) == ["queued", "running", "retry_wait", "running", "succeeded"]
+    assert [e.event_type for e in history].count("attempt.lease_expired") == 1
+    completed = [
+        (e.attempt_no, e.payload["stage"]) for e in history if e.event_type == "stage.completed"
+    ]
+    assert len(completed) == len(set(completed))  # no stage completed twice in one attempt
+    assert [e.seq for e in history] == list(range(1, len(history) + 1))
+    # The redelivered message and the duplicate were both dropped by the claim.
+    assert len(dropped_messages_for(pipeline, job_id)) >= 1
+
+
+def test_killing_the_worker_in_every_attempt_uses_up_the_budget(api, engine, start_pipeline):
+    start_pipeline(stub_delay_seconds=2.0, **SHORT_LEASE)
+    job_id = submit_job(api)
+    for attempt_no in (1, 2, 3):
+        attempt = wait_until(
+            lambda n=attempt_no: open_attempt_in_stage(engine, job_id, n, "summarize"),
+            90,
+            f"attempt {attempt_no} summarizing",
+        )
+        kill_worker_process(attempt)
+
+    wait_until(lambda: job_status(api, job_id) == "failed", 90, "job failed")
+    detail = api.get(f"/v1/jobs/{job_id}").json()
+    assert detail["error_class"] == "lease_expired"
+    assert detail["error_summary"].endswith("Gave up after 3 attempts.")
+    assert [a["outcome"] for a in detail["attempts"]] == ["lease_expired"] * 3
+    assert (detail["can_retry"], detail["retry_blocked_reason"]) == (True, None)
+
+
+def test_a_lost_message_is_requeued_by_recovery(api, engine, broker, start_pipeline):
+    """Redis loses the message after the dispatcher published it (simulated by deleting the
+    queue before any worker is running): recovery notices and sends a new one."""
+    pipeline = start_pipeline(with_worker=False, LOST_MESSAGE_GRACE_SECONDS="5")
+    job_id = submit_job(api)
+    wait_until(lambda: all(m.published_at for m in outbox_of(engine, job_id)), 30, "published")
+    assert broker.delete(TEST_QUEUE) == 1  # the message is gone
+
+    pipeline.start_worker()
+    wait_until(lambda: job_status(api, job_id) == "succeeded", 60, "job requeued and succeeded")
+
+    requeued = [e for e in events_of(engine, job_id) if e.event_type == "job.requeued"]
+    assert [e.payload["reason"] for e in requeued] == ["lost_message"]
+    assert len(outbox_of(engine, job_id)) == 2
+    assert [a.trigger for a in attempts_of(engine, job_id)] == ["initial"]
+
+
+def test_cancelling_a_running_job_stops_the_real_worker_at_a_stage_boundary(
+    api, engine, start_pipeline
+):
+    start_pipeline(stub_delay_seconds=2.0)
+    job_id = submit_job(api)
+    wait_until(lambda: open_attempt_in_stage(engine, job_id, 1, "summarize"), 60, "summarizing")
+
+    response = api.post(f"/v1/jobs/{job_id}/cancel")
+    assert response.json()["status"] == "cancel_requested"
+
+    wait_until(lambda: job_status(api, job_id) == "cancelled", 60, "job cancelled")
+    detail = api.get(f"/v1/jobs/{job_id}").json()
+    assert [a["outcome"] for a in detail["attempts"]] == ["cancelled"]
+    assert detail["artifacts"] == []
+    history = events_of(engine, job_id)
+    assert history[-1].payload["before_stage"] == "write_artifacts"
+    started = [e.payload["stage"] for e in history if e.event_type == "stage.started"]
+    assert "write_artifacts" not in started
 
 
 # --- PDF workflow (Phase 5) ----------------------------------------------------------------------

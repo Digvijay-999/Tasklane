@@ -1,7 +1,10 @@
 """The sandboxed PDF parser: real child processes, real limits."""
 
 import json
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -242,3 +245,68 @@ def test_processes_started_by_the_parser_are_killed_too(tmp_path):
     while _alive(grandchild) and time.monotonic() < deadline:
         time.sleep(0.05)
     assert not _alive(grandchild)
+
+
+# --- Orphans: the worker itself is killed (Phase 7) ----------------------------------------------
+
+BACKEND = Path(__file__).resolve().parents[2]
+
+
+def _wait_for(predicate, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
+def test_the_parser_dies_when_the_worker_process_is_killed(tmp_path):
+    """A real parent process (standing in for a Celery worker process) starts a parser through
+    run_sandboxed and is then killed with SIGKILL, as the OOM killer or `kill -9` would. The
+    parser must not keep running until its 120 s deadline."""
+    pid_file = tmp_path / "parser.pid"
+    child = _child(tmp_path, "open(sys.argv[1], 'w').write(str(os.getpid()))\ntime.sleep(120)\n")
+    worker_code = (
+        "from pathlib import Path\n"
+        "from app.workflows.sandbox import SandboxLimits, run_sandboxed\n"
+        f"run_sandboxed(Path({str(child)!r}), [{str(pid_file)!r}],\n"
+        "    limits=SandboxLimits(memory_bytes=512 * 2**20, output_max_bytes=2**20),\n"
+        "    timeout_seconds=120, keep_alive=lambda: None, keep_alive_interval=1,\n"
+        "    too_complex_error='pdf_too_complex', allowed_errors=())\n"
+    )
+    worker = subprocess.Popen([sys.executable, "-c", worker_code], cwd=BACKEND)
+    try:
+        assert _wait_for(pid_file.exists, 15), "the parser never started"
+        parser_pid = int(pid_file.read_text())
+        assert _alive(parser_pid)
+        time.sleep(0.3)
+        assert _alive(parser_pid)  # alive while its worker is
+    finally:
+        worker.kill()  # SIGKILL: no finally blocks, no cleanup code runs in the worker
+        worker.wait(10)
+
+    assert _wait_for(lambda: not _alive(parser_pid), 5), "orphaned parser kept running"
+
+
+def test_a_parser_whose_worker_died_before_it_started_exits_at_once(tmp_path):
+    """The race the parent-pid check covers: the worker died between starting the child and the
+    child's prctl call, so no death signal would ever come."""
+    ran = tmp_path / "ran"
+    child = _child(tmp_path, f"open({str(ran)!r}, 'w').write('yes')\n")
+    launcher = BACKEND / "app" / "workflows" / "limited_launcher.py"
+    not_our_parent = str(2**22 + 1)  # above Linux's largest pid: never anyone's parent
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(launcher),
+            not_our_parent,
+            str(2**29),
+            "5",
+            str(2**20),
+            str(child),
+        ],
+        timeout=30,
+    )
+    assert result.returncode == 1 and not ran.exists()

@@ -111,6 +111,17 @@ def has_attempts_left(attempt_count: int, max_attempts: int) -> bool:
     return attempt_count < max_attempts
 
 
+def run_attempt_no(attempt_no: int, max_attempts: int) -> int:
+    """Which attempt of the current *run* `attempt_no` is (1, 2, 3), for the retry backoff.
+
+    A new job gets max_attempts = ATTEMPTS_PER_RUN, and each manual retry sets it to
+    attempt_count + ATTEMPTS_PER_RUN, so the current run always started at attempt number
+    max_attempts - ATTEMPTS_PER_RUN + 1. Without this, the first automatic retry after a manual
+    retry (lifetime attempt 4) would wait as long as a fourth retry. Never below 1.
+    """
+    return max(1, attempt_no - (max_attempts - ATTEMPTS_PER_RUN))
+
+
 def status_after_success(current: JobStatus) -> JobStatus:
     """The last stage finished. A pending cancel request is superseded (decided in Phase 0)."""
     if current in (JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED):
@@ -164,11 +175,19 @@ def cancel_supersedes(from_status: JobStatus, to_status: JobStatus) -> bool:
     )
 
 
+class CancelBlock(StrEnum):
+    """Why cancelling would change nothing (the API still answers 200)."""
+
+    ALREADY_REQUESTED = "already_cancel_requested"
+    FINISHED = "already_finished"
+
+
 @dataclass(frozen=True)
 class CancelDecision:
-    """`target` is the status to move to, or None when cancelling is a no-op."""
+    """`target` is the status to move to, or None when cancelling is a no-op (`reason` says why)."""
 
     target: JobStatus | None
+    reason: CancelBlock | None = None
 
     @property
     def is_noop(self) -> bool:
@@ -182,7 +201,9 @@ def cancel_decision(current: JobStatus) -> CancelDecision:
     if current == JobStatus.RUNNING:
         return CancelDecision(JobStatus.CANCEL_REQUESTED)
     # Already requested, or already finished: report the current state, change nothing.
-    return CancelDecision(None)
+    if current == JobStatus.CANCEL_REQUESTED:
+        return CancelDecision(None, CancelBlock.ALREADY_REQUESTED)
+    return CancelDecision(None, CancelBlock.FINISHED)
 
 
 class ManualRetryBlock(StrEnum):

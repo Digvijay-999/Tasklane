@@ -213,8 +213,9 @@ The full product brief is in `PROJECT_BRIEF.md`; the planned design is in `docs/
   template per class (`ERRORS`); `INPUT_ERROR_CLASSES` lives there (state machine imports it).
   In part A every class is PERMANENT; unknown exceptions → `internal_error`. A failure appends
   `stage.failed {stage, error_class}`.
-- **Lease keep-alive:** `StageContext.keep_alive()` renews the lease; the sandbox calls it every
-  `LEASE_SECONDS / 4` while waiting; summarize renews after every provider call. Fenced → the
+- ~~**Lease keep-alive:** `StageContext.keep_alive()` renews the lease~~ (superseded in Phase 7:
+  the heartbeat thread renews it; `keep_alive()` is a fenced-flag check the sandbox calls every
+  second). Summarize still renews after every provider call (as a fencing check). Fenced → the
   parser is killed and nothing more is written.
 - **Storage layout:** `work/{job_id}/` (intermediate: `validate.json`, `pages.jsonl`,
   `extract.json`, `chunks.jsonl`, `summary.json`) and `artifacts/{job_id}/` (`summary.md`,
@@ -372,56 +373,85 @@ Full reasoning for each decision: `PHASE6_NOTES.md`.
   per file, 16 KiB ratio floor. Every rejection test snapshots the storage folder's parent before
   and after the job.
 
+## Decisions made (Phase 7)
+
+Full reasoning (alternatives, plain language): `PHASE7_NOTES.md`.
+
+- **Heartbeat** (`app/services/heartbeat.py`): a daemon thread per attempt, started in
+  `JobExecutionService.run()` after the claim and stopped/joined by a `with` block however the
+  attempt ends; each beat renews the lease in its own transaction on its own pooled connection
+  (worker pool 3). Interval `HEARTBEAT_INTERVAL_SECONDS` (unset = lease/4, max lease/3). A failed
+  beat is retried next interval; a dead thread sets `died` (stage writes still renew). Renewal
+  matching nothing → `fenced` Event.
+- **Fencing:** the execution service checks `fenced` at stage boundaries and before every write;
+  stage writes still renew in their transaction (database check). `keep_alive()` is a flag check
+  only; the sandbox calls it every `FENCE_CHECK_SECONDS` (1 s, `queue/worker_process.py`) and
+  kills its child when it raises. A fenced worker may finish one deterministic file write
+  (documented; harmless while outputs are deterministic).
+- **Recovery** (`app/queue/recovery.py`, no Celery/HTTP imports, test-enforced): thread in the
+  dispatcher process with its own stop Event (`start_in_thread`), every
+  `RECOVERY_INTERVAL_SECONDS` (5, ≤ lease). One job per transaction, `LIMIT 1 FOR UPDATE SKIP
+  LOCKED`, up to 100 of each kind per pass; a row whose handling raises is rolled back and
+  skipped for that pass (`skip=`), never blocking the rest. Dispatcher pool 3.
+- **Expired lease:** close attempt `lease_expired` (new *transient* error class) →
+  `attempt.lease_expired {attempt_no, worker_id, last_heartbeat_at, lease_expired_at}` → lock
+  job → `status_after_lease_expired`: `retry_wait` (backoff, `retry_at` = outbox `available_at`
+  from one `now()`, `enqueue_retry`) / `failed` ("Gave up after N attempts.") / `cancelled`. The
+  next attempt's trigger is `recovery` (claim reads `error_class`).
+- **Lock order** everywhere: attempt, then job (then outbox). Claim: job, then a new attempt.
+  Cancel/retry: job, then outbox. Tested with a repeated simultaneous finish + recovery race.
+- **Lost messages:** `queued` (or `retry_wait` overdue by more than the grace), unchanged for
+  `LOST_MESSAGE_GRACE_SECONDS` (300, ≥ 5 and ≥ 2 × recovery interval and dispatch poll), no open
+  attempt, no outbox row unpublished or published within the grace → `enqueue_run_job` +
+  `job.requeued {reason: lost_message, status, last_published_at}` (`lock_next_lost_message_job`).
+- **Cancel** `POST /v1/jobs/{id}/cancel` (always 200 + job detail): `cancel_job()` locks the job;
+  queued/retry_wait → `cancelled` + `DELETE` the unpublished outbox row (`outbox_removed`);
+  running → `cancel_requested`; else no-op. The worker checks the status before each stage and
+  ends `cancelled` (attempt outcome `cancelled`, `before_stage` in the event) in one transaction.
+  `CancelDecision` has a `reason` (`already_cancel_requested`, `already_finished`).
+- **Manual retry** `POST /v1/jobs/{id}/retry`: `retry_job()` locks the job; refusal → `409
+  job_not_retryable {reason, status}`; allowed → `failed → queued`, `max_attempts =
+  attempt_count + 3`, `manual_retry_count + 1`, `job.manual_retry {manual_retry_count,
+  previous_error_class, attempt_count, max_attempts}`, new outbox row. **Resumes from verified
+  checkpoints.** Backoff uses `run_attempt_no(attempt_no, max_attempts) = attempt_no -
+  (max_attempts - 3)` (≥ 1) in the worker and recovery.
+- **Job detail** adds `lease {attempt_no, worker_id, heartbeat_at, lease_expires_at, expired}`
+  (expired vs the database `now()`), `can_cancel`/`cancel_blocked_reason`,
+  `can_retry`/`retry_blocked_reason`, all from the state machine. Cancel/retry respond with the
+  same detail.
+- **Orphans:** `limited_launcher.py <parent_pid> <memory> <cpu> <fsize> <script> ...` calls
+  `prctl(PR_SET_PDEATHSIG, SIGKILL)` via ctypes, then exits 1 if `getppid() != parent_pid`.
+  Tested with a really killed parent process.
+- **Settings** use `env_ignore_empty=True` (Compose passes unset `${VAR:-}` as ""). Property
+  `heartbeat_seconds` replaced `keep_alive_interval_seconds`.
+- **Dev tools:** `python -m devtools.ps` lists container processes (the image has no `ps`);
+  `devtools.job_events` describes the new event types.
+
 ## Carry-forward requirements
 
 Items later phases must address. Remove an item only when it is implemented and tested.
 
-- **All later stages (Phase 6+):** keep calling `report_progress`/`keep_alive` within the lease;
-  any new slow call needs a timeout of at most half the lease. A checkpointed stage must list
+- **All later stages (Phase 6+):** the heartbeat keeps the lease alive, so every stage and every
+  slow call **must have its own time limit** (otherwise a hung stage is kept alive until the
+  Celery hard limit); call `keep_alive()` while waiting on anything long (it stops a fenced
+  worker), and keep provider timeouts at most half the lease. A checkpointed stage must list
   every file it writes in `output_paths` and every setting its output depends on in
   `fingerprint_params`, and bump `stage_version` when its output changes for the same input.
-- **Phase 7 — lease-expiry retries:** recovery moving an expired job to `retry_wait` must reuse
-  the Part B rules: `retry_at` and the outbox `available_at` from one database-clock value in one
-  transaction (`enqueue_retry`), the backoff policy, and the budget (`claimable_has_attempt_left`
-  will reject a violation).
-- **Phase 7 — backoff after a manual retry:** the delay uses the lifetime `attempt_no`, so after
-  a manual retry (attempt 4+) the first automatic retry waits 20–40 s, not 2.5–5 s. Base it on the
-  attempt number within the current run, or document it, when manual retry is built.
-- **Phase 7 — manual retry and checkpoints:** a manual retry's first attempt has
-  `attempt_no > 1`, so it resumes from verified checkpoints. Decide whether that's wanted, or
-  whether manual retry should clear `stage_checkpoints` and start fresh.
 - **Phase 11 — real providers:** raise `ProviderTimeout`/`ProviderUnavailable`/
   `ProviderRateLimited` for transient failures; add permanent `provider_auth` and
   `provider_rejected` classes. Per-chunk cache keys include provider and model, so switching
   models re-summarizes.
 - **All later phases — e2e isolation:** keep e2e processes on the test `STORAGE_ROOT`; the
   isolation test (now for a PDF and a repo job) must keep passing.
-- **Phase 7/11 — fenced writes to files:** a fenced worker makes no more database writes, but it
-  can finish replacing a file under `work/` or `artifacts/` first. Harmless while outputs are
-  deterministic; a non-deterministic provider (Phase 11) or recovery that starts a new attempt
-  (Phase 7) must write per-attempt files or otherwise prevent two attempts writing the same path.
+- **Phase 11 — fenced writes to files:** a fenced worker makes no more database writes, but it
+  can finish replacing a file under `work/` or `artifacts/` first (it notices within one
+  heartbeat interval, or at its next write; never while the database is unreachable). Harmless
+  while outputs are deterministic; a non-deterministic provider must write per-attempt files or
+  otherwise prevent two attempts writing the same path.
 - **Phase 9 — rendering `summary.md`:** the PDF one contains PDF text as Markdown (only
   Markdown punctuation is escaped); the repo one keeps summaries in fenced blocks. The dashboard
   must not render either with raw HTML, active links or auto-linked bare URLs, and must escape
   file paths from `manifest.json` (they are untrusted).
-- **Phase 7 — orphaned parser processes:** the PDF parser and the ZIP child run in their own
-  session so they can be killed as a group; if the *worker* is killed (SIGKILL/OOM), the child is
-  not killed with it. It exits at its next write to the closed stdout pipe (per page / per
-  extracted file), when it finishes, or at `RLIMIT_CPU` (deadline + 5 s). Consider a
-  parent-death signal.
-- **Phase 7 — heartbeats independent of progress updates** (a background heartbeat for stages
-  that can't report progress often enough).
-- **Phase 7 — lost messages:** recovery must detect claimable jobs (`queued`, or `retry_wait`
-  past its `retry_at`) with **no open attempt** and **no unpublished outbox row**, older than a
-  threshold, and re-queue them through the outbox. Causes: Redis losing a message, a manually
-  retried job whose message was lost, and a task that hit a non-database error before its claim
-  committed (the message is acked).
-- **Phase 7 — dead workers:** jobs left `running` by a worker killed mid-stage, or by the hard task
-  time limit, are recovered via lease expiry (close the attempt as `lease_expired`, then
-  `retry_wait` or `failed` per the state machine).
-- **Phase 7 — lock order:** the claim locks job then attempt; progress and finishing lock
-  attempt then job. Recovery must lock attempt then job (or detect and retry deadlock aborts), or
-  it can turn a live worker's progress write into a failure.
 - **Phase 8 — event order:** order and replay events by `seq` only, never `created_at` (`now()`
   is the transaction start time).
 - **Phase 9 — queue health:** surface dispatch failures (`dispatch_attempts`,
@@ -450,8 +480,25 @@ Items later phases must address. Remove an item only when it is implemented and 
 - **Phase 12 — work folders:** `work/{job_id}/` intermediate files are kept forever for now;
   retention must clean them (never for unfinished jobs), along with stray `.*.tmp` files left by
   a crash mid-write.
+- **Phase 8 — new event types:** `attempt.lease_expired`, `job.requeued`, `job.manual_retry`, and
+  `job.status_changed` payloads with `reason`, `before_stage`, `outbox_removed`,
+  `requested_by` must stream and replay like the others (all payloads are already safe: ids,
+  timestamps, counts, error classes).
+- **Phase 9 — actions and leases:** use `can_cancel`/`can_retry` and their reasons from the job
+  detail (never derive them from `status`); show `lease.expired` ("worker not responding,
+  recovering") and attempt outcomes `lease_expired`/`cancelled` and triggers `recovery`/
+  `manual_retry`.
+- **Phase 10 — recovery metrics:** count expired leases, requeued lost messages, fenced workers,
+  failed heartbeat beats and dead heartbeat threads (log lines exist: `expired lease recovered`,
+  `lost message: job requeued`, `heartbeat could not renew the lease`, `heartbeat thread died`).
+- **Phase 12 — vanished worker hosts:** a worker machine that disappears mid-transaction keeps
+  its row lock until Postgres's TCP keepalive gives up (~2 h); SKIP LOCKED recovery skips that
+  job meanwhile. Consider `idle_in_transaction_session_timeout` on worker connections.
+- **Phase 12 — long queues:** a job waiting in Redis longer than `LOST_MESSAGE_GRACE_SECONDS`
+  gets a duplicate message every grace period (dropped by the claim). Revisit the default, or
+  track queue depth, when measuring with many jobs.
 - **Dev note:** restarting the worker (including by live reload after a code change) interrupts
-  running jobs; they stay `running` until Phase 7 recovery.
+  running jobs; recovery retries them once their lease (60 s) expires.
 
 ## Commands
 
@@ -466,6 +513,8 @@ docker compose run --rm migrate              # apply migrations
 docker compose run --rm migrate alembic check   # do models and database agree?
 docker compose run --rm api alembic revision --autogenerate --rev-id 0005 -m "describe change"
 docker compose run --rm -v "${env:USERPROFILE}\tasklane-demo:/out" api python -m devtools.zip_samples /out   # sample ZIPs
+docker compose exec -T api python -m devtools.job_events <job_id>   # a job's event history
+docker compose exec -T worker python -m devtools.ps                 # processes in the worker container
 ```
 
 Regenerate `backend/uv.lock` after editing dependencies (runs uv in a throwaway container):
@@ -485,7 +534,7 @@ docker run --rm -v "${PWD}\backend:/src" -w /src python:3.13.18-slim sh -c "pip 
 | 4 | Dispatcher + Celery worker with one dummy stage | **Done** (awaiting developer verification) |
 | 5 | PDF workflow + retries | **Done** (awaiting developer verification) |
 | 6 | ZIP workflow + security | **Done** (awaiting developer verification) |
-| 7 | Leases, recovery, cancellation, manual retry | Not started |
+| 7 | Leases, recovery, cancellation, manual retry | **Done** (awaiting developer verification) |
 | 8 | SSE with replay | Not started |
 | 9 | Dashboard | Not started |
 | 10 | Observability | Not started |

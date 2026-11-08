@@ -128,7 +128,7 @@ def test_provider_timeout_must_fit_in_half_a_lease(unit_settings):
     with pytest.raises(ValidationError, match="at most half of LEASE_SECONDS"):
         Settings(**values)
     values["provider_timeout_seconds"] = 15
-    assert Settings(**values).keep_alive_interval_seconds == 7.5  # lease / 4
+    assert Settings(**values).heartbeat_seconds == 7.5  # lease / 4
 
 
 def test_task_time_limit_must_exceed_the_stage_limits(unit_settings):
@@ -293,3 +293,25 @@ def test_dispatch_loop_goes_again_immediately_after_a_full_batch():
     stop = FakeStop(waits=1)
     run_forever(FullThenEmpty(), poll_seconds=0.5, stop=stop)
     assert len(passes) == 2 and stop.waited == [0.5]  # no wait between the two passes
+
+
+def test_heartbeat_must_be_well_under_the_lease(unit_settings):
+    values = {**unit_settings.model_dump(), "lease_seconds": 30, "provider_timeout_seconds": 10}
+    assert Settings(**values).heartbeat_seconds == 7.5
+    assert Settings(**{**values, "heartbeat_interval_seconds": 10}).heartbeat_seconds == 10
+    with pytest.raises(ValidationError, match="at most a third of LEASE_SECONDS"):
+        Settings(**{**values, "heartbeat_interval_seconds": 10.5})
+
+
+def test_recovery_interval_must_not_exceed_the_lease(unit_settings):
+    values = {**unit_settings.model_dump(), "lease_seconds": 20, "provider_timeout_seconds": 10}
+    Settings(**{**values, "recovery_interval_seconds": 20})
+    with pytest.raises(ValidationError, match="RECOVERY_INTERVAL_SECONDS must not exceed"):
+        Settings(**{**values, "recovery_interval_seconds": 21})
+
+
+def test_lost_message_grace_must_cover_a_few_recovery_passes(unit_settings):
+    values = {**unit_settings.model_dump(), "recovery_interval_seconds": 5}
+    Settings(**{**values, "lost_message_grace_seconds": 10})
+    with pytest.raises(ValidationError, match="LOST_MESSAGE_GRACE_SECONDS must be at least twice"):
+        Settings(**{**values, "lost_message_grace_seconds": 9})

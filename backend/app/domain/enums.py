@@ -83,7 +83,10 @@ class EventType(StrEnum):
     JOB_CREATED = "job.created"
     JOB_STATUS_CHANGED = "job.status_changed"
     JOB_CANCEL_SUPERSEDED = "job.cancel_superseded"
+    JOB_REQUEUED = "job.requeued"  # recovery sent a new message for a job whose message was lost
+    JOB_MANUAL_RETRY = "job.manual_retry"  # a user reopened a failed job
     ATTEMPT_STARTED = "attempt.started"
+    ATTEMPT_LEASE_EXPIRED = "attempt.lease_expired"  # recovery closed an attempt nobody renewed
     STAGE_STARTED = "stage.started"
     STAGE_PROGRESS = "stage.progress"
     STAGE_COMPLETED = "stage.completed"

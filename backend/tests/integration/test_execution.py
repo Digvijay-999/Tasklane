@@ -198,7 +198,7 @@ def test_message_for_a_job_that_is_not_claimable_is_dropped_without_writes(
 
 
 def test_job_cancelled_while_queued_is_not_run(engine, session_factory, api):
-    """The cancel route arrives in Phase 7; here the job is cancelled directly in the database."""
+    """Cancelled directly in the database (the cancel route is tested in test_cancel_and_retry)."""
     job_id = new_job(engine)
     with Session(engine) as session, session.begin():
         transition_job(session, job_id, from_status=S.QUEUED, to_status=S.CANCELLED)
@@ -345,7 +345,7 @@ def test_failure_while_cancel_requested_still_ends_failed(engine, session_factor
 
 
 def test_worker_whose_attempt_was_closed_stops_without_writing(engine, session_factory):
-    """Simulates Phase 7 recovery closing a (presumed dead) attempt while the worker still runs."""
+    """Simulates recovery closing a (presumed dead) attempt while the worker still runs."""
     job_id = new_job(engine)
 
     def lose_ownership_then_report(context):
@@ -393,7 +393,7 @@ def test_if_recording_the_failure_fails_the_error_propagates_and_the_job_stays_r
 ):
     """E.g. the database goes down mid-job. The Celery task then retries the message (see
     test_queue_units); the redelivery is dropped because the job is `running`, and the job waits
-    for lease recovery (Phase 7)."""
+    for lease recovery (app/queue/recovery.py)."""
     from sqlalchemy.exc import OperationalError
 
     job_id = new_job(engine)

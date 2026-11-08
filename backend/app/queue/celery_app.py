@@ -20,8 +20,8 @@ Settings, in plain language:
   another worker. Long jobs therefore see duplicate deliveries, which the claim drops. It is
   also the longest a message can stay stuck if its worker died before claiming. It must exceed
   the lease (checked in Settings).
-- task_time_limit: last-resort kill for a runaway task. The job is then left `running` until its
-  lease expires (Phase 7 recovery).
+- task_time_limit: last-resort kill for a runaway task. Its heartbeat dies with it, the lease
+  expires, and recovery (app/queue/recovery.py) retries or fails the job.
 """
 
 from celery import Celery

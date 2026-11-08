@@ -14,6 +14,7 @@ from app.domain.state_machine import (
     MAX_ATTEMPTS_LIMIT,
     TERMINAL_STATUSES,
     TRANSITIONS,
+    CancelBlock,
     CancelDecision,
     FailureKind,
     IllegalTransitionError,
@@ -24,6 +25,7 @@ from app.domain.state_machine import (
     cancel_supersedes,
     ensure_transition,
     is_legal_transition,
+    run_attempt_no,
     status_after_failure,
     status_after_lease_expired,
     status_after_success,
@@ -186,10 +188,11 @@ def test_lease_expiry_is_unexpected_without_a_running_attempt(current):
         (S.QUEUED, CancelDecision(S.CANCELLED)),  # no worker holds it: cancel directly
         (S.RETRY_WAIT, CancelDecision(S.CANCELLED)),
         (S.RUNNING, CancelDecision(S.CANCEL_REQUESTED)),  # worker stops at a stage boundary
-        (S.CANCEL_REQUESTED, CancelDecision(None)),  # repeating the request is a no-op
-        (S.SUCCEEDED, CancelDecision(None)),  # finished jobs report their state unchanged
-        (S.FAILED, CancelDecision(None)),
-        (S.CANCELLED, CancelDecision(None)),
+        # Repeating the request is a no-op; finished jobs report their state unchanged.
+        (S.CANCEL_REQUESTED, CancelDecision(None, CancelBlock.ALREADY_REQUESTED)),
+        (S.SUCCEEDED, CancelDecision(None, CancelBlock.FINISHED)),
+        (S.FAILED, CancelDecision(None, CancelBlock.FINISHED)),
+        (S.CANCELLED, CancelDecision(None, CancelBlock.FINISHED)),
     ],
 )
 def test_cancel_decision(current, expected):
@@ -341,3 +344,18 @@ def test_relative_imports_are_resolved(tmp_path):
     source = tmp_path / "x.py"
     source.write_text("from ..db import models\nfrom . import enums\nfrom .enums import A\n")
     assert _imported_modules(source) == ["app.db", "app.domain", "app.domain.enums"]
+
+
+@pytest.mark.parametrize(
+    ("attempt_no", "max_attempts", "expected"),
+    [
+        (1, 3, 1),  # a new job: lifetime and run numbers agree
+        (3, 3, 3),
+        (4, 6, 1),  # first attempt after one manual retry (attempt_count 3 -> max 6)
+        (5, 6, 2),
+        (7, 9, 1),  # after a second manual retry
+        (2, 9, 1),  # never below 1, whatever the numbers
+    ],
+)
+def test_backoff_counts_attempts_within_the_current_run(attempt_no, max_attempts, expected):
+    assert run_attempt_no(attempt_no, max_attempts) == expected

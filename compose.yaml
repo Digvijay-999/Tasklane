@@ -29,6 +29,9 @@ x-backend-env: &backend-env
   CELERY_VISIBILITY_TIMEOUT_SECONDS: ${CELERY_VISIBILITY_TIMEOUT_SECONDS:-900}
   CELERY_TASK_TIME_LIMIT_SECONDS: ${CELERY_TASK_TIME_LIMIT_SECONDS:-3600}
   WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+  HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-}
+  RECOVERY_INTERVAL_SECONDS: ${RECOVERY_INTERVAL_SECONDS:-5}
+  LOST_MESSAGE_GRACE_SECONDS: ${LOST_MESSAGE_GRACE_SECONDS:-300}
   PDF_MAX_PAGES: ${PDF_MAX_PAGES:-500}
   PDF_MAX_TEXT_CHARS: ${PDF_MAX_TEXT_CHARS:-2000000}
   PDF_VALIDATE_TIMEOUT_SECONDS: ${PDF_VALIDATE_TIMEOUT_SECONDS:-60}
@@ -133,8 +136,9 @@ services:
       - storage:/data/storage
     depends_on: *backend-depends
 
-  # Publishes committed outbox rows to Redis. No ports. It keeps running, and keeps jobs queued,
-  # while Redis is down.
+  # Publishes committed outbox rows to Redis, and runs the recovery loop (expired leases, lost
+  # messages) in a second thread. No ports. It keeps running, and keeps jobs queued, while Redis
+  # is down.
   #
   # Dev only: devtools/reload.py restarts it when Python files change, stops it gracefully on
   # `docker compose stop` (SIGTERM, then up to --grace seconds), and exits if the dispatcher exits
@@ -169,10 +173,11 @@ services:
   # Stopping: `docker compose stop` -> tini -> reload runner -> SIGTERM to Celery, which does a
   # "warm shutdown": it stops taking messages and lets running tasks finish, for up to --grace
   # (25 s). That fits inside stop_grace_period (30 s), after which Docker kills the container. A
-  # job still running at that point stays `running` until Phase 7.
+  # job still running at that point is recovered once its lease expires (recovery runs in the
+  # dispatcher).
   #
   # Dev only: the runner restarts the worker when Python files change (the same warm shutdown, so
-  # short jobs finish; longer ones are interrupted and stay `running` until Phase 7).
+  # short jobs finish; longer ones are interrupted and recovered after their lease expires).
   worker:
     build: *backend-build
     image: tasklane-backend:dev

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -66,6 +66,15 @@ def enqueue_retry(session: Session, job_id: uuid.UUID, *, available_at: datetime
         },
     ).returning(outbox.c.id)
     return session.execute(statement).scalar_one()
+
+
+def delete_pending(session: Session, job_id: uuid.UUID) -> int:
+    """Remove the job's unpublished message (a cancelled job must never be sent). Returns the
+    number of rows removed. If the dispatcher is publishing that row right now, this waits for
+    its transaction; the message it sent is then dropped by the worker's claim."""
+    return session.execute(
+        delete(outbox).where(outbox.c.job_id == job_id, outbox.c.published_at.is_(None))
+    ).rowcount
 
 
 @dataclass(frozen=True)

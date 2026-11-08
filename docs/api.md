@@ -1,12 +1,15 @@
 # Tasklane HTTP API
 
-> **Status (Phase 6):** the routes marked **implemented** below work. `pdf_ingest` and
+> **Status (Phase 7):** the routes marked **implemented** below work. `pdf_ingest` and
 > `repo_index` jobs really process their input (with the built-in **stub** summarizer, not an AI
 > model) and produce downloadable artifacts; see
 > [What a pdf_ingest job does](#what-a-pdf_ingest-job-does) and
 > [What a repo_index job does](#what-a-repo_index-job-does). Transient failures are retried
 > automatically with backoff, resuming after the stages that already finished; see
-> [Failures and retries](#failures-and-retries). Routes marked **planned** don't exist yet.
+> [Failures and retries](#failures-and-retries). A job whose worker dies is recovered once its
+> lease expires; jobs can be cancelled and failed jobs retried by hand
+> ([cancel](#post-v1jobsjob_idcancel--implemented), [retry](#post-v1jobsjob_idretry--implemented)).
+> Routes marked **planned** don't exist yet.
 
 | Route | Status |
 |---|---|
@@ -15,7 +18,7 @@
 | `POST /v1/jobs` | implemented |
 | `GET /v1/jobs` | implemented |
 | `GET /v1/jobs/{job_id}` | implemented |
-| `POST /v1/jobs/{job_id}/cancel`, `POST /v1/jobs/{job_id}/retry` | planned (Phase 7) |
+| `POST /v1/jobs/{job_id}/cancel`, `POST /v1/jobs/{job_id}/retry` | implemented (Phase 7) |
 | `GET /v1/jobs/{job_id}/events` (SSE) | planned (Phase 8) |
 | `GET /v1/jobs/{job_id}/artifacts/{artifact_id}` | implemented (Phase 5) |
 | `GET /metrics` | planned (Phase 10) |
@@ -78,6 +81,7 @@ Every error, on every route, has this shape:
 | 404 | `not_found` | No route matches the URL |
 | 405 | `method_not_allowed` | Wrong HTTP method for the URL |
 | 409 | `idempotency_key_reused` | The key was used before with a *different* request |
+| 409 | `job_not_retryable` | `POST .../retry` on a job that can't be retried; `details.reason` is `not_failed`, `input_error` or `retry_limit_reached`, `details.status` the job's status |
 | 410 | `artifact_gone` | The artifact is recorded, but its file is missing or no longer matches the recorded size |
 | 413 | `upload_too_large` | The file exceeds the limit for its type |
 | 413 | `request_too_large` | A JSON body exceeds 64 KiB |
@@ -309,7 +313,63 @@ Returns the [job object](#job-object) plus:
   they are listed only for succeeded jobs: never while the job is running, and never for a
   failed one.
 
+- `lease` (Phase 7): while a worker holds the job, `{attempt_no, worker_id, heartbeat_at,
+  lease_expires_at, expired}`; otherwise `null`. The worker's heartbeat renews the lease every
+  quarter lease (15 s by default). `expired: true` (judged by the database clock) means the
+  worker stopped renewing it and recovery is about to retry or fail the job.
+- `can_cancel` / `cancel_blocked_reason`: whether `POST .../cancel` would change anything; when
+  not, `already_cancel_requested` or `already_finished`.
+- `can_retry` / `retry_blocked_reason`: whether `POST .../retry` would be accepted; when not,
+  `not_failed`, `input_error` or `retry_limit_reached`. Both pairs are decided by the server's
+  state machine, so clients never have to guess from the status.
+
 An unknown id, or one that isn't a UUID, returns `404 job_not_found`.
+
+### `POST /v1/jobs/{job_id}/cancel` — implemented
+
+```powershell
+curl.exe -s -X POST "$api/v1/jobs/<job_id>/cancel"
+```
+
+No body. Always `200` with the job detail (as `GET /v1/jobs/{job_id}`) as it is after the request:
+
+| Status before | Effect | `status` after |
+|---|---|---|
+| `queued`, `retry_wait` | Cancelled at once; the job's unsent queue message is deleted. A message already sent is ignored by the worker. | `cancelled` |
+| `running` | The worker finishes the stage it is in, then stops before the next one (its attempt ends with outcome `cancelled`). | `cancel_requested`, later `cancelled` |
+| `cancel_requested`, `succeeded`, `failed`, `cancelled` | Nothing changes (repeating a cancel is safe). | unchanged |
+
+A job in `cancel_requested` can still end `succeeded` (its last stage finished before the worker
+saw the request) or `failed` (a permanent error came first); a `job.cancel_superseded` event
+then explains why. `404 job_not_found` for an unknown id.
+
+### `POST /v1/jobs/{job_id}/retry` — implemented
+
+```powershell
+curl.exe -s -X POST "$api/v1/jobs/<job_id>/retry"
+```
+
+No body. Reopens a `failed` job: `200` with the job detail, now `queued` on the **same job id**,
+with:
+
+- a fresh budget of 3 automatic attempts (`max_attempts = attempt_count + 3`; at most 20 in
+  total), `manual_retry_count + 1`;
+- a clean run: `error_class`, `error_summary`, `finished_at`, `current_stage`, `retry_at` and
+  `cancel_requested_at` cleared, `progress_percent` 0 (the old values stay in `attempts` and the
+  events);
+- a `job.manual_retry` event; the next attempt has trigger `manual_retry`;
+- resume: stages whose checkpoints still verify are skipped (`stage.skipped`), as for an automatic
+  retry. The backoff of later automatic retries starts over (first retry 2.5–5 s).
+
+Refusals are `409 job_not_retryable` with `details.reason`:
+
+| `reason` | When |
+|---|---|
+| `not_failed` | The job isn't `failed` (also the answer to a second retry request: the first already queued it) |
+| `input_error` | It failed because of its input (e.g. `pdf_no_text`, `zip_unsafe_path`); upload a corrected file and create a new job |
+| `retry_limit_reached` | Another 3 attempts would pass the limit of 20 attempts per job |
+
+`404 job_not_found` for an unknown id.
 
 ### `GET /v1/jobs/{job_id}/artifacts/{artifact_id}` — implemented
 
@@ -444,7 +504,8 @@ When an attempt fails, `error_class` says why and `error_summary` holds a fixed,
   after one attempt.
 
 The job's `attempts` list shows each try's `outcome` (`failed_transient`, `failed_permanent`,
-`succeeded`). Its events include `stage.failed` (with `retryable`) and a `job.status_changed` to
+`succeeded`, `cancelled`, `lease_expired`) and `trigger` (`initial`, `auto_retry`, `recovery`,
+`manual_retry`). Its events include `stage.failed` (with `retryable`) and a `job.status_changed` to
 `retry_wait`, whose payload has `retry_at` and `retry_in_seconds`.
 
 Permanent:
@@ -481,6 +542,7 @@ Transient (retried):
 | `database_conflict` | A deadlock or serialization failure (Postgres `40P01`, `40001`) | A temporary database conflict interrupted the job. |
 | `storage_unavailable` | The disk was full, read-only, or failed (`ENOSPC`, `EIO`, ...), also while reading a ZIP | File storage was temporarily unavailable. |
 | `injected_transient` | Fault injection | Injected transient failure (fault injection test). |
+| `lease_expired` | The worker stopped renewing its lease (killed, crashed, cut off) and recovery took the job back | The worker running the job stopped responding before it finished (its lease expired). |
 
 "Little or no text" means fewer than 100 visible characters in total, or fewer than 20 per page
 on average. PDFs protected only by an *owner* password (printing/copying restrictions, no
@@ -511,7 +573,7 @@ if they disagree. When the setting is on, the API and worker log a warning at st
 | `options` | Resolved options, defaults included |
 | `attempt_count`, `max_attempts`, `manual_retry_count` | The retry budget is 3 automatic attempts |
 | `retry_at` | When a `retry_wait` job runs again |
-| `cancel_requested_at` | When cancellation was requested |
+| `cancel_requested_at` | When cancellation was requested (cleared by a manual retry) |
 | `error_class`, `error_summary` | Safe description of the latest failure |
 | `last_event_seq` | Number of the job's latest event (SSE in Phase 8 replays from here) |
 | `created_at`, `updated_at`, `started_at`, `finished_at` | |

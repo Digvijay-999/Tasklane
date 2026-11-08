@@ -159,10 +159,32 @@ class ArtifactResponse(BaseModel):
     download_url: str = Field(description="GET this URL to download the file.")
 
 
+class LeaseResponse(BaseModel):
+    """The open attempt's lease (only while a worker holds the job)."""
+
+    attempt_no: int
+    worker_id: str
+    heartbeat_at: datetime
+    lease_expires_at: datetime
+    expired: bool = Field(
+        description="True when the lease ran out (by the database clock) and recovery has not "
+        "acted yet: the worker is presumed dead."
+    )
+
+
 class JobDetailResponse(JobResponse):
     upload: JobUploadSummary
     attempts: list[AttemptResponse]
     artifacts: list[ArtifactResponse]
+    lease: LeaseResponse | None
+    can_cancel: bool = Field(description="POST .../cancel would change something.")
+    cancel_blocked_reason: str | None = Field(
+        description="When can_cancel is false: already_cancel_requested or already_finished."
+    )
+    can_retry: bool = Field(description="POST .../retry would be accepted.")
+    retry_blocked_reason: str | None = Field(
+        description="When can_retry is false: not_failed, input_error or retry_limit_reached."
+    )
 
 
 class JobListResponse(BaseModel):

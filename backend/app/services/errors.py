@@ -23,6 +23,7 @@ class ErrorCode(StrEnum):
     UPLOAD_KIND_MISMATCH = "upload_kind_mismatch"
     JOB_NOT_FOUND = "job_not_found"
     FAULT_INJECTION_DISABLED = "fault_injection_disabled"
+    JOB_NOT_RETRYABLE = "job_not_retryable"  # details.reason says why (ManualRetryBlock)
     # Artifacts
     ARTIFACT_NOT_FOUND = "artifact_not_found"
     ARTIFACT_GONE = "artifact_gone"

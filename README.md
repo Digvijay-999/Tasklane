@@ -5,7 +5,7 @@ processing jobs (PDF ingestion and repository ZIP indexing), with a focus on dur
 retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the goals and
 [docs/architecture.md](docs/architecture.md) for the planned design.
 
-## Current status: Phase 6 of 12
+## Current status: Phase 7 of 12
 
 **What works today:**
 
@@ -50,8 +50,22 @@ retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) fo
     at once without retrying.
   - For development, a job can ask for injected failures (`fault_injection`) to watch retries
     happen. This needs `ENABLE_FAULT_INJECTION=true` on the server and is off by default.
-  - A worker killed mid-job leaves that job `running` until lease recovery exists (Phase 7).
-  See [docs/reliability.md](docs/reliability.md#delivery-outbox--dispatcher--redis--worker).
+  - **A worker that dies mid-job is recovered.** A heartbeat thread renews each running attempt's
+    lease (60 s) every 15 s. If the worker is killed, the lease runs out, and the recovery loop
+    (in the dispatcher, every 5 s) closes the attempt as `lease_expired` and retries the job
+    (same backoff and 3-attempt budget as other transient errors) or fails it with "Gave up
+    after 3 attempts.". A worker that was only slow finds its attempt closed and stops without
+    writing anything more ("fencing"). A job whose queue message was lost is sent again after
+    `LOST_MESSAGE_GRACE_SECONDS` (300 s).
+  - **Cancel** (`POST /v1/jobs/{id}/cancel`): a queued or waiting job is cancelled at once; a
+    running job stops at the next stage boundary. Cancelling a finished job changes nothing.
+  - **Manual retry** (`POST /v1/jobs/{id}/retry`): reopens a failed job with 3 more attempts,
+    resuming after the stages whose outputs still verify. Refused (`409`, with a reason) for
+    jobs that failed because of their input, jobs that aren't failed, and jobs at the 20-attempt
+    limit. The job detail says in advance whether cancel and retry are possible, and why not.
+  - A parser process (PDF or ZIP) is killed by the kernel if its worker process dies, so a killed
+    worker leaves nothing running behind it.
+  See [docs/reliability.md](docs/reliability.md#leases-heartbeats-fencing-and-recovery-phase-7).
 - **PDF ingestion** (`pdf_ingest`): validate, extract text, chunk, summarize, and write two
   artifacts, `summary.md` and `manifest.json`, downloadable with
   `GET /v1/jobs/{id}/artifacts/{artifact_id}`.
@@ -83,8 +97,8 @@ retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) fo
   - Threat model and where each defense is enforced and tested:
     [docs/security.md](docs/security.md). Job details: [docs/api.md](docs/api.md#what-a-repo_index-job-does).
 
-**Not implemented yet:** lease recovery,
-cancellation, manual retry, the event stream, the dashboard, metrics, and any real LLM provider.
+**Not implemented yet:** the event stream (SSE), the dashboard, metrics, and any real LLM
+provider.
 See the phase list in [CLAUDE.md](CLAUDE.md).
 
 ## Requirements
@@ -176,6 +190,10 @@ curl.exe -s "$api/v1/jobs/$($job.id)"
 $detail = curl.exe -s "$api/v1/jobs/$($job.id)" | ConvertFrom-Json
 $summary = $detail.artifacts | Where-Object artifact_type -eq "summary"
 curl.exe -s -o summary.md "$api$($summary.download_url)"
+
+# Cancel a job, or retry a failed one (409 with a reason if it can't be retried)
+curl.exe -s -X POST "$api/v1/jobs/$($job.id)/cancel"
+curl.exe -s -X POST "$api/v1/jobs/$($job.id)/retry"
 ```
 
 Uploaded files, intermediate files (`work/`), and artifacts live in the `storage` Docker volume,
@@ -215,7 +233,7 @@ containers, so `.env` sets `WATCHFILES_FORCE_POLLING=true` and the reloader chec
 The `worker` and `dispatcher` containers also run your local code and restart when a `.py` file
 under `backend/app` changes (via `backend/devtools/reload.py`). A restart, like
 `docker compose stop worker`, lets a running job finish for up to 25 seconds; a job still running
-after that is interrupted and stays `running` until lease recovery exists (Phase 7).
+after that is interrupted; recovery retries it once its lease (60 s) has expired.
 
 Watch logs: `docker compose logs -f api worker dispatcher`
 
@@ -226,7 +244,7 @@ separate database, `<POSTGRES_DB>_test` (for example `tasklane_test`), which the
 on every run; they never touch your development database.
 
 ```powershell
-docker compose run --rm api pytest                  # everything (about 4 minutes)
+docker compose run --rm api pytest                  # everything (about 7 minutes)
 docker compose run --rm api pytest -m "not e2e"     # skip the end-to-end tests
 docker compose run --rm api pytest -m e2e           # only end-to-end: real worker + dispatcher
 docker compose run --rm api pytest tests/unit       # unit tests only (no database needed)

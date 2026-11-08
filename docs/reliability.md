@@ -3,13 +3,13 @@
 This document explains how Tasklane keeps job state correct when several processes touch the same
 job at once, and what each database constraint protects.
 
-> **Status (Phase 5):** implemented and tested: the state machine, the schema and its
+> **Status (Phase 7):** implemented and tested: the state machine, the schema and its
 > constraints, conditional status changes and per-job events (Phase 2), idempotent job creation
 > with the outbox write (Phase 3), the delivery pipeline: dispatcher, Celery worker, claim,
-> duplicate handling, progress with lease renewal and fencing (Phase 4), and error
-> classification, automatic retries with backoff, and resume from verified checkpoints
-> (Phase 5). **Not yet:** lease-expiry recovery, cancellation, and manual retry (Phase 7). See
-> [Known gaps](#known-gaps-until-phase-7).
+> duplicate handling, progress with lease renewal and fencing (Phase 4), error classification,
+> automatic retries with backoff, and resume from verified checkpoints (Phase 5), and the
+> heartbeat thread, the recovery loop (expired leases, lost messages), cancellation, and manual
+> retry (Phase 7). See [What is still not covered](#what-is-still-not-covered).
 
 Tasklane does **not** promise "exactly once" execution. Messages may be delivered more than once,
 and a worker may die halfway through a job. The goal is that duplicates and interruptions can't
@@ -66,14 +66,32 @@ transition: `cancel_decision()` returns "no change" and the API reports the curr
 and the new budget:
 
 - Only `failed` jobs can be retried.
-- Not offered when the failure was caused by the input (`invalid_input`, `unsupported_input`):
-  rerunning would fail the same way.
+- Not offered when the failure was caused by the input (`INPUT_ERROR_CLASSES` in
+  `app/domain/errors.py`: a corrupt, encrypted or scanned PDF, an unsafe ZIP, ...): rerunning
+  would fail the same way. Upload a corrected file and create a new job instead.
 - A retry grants a fresh budget of 3 automatic attempts: `max_attempts = attempt_count + 3`.
   `transition_job` refuses a `failed -> queued` change that doesn't set `max_attempts`, so a job
   can't be requeued with no attempts left to run.
 - The database caps `max_attempts` at 20. A retry that would exceed the cap is refused with reason
   `retry_limit_reached`, so the constraint is never what stops it. A test checks every
   `attempt_count` from 1 to 20 against the real database.
+
+The API route, `POST /v1/jobs/{id}/retry` (Phase 7), runs in one transaction: lock the job row,
+ask `can_manual_retry`, then `failed -> queued` with the new `max_attempts` and
+`manual_retry_count + 1`, a `job.manual_retry` event (previous error class, attempt count, new
+budget), and a new outbox row. A refusal is `409 job_not_retryable` with `details.reason`
+(`not_failed`, `input_error`, `retry_limit_reached`). Two retry requests at once queue one run:
+the second waits for the first's row lock, then sees `queued` and gets `409 not_failed`.
+
+- **The backoff restarts with the run.** Backoff is computed from the attempt number *within the
+  current run* (`run_attempt_no`: `attempt_no - (max_attempts - 3)`), so the first automatic
+  retry after a manual retry waits 2.5–5 s again, not the 20–40 s that lifetime attempt 4 would
+  give.
+- **It resumes from verified checkpoints.** The input is unchanged and every checkpoint is
+  re-verified (stage version, fingerprint of settings and upstream files, size and SHA-256 of each
+  output) before it is reused, so the stages that already finished are skipped and anything
+  doubtful runs again. If the failure was caused by a bug that has since been fixed in a stage,
+  that fix comes with a new `stage_version`, which invalidates the checkpoint.
 
 ## Conditional updates: how lost races are detected
 
@@ -188,9 +206,9 @@ misses CHECK bodies and partial-index conditions.
 | Other range/length checks | Progress 0–100, positive sizes and sequence numbers, bounded key and filename lengths |
 
 The lease and heartbeat live on `job_attempts`, not `jobs`, so frequent heartbeats never compete
-with cancel requests or event writes for the job row. In Phase 7, recovery will close an expired
-attempt; if its worker was only slow, its next heartbeat (`... WHERE id = :mine AND ended_at IS
-NULL`) matches nothing, telling it to stop without writing anything.
+with cancel requests or event writes for the job row. Recovery closes an expired attempt; if its
+worker was only slow, its next heartbeat (`... WHERE id = :mine AND ended_at IS NULL`) matches
+nothing, telling it to stop without writing anything.
 
 ## Delivery: outbox → dispatcher → Redis → worker
 
@@ -231,7 +249,7 @@ dispatcher is disconnected.
 | After locking, before publishing | No | Unchanged (rolled back) | Next pass publishes it. Nothing lost. |
 | After publishing, before commit | Yes | Still unpublished | Next pass publishes it **again**: a duplicate, which the worker drops (tested). |
 | After commit | Yes | Published | Normal. |
-| Redis accepted the message, then lost it before saving | No | Published | Job stays `queued`. Redis append-only persistence (flushed every second) makes this unlikely; Phase 7 recovery re-queues such jobs. |
+| Redis accepted the message, then lost it before saving | No | Published | Job stays `queued` until recovery notices (after `LOST_MESSAGE_GRACE_SECONDS`) and re-queues it. Redis append-only persistence (flushed every second) makes this unlikely. |
 
 **Redis unavailable:** the failed row and the rest of its batch get `dispatch_attempts + 1`,
 `last_dispatch_error` (the error *type*), and `available_at` pushed back by 1 s, 2 s, 4 s, ... up to
@@ -251,7 +269,7 @@ holds its row locks. Workers, in contrast, keep reconnecting for as long as Redi
 | `task_reject_on_worker_lost` | on | A killed worker process puts its message back instead of acknowledging it (tested: the redelivered message is then dropped because the job is already `running`). |
 | `worker_prefetch_multiplier` | 1 | Each process reserves one message at a time, so a busy or dying process can't hoard messages. |
 | Redis `visibility_timeout` | 900 s | An unacknowledged message is redelivered after 15 minutes. Long jobs see harmless duplicate deliveries; a message whose worker died before claiming waits at most this long. Must exceed the lease (checked at startup). |
-| `task_time_limit` | 3600 s | Last-resort kill; the job is left `running` for Phase 7 recovery. |
+| `task_time_limit` | 3600 s | Last-resort kill; the job's lease then expires and recovery retries or fails it. |
 
 The **lease** (60 s, in the database) protects work that has been *claimed*; the **visibility
 timeout** (in Redis) protects messages that were *received but not yet claimed*. Duplicates from
@@ -282,56 +300,174 @@ anything** (logged as `message dropped` with a reason):
 | Changed between our read and our update | Lost the race to another worker. |
 | Missing | Deleted. |
 
-### Progress, leases, and fencing
+## Leases, heartbeats, fencing, and recovery (Phase 7)
 
-Each progress report is one short transaction: renew the lease with `UPDATE job_attempts ... WHERE
-id = :attempt AND ended_at IS NULL`, update the job's stage and progress, append `stage.progress`.
-If the lease renewal matches nothing, the attempt was closed by someone else (Phase 7 recovery
-deciding the worker was dead), so the worker is **fenced out**: it stops without writing anything
-more. Finishing closes the attempt and transitions the job in one transaction.
+The full story of what happens when a worker disappears. Code: `app/services/heartbeat.py`,
+`app/services/execution.py`, `app/queue/recovery.py`. Design notes with the alternatives that
+were considered: `PHASE7_NOTES.md`.
 
-### Keeping the lease alive during long stages (Phase 5)
+### The lease
 
-A lease is 60 s (`LEASE_SECONDS`). Every PDF and repository stage renews it well within that
-time:
+When a worker claims a job it opens an *attempt* with a lease: `lease_expires_at = now() +
+LEASE_SECONDS` (60 s), measured on the database clock. The lease is the worker's claim to the job.
+While it is renewed, nobody else touches the job; once it runs out, the worker is presumed dead.
 
-- While a sandboxed parser (PDF or ZIP) runs, the worker waits on it and wakes at least every
-  `LEASE_SECONDS / 4` (15 s) to renew the lease (`keep_alive`), even if the parser reports no
-  progress. Per-page (PDF) and per-file (ZIP extraction) progress reports renew it too, and so
-  do the throttled progress reports of `filter_files`.
-- The summarize stage renews it after every summarizer call (each call is recorded in
-  `provider_calls` in the same transaction as the renewal). A single call can't renew while it
-  waits, so `PROVIDER_TIMEOUT_SECONDS` must be at most half the lease (the settings refuse to
-  start otherwise).
-- If a renewal matches nothing, the worker is fenced out: it kills the parser if one is running
-  and makes no more database writes. (It may still finish replacing a file in the job's work or
-  artifact folder that it had started; because outputs are deterministic, the file's content is
-  the same either way.)
+### The heartbeat
 
-A background heartbeat independent of the stage code comes in Phase 7.
+A background thread per running attempt (`Heartbeat`) renews the lease every
+`HEARTBEAT_INTERVAL_SECONDS` (default a quarter of the lease, 15 s; at most a third, so two missed
+beats still leave it alive), whatever the stage is doing. Each beat is one short transaction on
+its own pooled connection: `UPDATE job_attempts SET heartbeat_at = now(), lease_expires_at =
+now() + lease WHERE id = :attempt AND ended_at IS NULL`.
+
+- Started inside the task, after the claim committed, in the forked Celery worker process (so no
+  thread ever crosses a fork); stopped and joined in a `with` block however the attempt ends
+  (success, failure, fencing, cancel, or an exception leaving `run()`). Tested for all of them.
+- A daemon thread: when the process is killed, it dies with it, and the lease runs out.
+- A failed beat (database briefly down) is logged and retried at the next interval.
+- If the thread itself dies from a bug, it logs it and sets `died`; stage writes still renew the
+  lease, and a long silent stage would at worst be recovered and retried. Never two owners.
+- Stage writes (progress, provider calls, artifacts) still renew the lease in their own
+  transaction. That is not needed for liveness any more; it is the fencing check that makes each
+  write conditional on still owning the attempt.
+
+The price of an independent heartbeat: a stage stuck forever would be kept alive forever. Every
+stage has its own time limit (parser deadlines, `stage_timeout`), and the Celery hard time limit
+(`CELERY_TASK_TIME_LIMIT_SECONDS`) kills the whole process as the last resort, after which the
+lease expires normally.
+
+### Fencing
+
+Only *closing* an attempt takes the job away from a worker; a renewal never checks the expiry
+time. So the question "who owns the job?" has one answer: whoever's attempt is still open.
+
+When a renewal (heartbeat or stage write) matches no row, the attempt was closed by someone else:
+the worker is **fenced out**. The heartbeat sets a `fenced` flag; the execution service checks it
+before every write and at each stage boundary, and `keep_alive()` (now a flag check, no database)
+raises once it is set. The parser sandbox calls `keep_alive()` about once a second while waiting,
+so a running PDF or ZIP child is killed within about a second of the flag being set. The flag is
+set by the next heartbeat after the attempt was closed (15 s by default), or by the worker's next
+write, whichever comes first. A worker that can't reach the database at all can't learn it was
+fenced: its stage runs on (to the parser deadline at most) and every write it tries fails. After that the worker writes
+nothing: no events, no progress, no artifacts, no status change (finishing also starts with a
+conditional close of the attempt, which fails).
+
+**Files.** A fenced worker may still finish one file write that was already under way (a
+`work/` or `artifacts/` file, replaced atomically). That is harmless today because every stage's
+output is deterministic: the new attempt writes byte-for-byte the same content to the same path,
+readers always see a complete file (atomic rename), and checkpoints are verified by size and
+SHA-256 before reuse. Artifacts are registered in the database only in the successful attempt's
+finishing transaction, which a fenced worker can never commit. A non-deterministic provider
+(Phase 11) breaks the "same content" argument and must write per-attempt files.
+
+### Recovery
+
+`app/queue/recovery.py`, run in the dispatcher process in its own thread with its own stop flag
+(`RECOVERY_INTERVAL_SECONDS`, default 5 s). No Celery or HTTP imports (a test enforces it).
+Each job is handled in its own short transaction.
+
+**Expired leases.** `SELECT ... FROM job_attempts WHERE ended_at IS NULL AND lease_expires_at <
+now() ORDER BY lease_expires_at LIMIT 1 FOR UPDATE SKIP LOCKED`, then:
+
+1. close the attempt as `lease_expired` and append `attempt.lease_expired` (worker id, last
+   heartbeat, expiry time);
+2. lock the job and apply `status_after_lease_expired`:
+   - `running` with attempts left → `retry_wait`, with the usual backoff; `retry_at` and the
+     outbox row's `available_at` come from one `now()` in this transaction (`enqueue_retry`),
+     exactly like a transient failure in the worker. The next attempt's trigger is `recovery`;
+   - `running` with the budget used → `failed`, error class `lease_expired`, summary "... Gave
+     up after N attempts.";
+   - `cancel_requested` → `cancelled` (nobody is left to finish it, and the user wanted it
+     stopped).
+
+**Lock order.** Recovery locks the attempt, then the job, exactly like a worker reporting
+progress or finishing. The claim locks the job first but never an existing open attempt (a job
+with an open attempt is not claimable), so no cycle exists. SKIP LOCKED means recovery skips an
+attempt the worker is renewing right now (that worker is evidently alive). If the worker renews
+first, the lease is no longer expired; if recovery closes first, the worker is fenced. A test
+runs a worker's finish and a recovery pass at the same instant, repeatedly, for both success and
+failure: never a deadlock, always exactly one of them in charge.
+
+**Lost messages.** A job that should be running soon but has no message on its way: `queued`,
+or `retry_wait` whose `retry_at` passed more than `LOST_MESSAGE_GRACE_SECONDS` (300 s) ago; not
+changed within the grace period; no open attempt; and no outbox row that is unpublished or was
+published within the grace period. Recovery adds a new outbox row and appends `job.requeued`
+(`reason: lost_message`, previous status, when the last message went out). Causes: Redis losing a
+message, a worker killed after receiving a message but before claiming it (Redis would redeliver
+it only after the 900 s visibility timeout), a task failing before its claim committed. A
+requeue that turns out unnecessary is a harmless duplicate.
+
+**Safe twice and concurrently.** SKIP LOCKED hands different rows to concurrent passes; once a
+row is handled it no longer matches (closed attempt; fresh outbox row). Tests run two loops at
+once over 20 expired attempts and 10 lost jobs: each is handled exactly once.
+
+### Cancellation
+
+`POST /v1/jobs/{id}/cancel` locks the job row and applies `cancel_decision()`:
+
+- `queued` / `retry_wait` → `cancelled` at once, and the job's *unpublished* outbox row is
+  deleted in the same transaction. A message already in Redis is dropped by the claim (the job
+  is not claimable). This covers cancelling during retry backoff.
+- `running` → `cancel_requested`. Before each stage the worker reads the job's status; on
+  `cancel_requested` it closes the attempt as `cancelled` and moves the job to `cancelled`
+  (`before_stage` in the event), in one transaction, attempt then job.
+- `cancel_requested` or finished → 200 with the job unchanged (repeated cancels are no-ops).
+
+The earlier rules still hold: success or a permanent failure that happens before the next stage
+boundary wins (`job.cancel_superseded`); a transient failure during `cancel_requested` ends
+`cancelled`; an expired lease during `cancel_requested` ends `cancelled`. Races are tested
+deterministically by holding one side's transaction open until the other is provably waiting
+for its lock.
+
+### Duplicate delivery (acceptance #7)
+
+Unchanged mechanism, now also tested around recovery and cancellation: the claim accepts only
+`queued`, or `retry_wait` whose retry is due, under the job's row lock. A redelivered message (the
+900 s visibility timeout, `task_reject_on_worker_lost` after a kill, a dispatcher crash) for a
+running job, a job waiting in its backoff, or a cancelled job is dropped without writing anything;
+two deliveries racing for a due retry start exactly one attempt; a recovery pass after a duplicate
+already restarted the job leaves the new, live attempt alone.
+
+### Orphaned parser processes
+
+The PDF and ZIP children run in their own session (so the worker can kill the whole group), which
+also means nothing kills them if the worker dies. `limited_launcher.py` now calls
+`prctl(PR_SET_PDEATHSIG, SIGKILL)` before anything else, so the kernel kills the child the moment
+its parent dies, and exits at once if the parent already died before that call (it gets the
+expected parent pid as an argument). Linux only, like the resource limits. Tested with a real
+parent process killed with SIGKILL.
+
+### What is still not covered
+
+- **A stage that hangs without a time limit** would be kept alive by the heartbeat until the
+  Celery hard time limit (3600 s) kills the process. All current stages have limits.
+- **A worker cut off from the database but still running** keeps running its stage until it
+  next writes; once recovery has closed its attempt, those writes fail (fenced). It may finish a
+  deterministic file write in the meantime (see Files).
+- **A worker host that vanishes in the middle of a transaction** (power loss, network cut) leaves
+  its row lock in Postgres until the server notices the dead connection (TCP keepalive, about two
+  hours on Linux by default); recovery skips the locked job meanwhile. Setting
+  `idle_in_transaction_session_timeout` would bound this (Phase 12). A *killed process* closes its
+  socket and releases its locks at once, so this needs a whole machine to disappear.
+- **One row recovery can't handle** (a bug) is logged and skipped for that pass, never blocking
+  the others; it is tried again every pass.
+- **A recovery pass needs the database.** While Postgres is down nothing is recovered; the loop
+  backs off and resumes when it returns.
+- **Lost-message detection can't see inside Redis.** A job waiting longer than the grace period
+  behind a long queue gets a duplicate message every grace period (each dropped at once by the
+  claim). Raise `LOST_MESSAGE_GRACE_SECONDS` if your queue is routinely that long.
+- **Clock skew between the database and the workers doesn't matter** (every lease decision uses
+  `now()` in Postgres), but a database clock jump would make leases look expired early or late.
+- **Non-deterministic outputs** (a real LLM provider, Phase 11) need per-attempt files before a
+  fenced worker's late write could matter.
 
 ### Worker processes and database connections
 
 Celery forks worker processes from a parent. Forked processes must not share database sockets, so
 no engine is created at import time or in the parent: each process creates its own on first use,
 and if it ever finds state inherited from a parent (a fork after creation), it discards it without
-closing the parent's connections (tested with a real `fork`).
-
-### Known gaps until Phase 7
-
-- **If the database is still down when a failure is being recorded**, the failure can't be
-  written. The task asks Celery to redeliver the message later (as for a failed claim). That
-  message is dropped, because the job is still `running`, so the job waits for Phase 7 lease
-  recovery.
-- **A worker killed mid-stage**, or a task hitting the hard time limit, leaves the job `running`
-  with an open attempt whose lease simply lapses. Nothing acts on an expired lease until Phase 7.
-  A redelivered message for that job is dropped, because the job is still `running`.
-- **A message lost by Redis** after the outbox row was marked published leaves the job `queued`
-  until Phase 7 recovery re-queues it. The same happens if a task fails with a non-database error
-  before its claim commits (the message is acknowledged); that would be a bug, and it is logged.
-- **Leases are renewed by the stage code** (progress reports and `keep_alive`, see above), not
-  by an independent heartbeat. A stage that forgot to do either would let its lease lapse
-  (harmless until Phase 7).
+closing the parent's connections (tested with a real `fork`). Each worker process's pool has three
+connections: the task's own writes, its heartbeat, and a spare.
 
 ## Untrusted input: the parser sandbox (Phases 5-6)
 
@@ -414,7 +550,7 @@ full list is in [api.md](api.md#failures-and-retries)):
 ### The failure transaction
 
 One transaction (`JobExecutionService._fail`). It locks the attempt, then the job: the same
-order as progress reports, and the order Phase 7 recovery must use.
+order as progress reports and recovery.
 
 1. Close our attempt as `failed_transient` or `failed_permanent`:
    `UPDATE job_attempts ... WHERE id = :attempt AND ended_at IS NULL`. If that matches nothing,
@@ -437,12 +573,13 @@ order as progress reports, and the order Phase 7 recovery must use.
 `now()` is frozen at the transaction's start, so the value is a single database-clock instant.
 The dispatcher publishes a row only when `available_at <= now()`, and the claim accepts a
 `retry_wait` job only when `retry_at <= now()`. A message published before `retry_at` would be
-dropped as "retry not due", and with nothing else queued the job would wait for Phase 7 recovery.
+dropped as "retry not due", and the job would wait for the lost-message recovery.
 Python's clock is never used for either value. Tests check that the two values are equal.
 
 **Backoff.** `delay = d/2 + random(0, d/2)` with `d = min(RETRY_BASE_SECONDS × 2^(n−1),
 RETRY_MAX_SECONDS)` ("equal jitter", `app/domain/retry.py`). With the defaults (5 s, 300 s) the
-first retry is 2.5–5 s out, the second 5–10 s. The delay is always at least half of `d`, so
+first retry is 2.5–5 s out, the second 5–10 s (`n` counts attempts within the current run; see
+manual retry). The delay is always at least half of `d`, so
 retries really do back off. The random half spreads out jobs that failed at the same moment. The
 random source can be swapped, so tests are exact.
 

@@ -2,14 +2,18 @@
 
 Lease and fencing: an attempt is "open" while `ended_at IS NULL`. A worker renews its lease with
 `UPDATE ... WHERE id = :attempt AND ended_at IS NULL`. If that matches nothing, someone else
-(recovery, in Phase 7) has closed the attempt, so the worker must stop writing: it no longer owns
-the job. This is called *fencing*.
+(recovery) has closed the attempt, so the worker must stop writing: it no longer owns the job.
+This is called *fencing*. Note that renewing does not check whether the lease has already run
+out: only *closing* the attempt takes ownership away, so a late renewal that wins the race with
+recovery simply keeps the job.
 """
 
 import uuid
-from datetime import timedelta
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
-from sqlalchemy import func, insert, update
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.orm import Session
 
 from app.db.models import JobAttempt
@@ -82,3 +86,43 @@ def close_attempt(
         .returning(attempts.c.id)
     ).scalar_one_or_none()
     return closed is not None
+
+
+@dataclass(frozen=True)
+class ExpiredAttempt:
+    id: uuid.UUID
+    job_id: uuid.UUID
+    attempt_no: int
+    worker_id: str
+    heartbeat_at: datetime
+    lease_expires_at: datetime
+
+
+def lock_next_expired_attempt(
+    session: Session, skip: Sequence[uuid.UUID] = ()
+) -> ExpiredAttempt | None:
+    """Lock one open attempt whose lease has run out (database clock), oldest expiry first.
+
+    FOR UPDATE SKIP LOCKED: an attempt locked by someone else is skipped instead of waited for.
+    That someone is either another recovery pass (which will handle it) or the worker itself,
+    renewing or finishing right now, so it is evidently alive. The lock is held until the
+    caller's transaction ends. `skip`: attempts this pass already failed to handle.
+    """
+    conditions = [attempts.c.ended_at.is_(None), attempts.c.lease_expires_at < func.now()]
+    if skip:
+        conditions.append(attempts.c.id.not_in(list(skip)))
+    row = session.execute(
+        select(
+            attempts.c.id,
+            attempts.c.job_id,
+            attempts.c.attempt_no,
+            attempts.c.worker_id,
+            attempts.c.heartbeat_at,
+            attempts.c.lease_expires_at,
+        )
+        .where(*conditions)
+        .order_by(attempts.c.lease_expires_at)
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    ).one_or_none()
+    return ExpiredAttempt(*row) if row else None

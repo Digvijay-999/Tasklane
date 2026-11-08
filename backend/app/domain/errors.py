@@ -118,6 +118,12 @@ ERRORS: dict[str, ErrorSpec] = {
         ErrorKind.TRANSIENT, "File storage was temporarily unavailable."
     ),
     # --- Fault injection (development only; see providers/faults.py) ---
+    # Set by recovery (Phase 7) when a worker stopped renewing its lease (killed, crashed, or cut
+    # off from the database). Another attempt may well succeed.
+    "lease_expired": ErrorSpec(
+        ErrorKind.TRANSIENT,
+        "The worker running the job stopped responding before it finished (its lease expired).",
+    ),
     "injected_transient": ErrorSpec(
         ErrorKind.TRANSIENT, "Injected transient failure (fault injection test)."
     ),

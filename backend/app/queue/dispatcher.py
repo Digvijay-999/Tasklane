@@ -21,15 +21,16 @@ Crash windows:
   design: the worker's claim drops duplicates.
 - Redis accepts a message and then loses it (crash before saving): the row says published but no
   message exists, so the job stays `queued`. Redis's append-only file (compose.yaml) makes this
-  unlikely; Phase 7 recovery re-queues jobs stuck like this.
+  unlikely; the recovery loop (app/queue/recovery.py) re-queues jobs stuck like this.
 
 If Redis is unavailable, publishing fails: the failed row and the rest of the batch get
 `dispatch_attempts + 1`, the error type, and a delayed `available_at` (1 s, 2 s, 4 s, ... up to
 60 s), and the loop itself backs off. The dispatcher never gives up; the jobs stay `queued` and
 visible through the API, and go out as soon as Redis is back.
 
-This module contains only dispatching. The recovery loop (Phase 7) is a separate module that will
-run in the same process.
+This module contains only dispatching. The recovery loop is a separate module
+(app/queue/recovery.py); main() runs it in a second thread of this process, with its own stop
+flag, so either loop can be stopped (or moved to its own service) without touching the other.
 """
 
 import logging
@@ -165,25 +166,35 @@ def run_forever(
 def main() -> None:
     from app.config import get_settings
     from app.db.session import create_db_engine, create_session_factory
+    from app.domain.retry import RetryPolicy
     from app.observability.logging import configure_logging
+    from app.queue import recovery
     from app.queue.celery_app import create_celery_app
 
     settings = get_settings()
     configure_logging(settings.log_level)
     engine = create_db_engine(
-        settings, pool_size=2, max_overflow=0, application_name="tasklane-dispatcher"
+        # One connection per loop (dispatch, recovery), plus one spare.
+        settings,
+        pool_size=3,
+        max_overflow=0,
+        application_name="tasklane-dispatcher",
     )
+    session_factory = create_session_factory(engine)
     dispatcher = Dispatcher(
-        create_session_factory(engine),
+        session_factory,
         CeleryPublisher(create_celery_app(settings, for_publishing=True), settings.celery_queue),
         batch_size=settings.dispatch_batch_size,
     )
 
     stop = threading.Event()
+    recovery_stop = threading.Event()
 
     def request_stop(signum: int, _frame: object) -> None:
         logger.info("dispatcher stopping", extra={"signal": signal.Signals(signum).name})
-        stop.set()  # the current pass finishes; the loop exits before the next one
+        # Each loop finishes its current pass and exits before the next one.
+        stop.set()
+        recovery_stop.set()
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
@@ -195,9 +206,29 @@ def main() -> None:
             "batch": settings.dispatch_batch_size,
         },
     )
+    recovery_thread = recovery.start_in_thread(
+        recovery.Recovery(
+            session_factory,
+            retry_policy=RetryPolicy(
+                base_seconds=settings.retry_base_seconds, max_seconds=settings.retry_max_seconds
+            ),
+            lost_message_grace=timedelta(seconds=settings.lost_message_grace_seconds),
+        ),
+        interval_seconds=settings.recovery_interval_seconds,
+        stop=recovery_stop,
+    )
+    logger.info(
+        "recovery started",
+        extra={
+            "interval_seconds": settings.recovery_interval_seconds,
+            "lost_message_grace_seconds": settings.lost_message_grace_seconds,
+        },
+    )
     try:
         run_forever(dispatcher, poll_seconds=settings.dispatch_poll_seconds, stop=stop)
     finally:
+        recovery_stop.set()
+        recovery_thread.join(timeout=10)
         engine.dispose()
         logger.info("dispatcher stopped")
 

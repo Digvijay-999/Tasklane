@@ -91,6 +91,24 @@ def test_package_respects_its_boundary(package, path):
     assert bad == []
 
 
+@pytest.mark.parametrize("module", ["queue/recovery.py", "services/heartbeat.py"])
+def test_recovery_and_heartbeat_use_no_celery_and_no_http(module):
+    """Recovery is pure database work (its messages go out through the outbox), so it can run in
+    any process; the heartbeat runs inside a task but knows nothing about Celery either."""
+    forbidden = (
+        "celery",
+        "kombu",
+        "fastapi",
+        "starlette",
+        "app.api",
+        "app.queue.celery_app",
+        "app.queue.tasks",
+        "app.queue.worker_process",
+        "app.queue.worker_main",
+    )
+    assert [name for name in _imports(APP / module) if name.startswith(forbidden)] == []
+
+
 def test_every_service_error_code_has_an_http_status():
     """A code missing from the table would silently become a 400."""
     assert set(ErrorCode) <= set(STATUS_BY_CODE)

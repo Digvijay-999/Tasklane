@@ -12,8 +12,12 @@ Which mechanism enforces which limit:
 - Isolation: `python -I` (the application's code isn't importable, PYTHON* variables are ignored)
   and an environment with only PATH and LANG (no database password, no API keys).
 
-While waiting, the parent wakes at least every `keep_alive_interval` seconds to renew the job's
-lease, so a long parse can't let the lease lapse (Phase 7 adds independent heartbeats).
+While waiting, the parent wakes at least every `keep_alive_interval` seconds and calls
+`keep_alive`, which raises once the worker has been fenced out (the worker's heartbeat thread
+renews the lease; keep_alive itself is a cheap flag check). The child is then killed at once.
+
+If the worker process itself is killed, the child receives SIGKILL from the kernel
+(PR_SET_PDEATHSIG, set by limited_launcher.py), so it doesn't keep running until its deadline.
 
 Protocol: the child writes one JSON object per line on stdout.
     {"type": "progress", "done": 3, "total": 10}
@@ -71,6 +75,10 @@ def run_sandboxed(
         sys.executable,
         "-I",  # isolated: no app imports, no PYTHON* environment variables, no user site
         str(LAUNCHER),  # sets the resource limits, then runs the child script
+        # The child dies with this process (PR_SET_PDEATHSIG), so a killed worker leaves no
+        # orphaned parser behind. The signal follows the *thread* that started the child; this
+        # function waits for the child, so that thread outlives it.
+        str(os.getpid()),
         str(limits.memory_bytes),
         str(int(timeout_seconds) + 5),  # CPU seconds: a backstop behind the wall-clock deadline
         str(limits.output_max_bytes),

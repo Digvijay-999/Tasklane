@@ -10,8 +10,9 @@
 > sandboxed parser, artifacts and their download route, error classification, automatic
 > retries with backoff, and resume from verified checkpoints (Phase 5), and the repository ZIP
 > workflow with its sandboxed ZIP reader, allowlist filtering, line chunking and three artifacts
-> (Phase 6). In the lifecycle below, steps 1–6 are implemented (step 5 runs the real stages of
-> both workflows), and steps 7–8 are planned. The HTTP API is documented in [api.md](api.md);
+> (Phase 6), and the worker heartbeat thread, the recovery loop (expired leases, lost messages),
+> cancellation and manual retry (Phase 7). In the lifecycle below, steps 1–7 are implemented
+> (step 5 runs the real stages of both workflows), and step 8 is planned. The HTTP API is documented in [api.md](api.md);
 > delivery guarantees in [reliability.md](reliability.md); the threat model for untrusted
 > uploads in [security.md](security.md).
 
@@ -106,18 +107,23 @@ Step by step:
    `queued` job, or a `retry_wait` job whose retry is due, moves to `running`, together with a new
    `job_attempts` row holding a 60 s lease. Any other state means the message is a duplicate or
    stale, and it is dropped without writing anything.
-5. **Stages (Phase 4: one placeholder stage).** Each progress report renews the lease, records
+5. **Stages (implemented).** A heartbeat thread renews the attempt's lease every quarter lease,
+   independent of stage code. Each progress report also renews it (as a fencing check), records
    progress and a `stage.progress` event, and fails if the attempt was closed by someone else
-   (fencing). Cancellation checks between stages arrive in Phase 7. Stages are repeat-safe: outputs go to deterministic
+   (fencing); a fenced worker kills any parser child and writes nothing more. Before each stage
+   the worker checks for a cancel request and stops there if it finds one (attempt `cancelled`,
+   job `cancelled`). Stages are repeat-safe: outputs go to deterministic
    paths under `storage/artifacts/{job_id}/`, are written via temp-file-then-rename, and artifact
    rows are unique per `(job_id, artifact_type)`.
 6. **Finish.** On success: artifacts recorded, `succeeded`. On a *transient* error (timeout,
    provider 5xx/429): `retry_wait` with a backoff delay, re-dispatched through a new outbox row
    that becomes available after the delay. On a *permanent* error (corrupt input, unsupported
    scanned PDF): `failed` with a safe error summary; tracebacks go to logs only.
-7. **Recovery.** A periodic loop finds `running` attempts whose lease has expired (e.g. the worker
-   was killed). It marks the attempt abandoned and either requeues the job (within its retry
-   budget) or fails it with a clear reason.
+7. **Recovery (implemented).** A loop in the dispatcher process (every 5 s) finds open attempts
+   whose lease has expired (e.g. the worker was killed), closes them as `lease_expired`, and
+   moves the job to `retry_wait` (with backoff and a delayed outbox row), `failed` ("Gave up after
+   N attempts.") or `cancelled` (if cancellation was requested). It also re-queues claimable jobs
+   whose message was evidently lost. See [reliability.md](reliability.md#leases-heartbeats-fencing-and-recovery-phase-7).
 8. **Events.** Every event is persisted with a per-job sequence number *before* it is streamed.
    The SSE endpoint replays events after `Last-Event-ID`, then polls for new ones. A client
    disconnect never cancels a job.
@@ -184,8 +190,8 @@ is `receiving` (required once `ready`), added `uploads.rejection_reason`, and ad
 | `outbox` | `available_at` for delayed retries; **at most one unpublished message per job** |
 
 Deleting a job also deletes its attempts, events, artifacts and outbox rows; an upload can't be
-deleted while a job references it. All timestamps are `timestamptz`. Lease checks (Phase 7) will
-compare against the database clock (`now()`), never a container's clock.
+deleted while a job references it. All timestamps are `timestamptz`. Lease checks compare against
+the database clock (`now()`), never a container's clock.
 
 **Migrations:** schema changes are made only through Alembic migrations in `backend/migrations/`.
 The one-shot `migrate` Compose service runs `alembic upgrade head` and exits; the API waits for it
@@ -270,7 +276,7 @@ specific tags.
 | 4 | Dispatcher + Celery worker with one dummy stage | Outbox publishing; attempt creation; duplicate-delivery guard |
 | 5 | PDF workflow + retries | **Part A:** stages, sandboxed parser and limits, provider interface + **stub provider**, artifacts and download route, `provider_calls`, lease `keep_alive`. **Part B:** transient vs permanent errors, bounded backoff with jitter via delayed outbox rows, attempt-budget CHECK, fault injection, stage checkpoints/resume (migration `0004`) |
 | 6 | ZIP workflow + security | Path traversal, symlinks, zip bombs, file-count limits, file filtering, manifest + JSONL. Done: six stages, sandboxed ZIP reader shared with the PDF sandbox, allowlist filtering with skip reasons, line chunking, `summary.md` / `chunks.jsonl` / `manifest.json`, [security.md](security.md) |
-| 7 | Leases, recovery, cancellation, manual retry | Heartbeats; recovery loop; cooperative cancellation; `POST /cancel`, `POST /retry` |
+| 7 | Leases, recovery, cancellation, manual retry | Done: heartbeat thread, recovery loop (expired leases, lost messages), cooperative cancellation at stage boundaries, `POST /cancel`, `POST /retry`, parent-death signal for parser children; see `PHASE7_NOTES.md` |
 | 8 | SSE with replay | `Last-Event-ID` replay, then live polling; paginated event history |
 | 9 | Dashboard | Overview, new job, job detail, live events |
 | 10 | Observability | OpenTelemetry traces/metrics, `/metrics`, no job IDs as metric labels |
@@ -282,11 +288,13 @@ specific tags.
 - Tests run inside Docker by default, against real PostgreSQL (not SQLite), because row locking
   and constraint behavior differ between databases.
 - The dispatcher process hosts two independent loops: `queue/dispatcher.py` (outbox publishing)
-  and `queue/recovery.py` (expired-lease recovery), each with its own tests.
+  and `queue/recovery.py` (expired leases and lost messages), each in its own thread with its own
+  stop flag and its own tests.
 - `cancel_requested -> succeeded` and `cancel_requested -> failed` are legal: a definite outcome
   wins over a pending cancel (see §4).
 - Manual retry reopens `failed` jobs only, grants a fresh budget of 3 automatic attempts, is not
-  offered for input errors, and is refused once it would push `max_attempts` past 20.
+  offered for input errors, and is refused once it would push `max_attempts` past 20. It resumes
+  from verified checkpoints, and its backoff counts attempts within the new run (Phase 7).
 - Idempotency keys live as long as their job row (to be documented with the API in Phase 3).
 - Integration tests run against `<POSTGRES_DB>_test`, never the development database.
 - Local uploads and artifacts live under `storage/`, which is gitignored.

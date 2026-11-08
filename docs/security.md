@@ -49,7 +49,8 @@ repository content (see "Not covered" at the end).
 | Child script grows dangerous imports | The PDF child may import only the standard library and pypdf; the ZIP child and the launcher only the standard library (no app code, settings, or database) | `workflows/pdf/parse_child.py`, `workflows/repo/zip_child.py` | `test_sandboxed_scripts_import_only_the_standard_library` |
 | Disk trouble while the child works | `ENOSPC`, `EIO`, `EROFS`, `EDQUOT` inside the ZIP child are reported as the transient `storage_unavailable` (retried), not blamed on the archive | `workflows/repo/zip_child.py` | (not reproducible in tests without a failing disk) |
 | Compromised child lies to the worker | Only allowed error classes and integer parameters are trusted; anything else is `internal_error`. The ZIP child's output files are re-checked (exactly the requested entries, offsets that tile the blob, sizes within limits) | `workflows/sandbox.py`, `workflows/repo/archive.py` | `test_unknown_error_classes_from_the_child_are_not_trusted` |
-| Worker loses the job while the child runs | The lease is renewed while waiting; a fenced worker kills the child | `workflows/sandbox.py` | `test_the_lease_is_renewed_while_waiting`, `test_losing_the_job_kills_the_parser` |
+| Worker loses the job while the child runs | The worker's heartbeat renews the lease; the sandbox checks for fencing about once a second and kills the child | `workflows/sandbox.py` | `test_the_lease_is_renewed_while_waiting`, `test_losing_the_job_kills_the_parser`, `test_a_fenced_heartbeat_stops_the_stage_and_kills_its_parser` |
+| Worker process killed (kill -9, out of memory) while the child runs | `prctl(PR_SET_PDEATHSIG, SIGKILL)` in the child, plus an exit if its parent is already gone (Phase 7) | `workflows/limited_launcher.py` | `test_the_parser_dies_when_the_worker_process_is_killed`, `test_a_parser_whose_worker_died_before_it_started_exits_at_once` |
 
 ## PDFs
 
@@ -146,6 +147,5 @@ Every skipped file is listed in `manifest.json` with its reason
 - **Bare-URL file names** (`www.example.com/x.md`) can become links in renderers that auto-link
   (GitHub-flavoured Markdown); the dashboard (Phase 9) must not auto-link.
 - **Authentication.** Anyone who can reach `127.0.0.1:8000` can upload.
-- **Orphaned parser processes** if the worker itself is killed (Phase 7 carry-forward).
 - **Malware.** Files are never executed, but they aren't scanned either; downloaded artifacts
   contain repository text.

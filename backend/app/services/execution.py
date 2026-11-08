@@ -9,9 +9,13 @@ is always a **claim** against the database, which is the source of truth:
    is inserted; `attempt.started` is recorded. Anything else (already running, finished,
    cancelled, not due, lost the race to another worker) means the message is a duplicate or
    stale: it is **dropped without writing anything**.
-2. Stages: every report from a stage (progress, keep-alive, provider call, artifact) renews the
-   lease in the same short transaction as its write. If the attempt was closed by someone else
-   (recovery, Phase 7), the worker is *fenced out*: it stops without writing anything further.
+2. Stages: a heartbeat thread (app/services/heartbeat.py) renews the lease in the background
+   for as long as the attempt runs. Every report from a stage (progress, provider call,
+   artifact) also renews it in the same short transaction as its write, as a fencing check. If
+   the attempt was closed by someone else (recovery), the worker is *fenced out*: it stops
+   without writing anything further (the heartbeat's `fenced` flag, or a renewal matching no
+   row). Before each stage the worker checks for a cancel request; if there is one, it stops
+   there: the attempt is closed as `cancelled` and the job moves to `cancelled`.
    Before a stage runs, its checkpoint from an earlier attempt is verified; if it holds, the
    stage is skipped (`stage.skipped`) and the retry resumes after it (app/domain/checkpoints.py).
 3. Finish (one transaction): close the attempt and move the job to `succeeded`, or record the
@@ -25,11 +29,13 @@ Failure handling: every exception is classified (`_classify`):
 A transient failure moves the job to `retry_wait` with a backoff while attempts remain, in the
 same transaction as the retry's outbox row (`_fail`). If even the failure can't be recorded (the
 database is down), or the worker process dies, the job stays `running` with an open attempt until
-its lease expires; recovering it is Phase 7's job.
+its lease expires; then recovery (app/queue/recovery.py) closes the attempt as `lease_expired`
+and retries or fails the job.
 """
 
 import errno
 import logging
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -69,11 +75,13 @@ from app.domain.retry import RetryPolicy
 from app.domain.state_machine import (
     CLAIMABLE_STATUSES,
     FailureKind,
+    run_attempt_no,
     status_after_failure,
     status_after_success,
 )
 from app.providers.base import ProviderCallRecord
 from app.providers.faults import fault_plan
+from app.services.heartbeat import Heartbeat
 from app.storage.local import LocalStorage
 from app.storage.workspace import JobWorkspace
 from app.workflows.base import ArtifactOutput, JobInput, Stage, UploadInput
@@ -96,11 +104,21 @@ class AttemptFencedError(Exception):
     """This worker's attempt was closed by someone else (or the job left `running`): stop."""
 
 
+class _CancelRequested(Exception):
+    """The user asked to cancel; raised at a stage boundary (never from stage code)."""
+
+    def __init__(self, before_stage: str) -> None:
+        super().__init__(before_stage)
+        self.before_stage = before_stage
+
+
 class RunOutcome(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     RETRY_SCHEDULED = "retry_scheduled"  # transient failure: the job waits in retry_wait
-    CANCELLED = "cancelled"  # transient failure while a cancel request was pending
+    # Stopped at a stage boundary because of a cancel request, or a transient failure while a
+    # cancel request was pending.
+    CANCELLED = "cancelled"
     DROPPED = "dropped"  # duplicate or stale message: nothing was written
     FENCED = "fenced"  # lost ownership mid-run: stopped without further writes
 
@@ -151,6 +169,7 @@ class JobExecutionService:
         storage: LocalStorage | None = None,
         retry_policy: RetryPolicy | None = None,
         fault_injection_enabled: bool = False,
+        heartbeat_interval: float | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.worker_id = worker_id
@@ -159,6 +178,8 @@ class JobExecutionService:
         self.storage = storage
         self.retry_policy = retry_policy or RetryPolicy()
         self.fault_injection_enabled = fault_injection_enabled
+        # Settings.heartbeat_seconds in the worker; a quarter of the lease by default.
+        self.heartbeat_interval = heartbeat_interval or lease.total_seconds() / 4
 
     # --- Entry point -----------------------------------------------------------------------------
 
@@ -183,7 +204,19 @@ class JobExecutionService:
             "worker_id": self.worker_id,
         }
         logger.info("job claimed", extra=log_extra)
-        progress = _StageTracker()
+        heartbeat = Heartbeat(
+            self.session_factory,
+            claim.attempt_id,
+            lease=self.lease,
+            interval=self.heartbeat_interval,
+            log_extra=log_extra,
+        )
+        with heartbeat:  # stopped and joined however the attempt ends (even on BaseException)
+            return self._execute(claim, _StageTracker(heartbeat.fenced), log_extra)
+
+    def _execute(
+        self, claim: ClaimedAttempt, progress: "_StageTracker", log_extra: dict[str, Any]
+    ) -> RunResult:
         try:
             self._run_stages(claim, progress)
             progress.finishing = True  # a failure from here on is not any stage's fault
@@ -191,6 +224,15 @@ class JobExecutionService:
         except AttemptFencedError:
             logger.warning("attempt fenced out; stopping without further writes", extra=log_extra)
             return RunResult(RunOutcome.FENCED, attempt_no=claim.attempt_no)
+        except _CancelRequested as cancel:
+            outcome = self._cancel(claim, cancel.before_stage)
+            logger.info(
+                "job cancelled at a stage boundary"
+                if outcome == RunOutcome.CANCELLED
+                else "attempt fenced out while cancelling",
+                extra={**log_extra, "before_stage": cancel.before_stage},
+            )
+            return RunResult(outcome, attempt_no=claim.attempt_no)
         except Exception as exc:
             failure = _classify(exc, None if progress.finishing else progress.current_stage)
             failure_log = {
@@ -229,6 +271,7 @@ class JobExecutionService:
                     Job.workflow_type,
                     Job.options,
                     Job.upload_id,
+                    Job.error_class,
                 )
                 .where(Job.id == job_id)
                 .with_for_update(of=Job)
@@ -243,7 +286,12 @@ class JobExecutionService:
 
             attempt_no = row.attempt_count + 1
             if status == JobStatus.RETRY_WAIT:
-                trigger = AttemptTrigger.AUTO_RETRY
+                # lease_expired: recovery put it there after the previous worker vanished.
+                trigger = (
+                    AttemptTrigger.RECOVERY
+                    if row.error_class == "lease_expired"
+                    else AttemptTrigger.AUTO_RETRY
+                )
             elif row.attempt_count == 0:
                 trigger = AttemptTrigger.INITIAL
             else:
@@ -319,6 +367,9 @@ class JobExecutionService:
         earlier_stage_ran = False
         done = 0
         for stage, weight in zip(stages, weights, strict=True):
+            tracker.check_fenced()
+            if self._cancel_requested(claim):
+                raise _CancelRequested(stage.name)
             tracker.current_stage = stage.name
             context = _AttemptContext(
                 self, claim, tracker, stage.name, done / total, weight / total
@@ -400,7 +451,36 @@ class JobExecutionService:
             output_paths=list(stage.output_paths(context.workspace)),  # type: ignore[attr-defined]
         )
 
+    def _cancel_requested(self, claim: ClaimedAttempt) -> bool:
+        with self.session_factory() as session:
+            status = session.execute(select(Job.status).where(Job.id == claim.job_id)).scalar_one()
+        return status == JobStatus.CANCEL_REQUESTED
+
     # --- Finish ----------------------------------------------------------------------------------
+
+    def _cancel(self, claim: ClaimedAttempt, before_stage: str) -> RunOutcome:
+        """Honour a cancel request at a stage boundary, in ONE transaction: close the attempt as
+        `cancelled` (fencing: if it was already closed, write nothing), then move the job from
+        `cancel_requested` to `cancelled`. Lock order: attempt, then job."""
+        try:
+            with self.session_factory.begin() as session:
+                if not attempt_rows.close_attempt(
+                    session, claim.attempt_id, AttemptOutcome.CANCELLED
+                ):
+                    raise AttemptFencedError
+                result = job_rows.transition_job(
+                    session,
+                    claim.job_id,
+                    from_status=JobStatus.CANCEL_REQUESTED,
+                    to_status=JobStatus.CANCELLED,
+                    event_payload={"attempt_no": claim.attempt_no, "before_stage": before_stage},
+                    attempt_no=claim.attempt_no,
+                )
+                if not result.applied:
+                    raise AttemptFencedError  # rolls the close back too
+        except AttemptFencedError:
+            return RunOutcome.FENCED
+        return RunOutcome.CANCELLED
 
     def _succeed(self, claim: ClaimedAttempt, tracker: "_StageTracker") -> None:
         """Close the attempt, register the artifacts, and finish the job in ONE transaction, so
@@ -439,7 +519,7 @@ class JobExecutionService:
         4. for retry_wait: the job's retry_at and the retry's outbox available_at get the SAME
            timestamp, taken from the database clock in this transaction, so the message can
            never arrive before the job is due (it would be dropped as "retry not due").
-        Lock order: attempt, then job (the same as progress reports; Phase 7 recovery too).
+        Lock order: attempt, then job (the same as progress reports and recovery).
 
         A deadlock or serialization failure rolls the whole transaction back, so it is safe to
         run again; after a few tries the error reaches the task layer.
@@ -518,7 +598,10 @@ class JobExecutionService:
             }
             retry_at = None
             if target == JobStatus.RETRY_WAIT:
-                delay = self.retry_policy.delay_seconds(claim.attempt_no)
+                # Counted within the current run, so a manual retry starts the backoff over.
+                delay = self.retry_policy.delay_seconds(
+                    run_attempt_no(claim.attempt_no, row.max_attempts)
+                )
                 # now() is frozen for the whole transaction: one database-clock instant.
                 retry_at = session.execute(
                     select(func.now() + timedelta(seconds=delay))
@@ -578,13 +661,19 @@ class JobExecutionService:
 
 
 class _StageTracker:
-    """Per-run state: which stage is running (so a failure can name it) and the artifacts the
-    stages produced (registered only when the job succeeds)."""
+    """Per-run state: which stage is running (so a failure can name it), the artifacts the
+    stages produced (registered only when the job succeeds), and the heartbeat's fenced flag."""
 
-    def __init__(self) -> None:
+    def __init__(self, fenced: threading.Event) -> None:
         self.current_stage: str | None = None
         self.finishing = False  # every stage is done; the success is being recorded
         self.artifacts: dict[str, ArtifactOutput] = {}  # by artifact type; a re-save replaces
+        self.fenced = fenced
+
+    def check_fenced(self) -> None:
+        """Stop before writing anything once the attempt is known to be closed."""
+        if self.fenced.is_set():
+            raise AttemptFencedError
 
 
 class _AttemptContext:
@@ -623,8 +712,10 @@ class _AttemptContext:
         )
 
     def keep_alive(self) -> None:
-        with self.service.session_factory.begin() as session:
-            self._renew(session)
+        """The heartbeat thread renews the lease; this only stops a fenced-out worker. It is
+        cheap (no database), so the parser sandbox calls it about once a second and kills its
+        child process as soon as it raises."""
+        self.tracker.check_fenced()
 
     def record_provider_call(self, call: ProviderCallRecord) -> None:
         usage = call.usage
@@ -651,7 +742,8 @@ class _AttemptContext:
 
     def save_artifact(self, artifact: ArtifactOutput) -> None:
         """Remember the artifact; its row is written when the job succeeds (see _succeed)."""
-        self.keep_alive()  # fencing check: a fenced-out worker stops here
+        with self.service.session_factory.begin() as session:
+            self._renew(session)  # fencing check against the database: a fenced worker stops
         self.tracker.artifacts[artifact.artifact_type] = artifact
 
     # --- Internals ------------------------------------------------------------------------------
@@ -695,7 +787,9 @@ class _AttemptContext:
                 )
 
     def _renew(self, session: Session) -> None:
+        self.tracker.check_fenced()  # known to be closed: don't even open the write
         if not attempt_rows.renew_lease(session, self.claim.attempt_id, self.service.lease):
+            self.tracker.fenced.set()
             raise AttemptFencedError
 
 

@@ -277,6 +277,7 @@ TRANSIENT = {
     "database_conflict",
     "storage_unavailable",
     "injected_transient",
+    "lease_expired",
 }
 
 

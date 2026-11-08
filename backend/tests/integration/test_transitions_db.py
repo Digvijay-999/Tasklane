@@ -439,7 +439,7 @@ def test_cancel_loses_to_claim_then_requests_cancellation(engine):
 
     lost = api.result()
     assert not lost.applied and lost.status == S.RUNNING
-    # The API re-evaluates with the status it now sees, as Phase 7's cancel endpoint will.
+    # The API re-evaluates with the status it now sees, as the cancel endpoint does.
     decision = cancel_decision(lost.status)
     assert decision.target == S.CANCEL_REQUESTED
     with Session(engine) as retry:

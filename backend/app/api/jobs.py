@@ -118,15 +118,61 @@ def list_jobs(
     responses={404: {"model": ErrorResponse}},
 )
 def get_job(job_id: str, request: Request) -> JobDetailResponse:
+    return _detail_response(request, _parse_job_id(job_id))
+
+
+@router.post(
+    "/jobs/{job_id}/cancel",
+    response_model=JobDetailResponse,
+    responses={404: {"model": ErrorResponse}},
+)
+def cancel_job(job_id: str, request: Request) -> JobDetailResponse:
+    """Always 200 with the job as it is now: cancelled at once (queued, retry_wait),
+    cancel_requested (running: the worker stops at the next stage boundary), or unchanged
+    (already cancel_requested or finished)."""
+    parsed_id = _parse_job_id(job_id)
+    _service(request).cancel(parsed_id)
+    return _detail_response(request, parsed_id)
+
+
+@router.post(
+    "/jobs/{job_id}/retry",
+    response_model=JobDetailResponse,
+    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+)
+def retry_job(job_id: str, request: Request) -> JobDetailResponse:
+    """200 with the reopened (queued) job, or 409 job_not_retryable with details.reason."""
+    parsed_id = _parse_job_id(job_id)
+    _service(request).retry(parsed_id)
+    return _detail_response(request, parsed_id)
+
+
+def _parse_job_id(job_id: str) -> uuid.UUID:
     try:
-        parsed_id = uuid.UUID(job_id)
+        return uuid.UUID(job_id)
     except ValueError:
         # A malformed id can't name an existing job, so this is a plain "not found".
         raise ServiceError(ErrorCode.JOB_NOT_FOUND, "No job exists with this id.") from None
+
+
+def _detail_response(request: Request, parsed_id: uuid.UUID) -> JobDetailResponse:
     detail = _service(request).detail(parsed_id)
+    attempt = detail.open_attempt
     return JobDetailResponse.model_validate(
         {
             **JobResponse.model_validate(detail.job).model_dump(),
+            "lease": attempt
+            and {
+                "attempt_no": attempt.attempt_no,
+                "worker_id": attempt.worker_id,
+                "heartbeat_at": attempt.heartbeat_at,
+                "lease_expires_at": attempt.lease_expires_at,
+                "expired": attempt.lease_expires_at < detail.database_now,
+            },
+            "can_cancel": not detail.cancel.is_noop,
+            "cancel_blocked_reason": detail.cancel.reason,
+            "can_retry": detail.retry.allowed,
+            "retry_blocked_reason": detail.retry.reason,
             "upload": detail.upload,
             "attempts": detail.attempts,
             "artifacts": [
