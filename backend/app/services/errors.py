@@ -27,8 +27,10 @@ class ErrorCode(StrEnum):
     # Artifacts
     ARTIFACT_NOT_FOUND = "artifact_not_found"
     ARTIFACT_GONE = "artifact_gone"
-    # Listing
+    # Listing, event replay
     INVALID_CURSOR = "invalid_cursor"
+    # Event stream
+    STREAM_LIMIT_REACHED = "stream_limit_reached"
 
 
 class ServiceError(Exception):

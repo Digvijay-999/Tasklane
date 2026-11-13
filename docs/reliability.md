@@ -3,13 +3,15 @@
 This document explains how Tasklane keeps job state correct when several processes touch the same
 job at once, and what each database constraint protects.
 
-> **Status (Phase 7):** implemented and tested: the state machine, the schema and its
+> **Status (Phase 8):** implemented and tested: the state machine, the schema and its
 > constraints, conditional status changes and per-job events (Phase 2), idempotent job creation
 > with the outbox write (Phase 3), the delivery pipeline: dispatcher, Celery worker, claim,
 > duplicate handling, progress with lease renewal and fencing (Phase 4), error classification,
 > automatic retries with backoff, and resume from verified checkpoints (Phase 5), and the
 > heartbeat thread, the recovery loop (expired leases, lost messages), cancellation, and manual
-> retry (Phase 7). See [What is still not covered](#what-is-still-not-covered).
+> retry (Phase 7), and event replay over SSE (Phase 8). See
+> [What is still not covered](#what-is-still-not-covered) and
+> [what replay does not guarantee](#what-replay-does-not-guarantee).
 
 Tasklane does **not** promise "exactly once" execution. Messages may be delivered more than once,
 and a worker may die halfway through a job. The goal is that duplicates and interruptions can't
@@ -166,7 +168,7 @@ write events must stay short, since they hold the job's row lock until commit.
 
 **Order by `seq`, never by time.** `created_at` uses Postgres's `now()`, which is the start time of
 the *transaction*, so an event can carry an earlier timestamp than the one before it. The SSE
-replay in Phase 8 orders by `seq` only.
+stream and the history route order by `seq` only (see [Event replay](#event-replay-phase-8)).
 
 ## Database constraints
 
@@ -468,6 +470,108 @@ no engine is created at import time or in the parent: each process creates its o
 and if it ever finds state inherited from a parent (a fork after creation), it discards it without
 closing the parent's connections (tested with a real `fork`). Each worker process's pool has three
 connections: the task's own writes, its heartbeat, and a spare.
+
+## Event replay (Phase 8)
+
+`GET /v1/jobs/{job_id}/events` (SSE) and `GET /v1/jobs/{job_id}/events/history` read the
+`job_events` table; nothing is pushed to them from the worker. Code: `app/api/events.py` (the
+stream loop), `app/services/events.py` (one short read), `app/db/repositories/events.py`.
+
+### One loop for replay and live
+
+```text
+cursor = resume position (Last-Event-ID, else ?after=, else 0; clamped to the job's last seq)
+loop:
+    read the job's last_event_seq, then events with cursor < seq <= last_event_seq (up to 500)
+    send each one, in seq order; cursor = its seq
+    more left?                              -> read again at once
+    job finished and cursor == last seq?    -> send stream.end, close
+    older than SSE_MAX_STREAM_SECONDS?      -> send a bare `id: <cursor>`, close
+    nothing sent for SSE_KEEPALIVE_SECONDS? -> send ": keepalive"
+    sleep SSE_POLL_SECONDS
+```
+
+Replay is just the first iterations of the same loop, so there is no hand-over between a
+"replay phase" and a "live phase" where an event could slip through.
+
+**Why nothing is missed.** The cursor only moves to the seq of an event that was actually sent.
+An event committed while the loop sleeps, or between the read and the sleep, has a seq greater
+than the cursor and is returned by the next read. This works because of
+[per-job numbers](#per-job-event-sequence-numbers): seq N+1 can't be created until N is
+committed, so a read never sees N+1 without N. Each read takes the job's `last_event_seq` first
+and then the events up to it. The second statement sees at least what the first one saw (READ
+COMMITTED), and every event up to a committed `last_event_seq` is committed, so a read returns
+them all. (Tested deterministically: a wrapper commits a new event right after each read, before
+the loop sleeps; every one is delivered.)
+
+**Why nothing is sent twice.** Each event is sent once per connection, in increasing `seq`. On
+reconnect the client names the last seq it processed and gets only later ones. A client that
+reconnects with an older id than it actually processed (its own bug) receives those events again,
+identical: the same `seq`, so de-duplicating by `seq` is trivial.
+
+**Gaps are logged, never skipped silently.** If a read returns seq 5 when 4 was expected, or
+`last_event_seq` says events exist that the read doesn't return, the stream logs `event seq gap`
+(ERROR, with `expected` and `got`) and continues. This can't happen today (events are never
+deleted); it would reveal a bug, or a future retention job deleting events of a live job.
+
+**Only committed events are streamed.** The stream reads the table from its own connection, and
+an uncommitted event is invisible to other connections. Tested both in-process and over a real
+connection: an event appended in an open transaction is not sent during ten polls, and arrives
+right after the commit.
+
+### Connections, threads, and slow clients
+
+- The loop is an **async generator** on uvicorn's event loop. While idle it holds no thread, no
+  database connection and no transaction. Each read borrows a worker thread
+  (`anyio.to_thread`) and a pooled connection for one short read-only transaction, and returns
+  both before sleeping. Tested: 15 idle streams against a pool of 5 + 5 connections; the job,
+  history and readiness routes still answer in under 2 s, no session is `idle in transaction`,
+  and all 15 streams still deliver the next event.
+- A **slow client** only slows its own stream: writing waits for the socket (back-pressure)
+  without blocking the event loop. A client that **stops reading** is dropped when one write
+  can't complete within `SSE_WRITE_TIMEOUT_SECONDS` (30 s), which frees its slot (tested with a
+  client that never reads 20 MB of events; other requests stay fast).
+- **Disconnects:** uvicorn tells the app as soon as the socket closes (clean close or reset), and
+  Starlette cancels the stream at its current `await`. The stream slot is released in the
+  response's `finally`, however the stream ends. Tested with a clean close and with an abrupt
+  TCP reset: the server logs `event stream closed` with `reason: disconnected` and the only slot
+  is free again within 2 s. The job is never touched; streaming is read-only (tested with a real
+  job that keeps running and succeeds after its viewer vanishes).
+- **Database outage during a stream:** the read fails, the stream warns once, keeps sending
+  keepalives, retries with a growing delay (up to the keepalive interval, so many streams don't
+  flood the logs or the thread pool), and resumes when the database is back. A *new* connection gets
+  `503 service_unavailable` meanwhile.
+- **Server stop or reload:** uvicorn closes open streams after 5 s
+  (`--timeout-graceful-shutdown 5`); without it a reload would wait for every stream to end.
+
+### Ending a stream
+
+| Ending | What the client sees | What it should do |
+|---|---|---|
+| Job finished, everything sent | `stream.end` (`reason: job_finished`), then the server closes | Stop. A manual retry reopens the job; reconnect with the last id to follow it |
+| `SSE_MAX_STREAM_SECONDS` reached | A comment and a bare `id: <last seq>`, then the server closes | Reconnect with that id (EventSource does it by itself) |
+| Server shutdown, network drop, proxy timeout | The connection ends | Reconnect with the last id (EventSource does it by itself) |
+| Job deleted while streaming | `stream.end` (`reason: job_not_found`) | Stop |
+
+`stream.end` has no `id:`, so a client's last id is always the seq of a real event.
+
+### What replay does not guarantee
+
+- **Not a push system with acknowledgements.** The server doesn't know which events a client
+  processed; the client's `Last-Event-ID` / `?after=` is the only record. A client that stores
+  the wrong id gets repeats or misses.
+- **Latency is up to one poll interval** (0.5 s) plus the read, not instant (no LISTEN/NOTIFY;
+  polling also covers events written while nobody was connected).
+- **The stream limit is per API process** (`SSE_MAX_STREAMS`), counted in memory. Several API
+  processes would each allow that many.
+- **Events are kept forever for now.** If a retention job (Phase 12) ever deletes events, a
+  client resuming from before the deleted range would see a gap (logged on the server).
+- **A browser gives up after an error status.** EventSource reconnects by itself only after a
+  dropped connection; a `503` or `404` on reconnect closes it for good, so the page must
+  reconnect itself (with `?after=`). See [api.md](api.md#using-it-from-a-browser).
+- **Proxies may still buffer or cut streams.** `X-Accel-Buffering: no` covers nginx; other
+  proxies need their own settings. Keepalives every 15 s stop most idle timeouts.
+- **`created_at` is not an order.** It is informational; only `seq` orders events.
 
 ## Untrusted input: the parser sandbox (Phases 5-6)
 

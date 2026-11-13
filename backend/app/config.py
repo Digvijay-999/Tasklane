@@ -132,6 +132,28 @@ class Settings(BaseSettings):
     # "fault_injection"). Off by default; the API refuses the option while it is off.
     enable_fault_injection: bool = False
 
+    # --- Event stream (Phase 8), per API process ---
+    # Open SSE streams allowed at once; one more gets 503 stream_limit_reached.
+    sse_max_streams: int = Field(default=50, ge=1, le=10_000)
+    # A stream is closed after this long (with its last id, so the client resumes seamlessly).
+    sse_max_stream_seconds: float = Field(default=3600, ge=1, le=86_400)
+    # How often an open stream checks the database for new events.
+    sse_poll_seconds: float = Field(default=0.5, ge=0.05, le=10)
+    # A ": keepalive" comment is sent after this long without any other output.
+    sse_keepalive_seconds: float = Field(default=15, ge=0.1, le=300)
+    # Reconnect delay the server asks browsers to use ("retry:" field), in milliseconds.
+    sse_retry_milliseconds: int = Field(default=3000, ge=100, le=600_000)
+    # A client that can't accept a write for this long (not reading) is disconnected.
+    sse_write_timeout_seconds: float = Field(default=30, ge=0.1, le=600)
+
+    @model_validator(mode="after")
+    def _sse_timings(self) -> "Settings":
+        if self.sse_keepalive_seconds < self.sse_poll_seconds:
+            raise ValueError("SSE_KEEPALIVE_SECONDS must be at least SSE_POLL_SECONDS")
+        if self.sse_max_stream_seconds < self.sse_keepalive_seconds:
+            raise ValueError("SSE_MAX_STREAM_SECONDS must be at least SSE_KEEPALIVE_SECONDS")
+        return self
+
     @model_validator(mode="after")
     def _visibility_timeout_exceeds_lease(self) -> "Settings":
         if self.celery_visibility_timeout_seconds <= self.lease_seconds:

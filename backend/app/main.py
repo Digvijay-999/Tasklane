@@ -12,13 +12,14 @@ from datetime import timedelta
 
 from fastapi import FastAPI
 
-from app.api import health, jobs, uploads
+from app.api import events, health, jobs, uploads
 from app.api.errors import install_error_handling
 from app.config import Settings, get_settings
 from app.db.session import create_db_engine, create_session_factory
 from app.observability.logging import RequestContextMiddleware, configure_logging
 from app.queue.broker import create_broker_client
 from app.services.artifacts import ArtifactService
+from app.services.events import EventService
 from app.services.jobs import JobService
 from app.services.uploads import UploadLimits, UploadService
 from app.storage.local import LocalStorage
@@ -56,6 +57,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "(development only; set ENABLE_FAULT_INJECTION=false to turn it off)"
             )
         app.state.artifact_service = ArtifactService(session_factory, storage)
+        app.state.event_service = EventService(session_factory)
+        app.state.sse_slots = events.StreamSlots(settings.sse_max_streams)
         try:
             yield
         finally:
@@ -79,4 +82,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(uploads.router)
     app.include_router(jobs.router)
+    app.include_router(events.router)
     return app

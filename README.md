@@ -5,7 +5,7 @@ processing jobs (PDF ingestion and repository ZIP indexing), with a focus on dur
 retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the goals and
 [docs/architecture.md](docs/architecture.md) for the planned design.
 
-## Current status: Phase 7 of 12
+## Current status: Phase 8 of 12
 
 **What works today:**
 
@@ -97,8 +97,18 @@ retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) fo
   - Threat model and where each defense is enforced and tested:
     [docs/security.md](docs/security.md). Job details: [docs/api.md](docs/api.md#what-a-repo_index-job-does).
 
-**Not implemented yet:** the event stream (SSE), the dashboard, metrics, and any real LLM
-provider.
+- **Live event stream** (`GET /v1/jobs/{id}/events`, Server-Sent Events): every event of a job
+  (status changes, attempts, stages, progress, retries, recovery) as it is committed, within
+  about half a second. After a dropped connection a client resumes with `Last-Event-ID` (or
+  `?after=<seq>`, for a browser page that was reloaded) and receives exactly the events it
+  missed, in order. The stream ends with a `stream.end` event once the job is finished.
+  Disconnecting never affects the job. Limits: 50 open streams per API process (then `503`),
+  1 hour per stream (the client then resumes), keepalive comments every 15 s.
+  `GET /v1/jobs/{id}/events/history` returns the same events as JSON pages.
+  See [docs/api.md](docs/api.md#events) and
+  [docs/reliability.md](docs/reliability.md#event-replay-phase-8).
+
+**Not implemented yet:** the dashboard, metrics, and any real LLM provider.
 See the phase list in [CLAUDE.md](CLAUDE.md).
 
 ## Requirements
@@ -194,6 +204,18 @@ curl.exe -s -o summary.md "$api$($summary.download_url)"
 # Cancel a job, or retry a failed one (409 with a reason if it can't be retried)
 curl.exe -s -X POST "$api/v1/jobs/$($job.id)/cancel"
 curl.exe -s -X POST "$api/v1/jobs/$($job.id)/retry"
+
+# Follow a job's events live (-N: print as they arrive). Ctrl+C to stop; a finished job's
+# stream ends by itself with "event: stream.end".
+curl.exe -N "$api/v1/jobs/$($job.id)/events"
+# Resume after event 5 (as a reconnecting client would), by header or by query parameter
+curl.exe -N -H "Last-Event-ID: 5" "$api/v1/jobs/$($job.id)/events"
+curl.exe -N "$api/v1/jobs/$($job.id)/events?after=5"
+# The same events as JSON pages
+curl.exe -s "$api/v1/jobs/$($job.id)/events/history?limit=10"
+
+# A readable view of the stream (runs inside the api container, where the API is localhost:8000)
+docker compose exec -T api python -m devtools.sse_client "http://localhost:8000/v1/jobs/$($job.id)/events"
 ```
 
 Uploaded files, intermediate files (`work/`), and artifacts live in the `storage` Docker volume,
@@ -224,7 +246,7 @@ and migrations disagree.
 
 The `api` container runs your local `backend/app` source code, and uvicorn restarts when a file
 changes, so you don't need to rebuild after editing code. Rebuild only after changing dependencies
-(`backend/pyproject.toml` / `backend/uv.lock`) or `backend/alembic.ini`:
+(`backend/pyproject.toml` / `backend/uv.lock`), `backend/alembic.ini`, or `backend/Dockerfile`:
 `docker compose up --build -d`.
 
 On Docker Desktop for Windows, file-change events from the Windows filesystem don't reach Linux

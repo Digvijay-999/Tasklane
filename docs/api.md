@@ -1,6 +1,6 @@
 # Tasklane HTTP API
 
-> **Status (Phase 7):** the routes marked **implemented** below work. `pdf_ingest` and
+> **Status (Phase 8):** the routes marked **implemented** below work. `pdf_ingest` and
 > `repo_index` jobs really process their input (with the built-in **stub** summarizer, not an AI
 > model) and produce downloadable artifacts; see
 > [What a pdf_ingest job does](#what-a-pdf_ingest-job-does) and
@@ -9,6 +9,8 @@
 > [Failures and retries](#failures-and-retries). A job whose worker dies is recovered once its
 > lease expires; jobs can be cancelled and failed jobs retried by hand
 > ([cancel](#post-v1jobsjob_idcancel--implemented), [retry](#post-v1jobsjob_idretry--implemented)).
+> A job's events can be followed live, with replay after a dropped connection
+> ([Events](#events)).
 > Routes marked **planned** don't exist yet.
 
 | Route | Status |
@@ -19,7 +21,7 @@
 | `GET /v1/jobs` | implemented |
 | `GET /v1/jobs/{job_id}` | implemented |
 | `POST /v1/jobs/{job_id}/cancel`, `POST /v1/jobs/{job_id}/retry` | implemented (Phase 7) |
-| `GET /v1/jobs/{job_id}/events` (SSE) | planned (Phase 8) |
+| `GET /v1/jobs/{job_id}/events` (SSE), `GET /v1/jobs/{job_id}/events/history` | implemented (Phase 8) |
 | `GET /v1/jobs/{job_id}/artifacts/{artifact_id}` | implemented (Phase 5) |
 | `GET /metrics` | planned (Phase 10) |
 
@@ -575,8 +577,182 @@ if they disagree. When the setting is on, the API and worker log a warning at st
 | `retry_at` | When a `retry_wait` job runs again |
 | `cancel_requested_at` | When cancellation was requested (cleared by a manual retry) |
 | `error_class`, `error_summary` | Safe description of the latest failure |
-| `last_event_seq` | Number of the job's latest event (SSE in Phase 8 replays from here) |
+| `last_event_seq` | Number of the job's latest event (see [Events](#events)) |
 | `created_at`, `updated_at`, `started_at`, `finished_at` | |
+
+## Events
+
+Everything that happens to a job is recorded as an **event** with a per-job number, `seq`
+(1, 2, 3, ... with no gaps). Events are written in the same database transaction as the change
+they describe, so an event you receive always describes something that was really committed.
+
+| Event | When | Payload (ids, counts, stage names, timestamps, error classes) |
+|---|---|---|
+| `job.created` | Job accepted | `workflow_type`, `upload_id` |
+| `job.status_changed` | Any status change | `from`, `to`; depending on the change also `error_class`, `retry_in_seconds`, `gave_up_after_attempts`, `reason`, `before_stage`, `outbox_removed`, `requested_by`, `attempt_no`, `worker_id`, `manual_retry_count` |
+| `job.cancel_superseded` | The job finished before a pending cancel took effect | `outcome`, `reason` |
+| `job.requeued` | Recovery re-sent a lost message | `reason`, `status`, `last_published_at` |
+| `job.manual_retry` | `POST .../retry` reopened the job | `manual_retry_count`, `previous_error_class`, `attempt_count`, `max_attempts` |
+| `attempt.started` | A worker claimed the job | `trigger` (`initial`, `auto_retry`, `recovery`, `manual_retry`), `worker_id`, `attempt_no` |
+| `attempt.lease_expired` | Recovery closed an attempt whose worker stopped renewing its lease | `attempt_no`, `worker_id`, `last_heartbeat_at`, `lease_expired_at` |
+| `stage.started` / `stage.completed` | A stage begins / ends | `stage`; completed adds `duration_ms` |
+| `stage.progress` | Progress inside a stage | `stage`, `percent` |
+| `stage.failed` | A stage raised | `stage`, `error_class`, `retryable` |
+| `stage.skipped` | A retry reused the stage's verified checkpoint | `stage`, `reason` |
+
+Every event has the same shape in both routes below:
+
+```json
+{"seq": 4, "event_type": "stage.started", "attempt_no": 1,
+ "created_at": "2026-11-10T12:00:01.722110Z", "payload": {"stage": "validate_pdf"}}
+```
+
+`created_at` is the start of the transaction that wrote the event, so a later event can carry an
+earlier timestamp. **Order by `seq`, never by `created_at`.** Payloads never contain tracebacks,
+secrets, file contents or server paths. Should a future event carry a value taken from an upload
+(a file name, say), it is only ever a JSON string value, never part of the SSE framing.
+
+### `GET /v1/jobs/{job_id}/events` — implemented (Server-Sent Events)
+
+Follow a job live. The response stays open and the server writes one block of text per event
+([Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html)).
+
+```powershell
+curl.exe -N "$api/v1/jobs/<job_id>/events"            # -N: print as it arrives, don't buffer
+curl.exe -N "$api/v1/jobs/<job_id>/events?after=12"   # resume after event 12
+curl.exe -N -H "Last-Event-ID: 12" "$api/v1/jobs/<job_id>/events"
+```
+
+Response headers: `Content-Type: text/event-stream; charset=utf-8`, `Cache-Control: no-cache`,
+`X-Accel-Buffering: no` (tells proxies such as nginx not to buffer), `Connection: keep-alive`.
+The body, literally (a finished job read from the beginning, shortened):
+
+```text
+retry: 3000
+
+id: 1
+event: job.created
+data: {"seq":1,"event_type":"job.created","attempt_no":null,"created_at":"2026-11-10T12:00:01.202364Z","payload":{"upload_id":"fd1a8ab5-1bb3-445e-b714-c1ba39320605","workflow_type":"pdf_ingest"}}
+
+id: 2
+event: job.status_changed
+data: {"seq":2,"event_type":"job.status_changed","attempt_no":1,"created_at":"2026-11-10T12:00:01.705243Z","payload":{"to":"running","from":"queued","worker_id":"worker@6d635f77cb6a:63","attempt_no":1}}
+
+: keepalive
+
+id: 21
+event: job.status_changed
+data: {"seq":21,"event_type":"job.status_changed","attempt_no":1,"created_at":"2026-11-10T12:00:09.110021Z","payload":{"to":"succeeded","from":"running","attempt_no":1}}
+
+event: stream.end
+data: {"reason":"job_finished","status":"succeeded","last_seq":21}
+
+```
+
+- `retry: 3000` (first block) asks browsers to wait 3 s before reconnecting
+  (`SSE_RETRY_MILLISECONDS`).
+- Each event block: `id:` = the event's `seq`, `event:` = its type, `data:` = the event object
+  above as **one line of JSON**. Every non-ASCII and control character in it is escaped (`\n`,
+  `\r`, ` `, ...), so no value can end the line or add a field or an event.
+- `: keepalive` is a comment, sent after `SSE_KEEPALIVE_SECONDS` (15) without other output, so
+  proxies and clients don't treat a quiet stream as dead. Clients ignore comments.
+- `stream.end` is not a stored event and has **no `id:`**: see below.
+
+**Resume position.** The stream sends every event whose `seq` is greater than the resume
+position, in order, then waits for new ones:
+
+| Request | Resume position |
+|---|---|
+| `Last-Event-ID: N` header | `N` (wins if `?after=` is also given) |
+| `?after=N` | `N` (EventSource can't set headers, and forgets the last id when the page reloads) |
+| neither, an empty value, or `0` | `0`: everything from the first event |
+| `N` greater than the job's last `seq` | No replay, no error: only events written from now on |
+| anything but a non-negative integer (`-1`, `abc`, `1.5`) | `400 invalid_cursor` |
+
+These are checked before streaming starts, as is the job itself: an unknown job is
+`404 job_not_found` with the usual JSON error body.
+
+**End of stream.** Once the job is finished (`succeeded`, `failed`, `cancelled`) and every event
+up to its last one has been sent, the server sends `stream.end` and closes the connection. Its
+`data` holds `reason` (`job_finished`; `job_not_found` if the job was deleted meanwhile),
+`status` and `last_seq`. A client should stop on `stream.end` instead of reconnecting. A
+**manual retry** reopens a failed job (it is `queued` again): to follow the new run, reconnect
+with `Last-Event-ID` (or `?after=`) set to `last_seq` and you receive `job.status_changed`
+(`failed -> queued`), `job.manual_retry`, and everything after.
+
+**Limits** (per API process; settings in `.env`):
+
+| Setting | Default | |
+|---|---|---|
+| `SSE_MAX_STREAMS` | 50 | Open streams at once. One more gets `503 stream_limit_reached` (`details.limit`): retry shortly, or use the history route |
+| `SSE_MAX_STREAM_SECONDS` | 3600 | Then the server ends the stream with a comment and a bare `id: <last seq>` line (no `stream.end`), so EventSource reconnects and resumes where it was |
+| `SSE_POLL_SECONDS` | 0.5 | How often an open stream checks for new events: new events arrive within about this long |
+| `SSE_KEEPALIVE_SECONDS` | 15 | Idle time before a `: keepalive` comment (at least `SSE_POLL_SECONDS`) |
+| `SSE_RETRY_MILLISECONDS` | 3000 | The `retry:` value |
+| `SSE_WRITE_TIMEOUT_SECONDS` | 30 | A client that can't accept data for this long (it stopped reading) is disconnected |
+
+A dropped connection (client, proxy or network) never affects the job: the stream only reads.
+When the API stops or reloads, it closes open streams after 5 s; clients reconnect.
+
+**Error codes:** `400 invalid_cursor`, `404 job_not_found`, `503 stream_limit_reached`, and
+`503 service_unavailable` if the database is down when connecting. If the database becomes
+unavailable *during* a stream, the stream stays open, keepalives continue, and events resume when
+it is back.
+
+#### Using it from a browser
+
+```js
+let lastSeq = Number(sessionStorage.getItem(`seq:${jobId}`) || 0);
+const source = new EventSource(`/v1/jobs/${jobId}/events?after=${lastSeq}`);
+const onEvent = (e) => {
+  lastSeq = Number(e.lastEventId);
+  sessionStorage.setItem(`seq:${jobId}`, String(lastSeq));
+  render(JSON.parse(e.data));
+};
+for (const type of ["job.status_changed", "stage.started", "stage.progress" /* ... */]) {
+  source.addEventListener(type, onEvent);
+}
+source.addEventListener("stream.end", () => source.close()); // finished: don't reconnect
+source.onerror = () => {
+  // readyState CONNECTING: the browser reconnects by itself, sending Last-Event-ID.
+  // readyState CLOSED: it gave up (the server answered with an error, e.g. 503).
+  //   Reconnect yourself later with ?after=<lastSeq>, waiting longer each time.
+};
+```
+
+- Events have names, so listen with `addEventListener(type, ...)`; `onmessage` only receives
+  unnamed events and never fires here.
+- After a dropped connection the browser reconnects by itself and sends `Last-Event-ID`. When
+  both are present, the header wins, so the `?after=` in the URL doesn't cause repeats.
+- After a **page refresh** that memory is gone and EventSource can't set headers: keep the last
+  `seq` (page state or `sessionStorage`) and reconnect with `?after=<seq>`.
+- Close the EventSource on `stream.end`. Otherwise it reconnects after the `retry:` delay, gets
+  `stream.end` again at once, and repeats every few seconds.
+- A browser gives up for good when a (re)connection is answered with an error status (`503`,
+  `404`); only a dropped connection is retried automatically.
+
+### `GET /v1/jobs/{job_id}/events/history` — implemented
+
+Plain JSON pages of events, for clients that fell behind or can't use SSE.
+
+```powershell
+curl.exe -s "$api/v1/jobs/<job_id>/events/history?limit=5"
+curl.exe -s "$api/v1/jobs/<job_id>/events/history?after=5&limit=5"
+```
+
+```json
+{"items": [{"seq": 6, "event_type": "stage.completed", "attempt_no": 1, "created_at": "...", "payload": {"stage": "validate_pdf", "duration_ms": 676}}],
+ "next_after": 10, "last_seq": 21}
+```
+
+| Query | |
+|---|---|
+| `after` | Events with `seq` greater than this (default 0). Malformed: `400 invalid_cursor` |
+| `limit` | 1-500, default 100. Outside that range: `422 invalid_request` |
+
+`items` are in `seq` order. `next_after` is the `after` for the next page, or `null` when you
+have everything up to `last_seq` (the job's latest event when the page was read). Unknown job:
+`404 job_not_found`.
 
 ## Health
 

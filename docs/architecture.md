@@ -79,9 +79,12 @@ sequenceDiagram
     end
     W->>DB: artifacts + succeeded (or retry_wait / failed / cancelled)
 
-    UI->>API: GET /v1/jobs/{id}/events (Last-Event-ID)
-    API->>DB: read events with seq > Last-Event-ID, then poll for new ones
-    API-->>UI: SSE stream
+    UI->>API: GET /v1/jobs/{id}/events (Last-Event-ID or ?after=)
+    loop every 0.5 s until the job is finished
+        API->>DB: short read: events with seq > cursor
+        API-->>UI: SSE: id/event/data per event (or a keepalive comment)
+    end
+    API-->>UI: stream.end, close
 ```
 
 Step by step:
@@ -124,9 +127,13 @@ Step by step:
    moves the job to `retry_wait` (with backoff and a delayed outbox row), `failed` ("Gave up after
    N attempts.") or `cancelled` (if cancellation was requested). It also re-queues claimable jobs
    whose message was evidently lost. See [reliability.md](reliability.md#leases-heartbeats-fencing-and-recovery-phase-7).
-8. **Events.** Every event is persisted with a per-job sequence number *before* it is streamed.
-   The SSE endpoint replays events after `Last-Event-ID`, then polls for new ones. A client
-   disconnect never cancels a job.
+8. **Events (implemented).** Every event is persisted with a per-job sequence number *before*
+   it is streamed. `GET /v1/jobs/{id}/events` runs one loop for replay and live: send every
+   committed event with `seq` greater than the cursor (`Last-Event-ID`, else `?after=`), advance
+   the cursor, sleep 0.5 s, repeat; then `stream.end` once the job is finished. Each read is a
+   short transaction; an idle stream holds no database connection. A client disconnect stops the
+   loop and never touches the job. `GET /v1/jobs/{id}/events/history` serves the same events as
+   JSON pages. See [reliability.md](reliability.md#event-replay-phase-8) and `PHASE8_NOTES.md`.
 
 ## 4. Job state machine (implemented in Phase 2; used by workers from Phase 4)
 
@@ -277,7 +284,7 @@ specific tags.
 | 5 | PDF workflow + retries | **Part A:** stages, sandboxed parser and limits, provider interface + **stub provider**, artifacts and download route, `provider_calls`, lease `keep_alive`. **Part B:** transient vs permanent errors, bounded backoff with jitter via delayed outbox rows, attempt-budget CHECK, fault injection, stage checkpoints/resume (migration `0004`) |
 | 6 | ZIP workflow + security | Path traversal, symlinks, zip bombs, file-count limits, file filtering, manifest + JSONL. Done: six stages, sandboxed ZIP reader shared with the PDF sandbox, allowlist filtering with skip reasons, line chunking, `summary.md` / `chunks.jsonl` / `manifest.json`, [security.md](security.md) |
 | 7 | Leases, recovery, cancellation, manual retry | Done: heartbeat thread, recovery loop (expired leases, lost messages), cooperative cancellation at stage boundaries, `POST /cancel`, `POST /retry`, parent-death signal for parser children; see `PHASE7_NOTES.md` |
-| 8 | SSE with replay | `Last-Event-ID` replay, then live polling; paginated event history |
+| 8 | SSE with replay | Done: one loop for replay and live (`Last-Event-ID` or `?after=`), `stream.end`, keepalives, stream limit and lifetime, write timeout, paginated event history, `devtools.sse_client`; see `PHASE8_NOTES.md` |
 | 9 | Dashboard | Overview, new job, job detail, live events |
 | 10 | Observability | OpenTelemetry traces/metrics, `/metrics`, no job IDs as metric labels |
 | 11 | Optional LLM provider | OpenAI-compatible adapter behind config; timeouts; usage recording |
@@ -298,6 +305,9 @@ specific tags.
 - Idempotency keys live as long as their job row (to be documented with the API in Phase 3).
 - Integration tests run against `<POSTGRES_DB>_test`, never the development database.
 - Local uploads and artifacts live under `storage/`, which is gitignored.
+- The SSE stream is an async generator that polls the database with short reads (no
+  LISTEN/NOTIFY, no thread per stream), and ends with `stream.end` when the job is finished
+  (Phase 8; see `PHASE8_NOTES.md`).
 - Names from inside an uploaded ZIP are data, never filesystem paths: extracted bytes go into one
   generated file (`work/{job_id}/files.bin`) at recorded offsets (Phase 6; see
   `PHASE6_NOTES.md`).

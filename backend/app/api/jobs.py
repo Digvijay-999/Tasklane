@@ -118,7 +118,7 @@ def list_jobs(
     responses={404: {"model": ErrorResponse}},
 )
 def get_job(job_id: str, request: Request) -> JobDetailResponse:
-    return _detail_response(request, _parse_job_id(job_id))
+    return _detail_response(request, parse_job_id(job_id))
 
 
 @router.post(
@@ -130,7 +130,7 @@ def cancel_job(job_id: str, request: Request) -> JobDetailResponse:
     """Always 200 with the job as it is now: cancelled at once (queued, retry_wait),
     cancel_requested (running: the worker stops at the next stage boundary), or unchanged
     (already cancel_requested or finished)."""
-    parsed_id = _parse_job_id(job_id)
+    parsed_id = parse_job_id(job_id)
     _service(request).cancel(parsed_id)
     return _detail_response(request, parsed_id)
 
@@ -142,12 +142,12 @@ def cancel_job(job_id: str, request: Request) -> JobDetailResponse:
 )
 def retry_job(job_id: str, request: Request) -> JobDetailResponse:
     """200 with the reopened (queued) job, or 409 job_not_retryable with details.reason."""
-    parsed_id = _parse_job_id(job_id)
+    parsed_id = parse_job_id(job_id)
     _service(request).retry(parsed_id)
     return _detail_response(request, parsed_id)
 
 
-def _parse_job_id(job_id: str) -> uuid.UUID:
+def parse_job_id(job_id: str) -> uuid.UUID:
     try:
         return uuid.UUID(job_id)
     except ValueError:

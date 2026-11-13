@@ -192,3 +192,25 @@ class JobListResponse(BaseModel):
     next_cursor: str | None = Field(
         description="Pass as ?cursor= to get the next page; null when there are no more."
     )
+
+
+class JobEventResponse(BaseModel):
+    """One stored event. The same shape is the `data` of an SSE message."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    seq: int = Field(description="Per-job event number (1, 2, 3, ...); the SSE id.")
+    event_type: str
+    attempt_no: int | None
+    created_at: datetime = Field(
+        description="Transaction start time: informational only, order by seq."
+    )
+    payload: dict[str, Any]
+
+
+class JobEventPageResponse(BaseModel):
+    items: list[JobEventResponse]
+    next_after: int | None = Field(
+        description="Pass as ?after= to get the next page; null when caught up."
+    )
+    last_seq: int = Field(description="The job's latest event number when this page was read.")

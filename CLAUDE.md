@@ -427,6 +427,56 @@ Full reasoning (alternatives, plain language): `PHASE7_NOTES.md`.
 - **Dev tools:** `python -m devtools.ps` lists container processes (the image has no `ps`);
   `devtools.job_events` describes the new event types.
 
+## Decisions made (Phase 8)
+
+Full reasoning (alternatives, plain language): `PHASE8_NOTES.md`.
+
+- **One loop for replay and live** (`app/api/events.py::event_frames`): read the job's
+  `last_event_seq`, then events with `cursor < seq <= last_event_seq` ORDER BY `seq` (500 per
+  read; `services/events.py`, `db/repositories/events.py`), send them, cursor = last sent seq,
+  sleep `SSE_POLL_SECONDS`, repeat. No LISTEN/NOTIFY, no Redis. Race-free because of per-job
+  numbering (tested with a wrapper that commits right after each read).
+- **Async generator, not threads:** the route is `async def`; each read runs in
+  `anyio.to_thread` inside a short session closed before sleeping. Never a sync generator
+  (it would hold one of Starlette's 40 shared threads per stream).
+- **Resume position** (`parse_resume_position`): `Last-Event-ID` wins over `?after=`; empty =
+  absent; missing/`0` = from the start; not `^[0-9]{1,18}$` → `400 invalid_cursor`
+  (`details.source`); past the job's last seq → clamped (no replay, then live). Unknown job →
+  `404 job_not_found`. All checked before the response starts.
+- **Frame:** `id: <seq>`, `event: <event_type>` (re-checked against the DB regex), `data:` =
+  `{seq, event_type, attempt_no, created_at, payload}` via `json.dumps(ensure_ascii=True)` (no raw
+  CR/LF/U+2028 possible; the formatter raises if one appears). First block `retry: <ms>`.
+  History items use the same object (`JobEventResponse`).
+- **End:** job terminal and cursor == last seq → `event: stream.end`, data `{reason:
+  job_finished|job_not_found, status, last_seq}`, **no `id:`**, then close. Clients close on it;
+  a manual retry reopens the job, so a reconnect with the last id gets the new events.
+- **Lifetime end** (`SSE_MAX_STREAM_SECONDS`): a comment plus a bare `id: <cursor>` (updates
+  the client's last id without an event), no `stream.end`, then close (EventSource resumes).
+- **Settings** (validated): `SSE_MAX_STREAMS` 50, `SSE_MAX_STREAM_SECONDS` 3600,
+  `SSE_POLL_SECONDS` 0.5, `SSE_KEEPALIVE_SECONDS` 15 (≥ poll; ≤ lifetime),
+  `SSE_RETRY_MILLISECONDS` 3000, `SSE_WRITE_TIMEOUT_SECONDS` 30. Passed through Compose so a
+  shell variable overrides them.
+- **Slots:** in-memory `StreamSlots` per API process (event-loop only, no lock), acquired after
+  the job check, released in `EventStreamResponse.__call__`'s `finally` (which also `aclose()`s
+  the generator); over the limit → `503 stream_limit_reached` with `details.limit`.
+- **Disconnects:** uvicorn reports ASGI spec 2.3, so Starlette's `StreamingResponse` cancels the
+  body on `http.disconnect` (tested: clean close and TCP reset free the slot within 2 s). A
+  client that can't accept a write for `SSE_WRITE_TIMEOUT_SECONDS` is dropped (`send` wrapped in
+  `anyio.fail_after`). The stream never writes to the database.
+- **Database outage mid-stream:** connectivity errors are warned once per outage (type only) and
+  retried with backoff (poll × 2ⁿ, capped at the keepalive interval); keepalives continue. A gap in seqs is logged as `event seq gap` (ERROR) and never
+  skipped silently; missing rows at the end move the cursor to `last_event_seq` (no spinning).
+- **`uvicorn --timeout-graceful-shutdown 5`** in both Dockerfile targets: otherwise stop/reload
+  waits for open streams to end.
+- **History route** `GET /v1/jobs/{id}/events/history?after=&limit=` (1-500, default 100):
+  `{items, next_after (null when caught up), last_seq}`.
+- **Logs:** `event stream opened` / `event stream closed` (`reason`: `disconnected`,
+  `job_finished`, `max_lifetime`, `job_not_found`; `events_sent`, `last_seq`).
+- **Tests:** streaming over real connections runs against a real `uvicorn` subprocess on a free
+  port (`tests/integration/test_events_e2e.py`, marked e2e); TestClient only for streams that
+  end by themselves. `devtools/sse_client.py` (stdlib only) and its parser `iter_sse` are reused
+  by the tests. Pipeline fixtures are shared by assigning them from `test_e2e_pipeline`.
+
 ## Carry-forward requirements
 
 Items later phases must address. Remove an item only when it is implemented and tested.
@@ -452,8 +502,6 @@ Items later phases must address. Remove an item only when it is implemented and 
   Markdown punctuation is escaped); the repo one keeps summaries in fenced blocks. The dashboard
   must not render either with raw HTML, active links or auto-linked bare URLs, and must escape
   file paths from `manifest.json` (they are untrusted).
-- **Phase 8 — event order:** order and replay events by `seq` only, never `created_at` (`now()`
-  is the transaction start time).
 - **Phase 9 — queue health:** surface dispatch failures (`dispatch_attempts`,
   `last_dispatch_error`) and the oldest queued job's age.
 - **Phase 11 — repository text sent to a real provider:** indexed files can contain secrets
@@ -480,10 +528,6 @@ Items later phases must address. Remove an item only when it is implemented and 
 - **Phase 12 — work folders:** `work/{job_id}/` intermediate files are kept forever for now;
   retention must clean them (never for unfinished jobs), along with stray `.*.tmp` files left by
   a crash mid-write.
-- **Phase 8 — new event types:** `attempt.lease_expired`, `job.requeued`, `job.manual_retry`, and
-  `job.status_changed` payloads with `reason`, `before_stage`, `outbox_removed`,
-  `requested_by` must stream and replay like the others (all payloads are already safe: ids,
-  timestamps, counts, error classes).
 - **Phase 9 — actions and leases:** use `can_cancel`/`can_retry` and their reasons from the job
   detail (never derive them from `status`); show `lease.expired` ("worker not responding,
   recovering") and attempt outcomes `lease_expired`/`cancelled` and triggers `recovery`/
@@ -497,13 +541,31 @@ Items later phases must address. Remove an item only when it is implemented and 
 - **Phase 12 — long queues:** a job waiting in Redis longer than `LOST_MESSAGE_GRACE_SECONDS`
   gets a duplicate message every grace period (dropped by the claim). Revisit the default, or
   track queue depth, when measuring with many jobs.
+- **Phase 9 — untrusted text in the dashboard:** never auto-link bare URLs in file names,
+  archive paths, manifest entries or event payloads (render them as plain text; no
+  `dangerouslySetInnerHTML`, no linkify). Event payloads arrive as JSON from the stream; keep
+  them data.
+- **Phase 9 — CORS / dev proxy:** the API sends no CORS headers. Use a Vite dev proxy
+  (`/v1` → `http://127.0.0.1:8000`) so the page and the API share an origin (EventSource and
+  `fetch` then need no CORS); if CORS is added instead, allow only the Vite dev origin, and
+  remember EventSource can't send custom headers.
+- **Phase 9 — EventSource usage:** listen with `addEventListener(<event type>)` (events are
+  named; `onmessage` never fires); remember the last `seq` and reconnect with `?after=<seq>`
+  after a page reload; close on `stream.end`; on `error` with `readyState === CLOSED` (the
+  server answered 503/404) reconnect yourself with backoff and `?after=`; order by `seq`, never
+  `created_at`; de-duplicate by `seq` if combining history and stream. `docs/api.md` has an
+  example.
+- **Phase 10 — stream metrics:** open streams, streams refused (`stream_limit_reached`), stream
+  closes by reason, seq gaps (log lines exist: `event stream opened/closed`, `event seq gap`).
+- **Phase 12 — event retention:** if events are ever deleted, never for unfinished jobs; a stream
+  resuming before a deleted range logs `event seq gap`.
 - **Dev note:** restarting the worker (including by live reload after a code change) interrupts
   running jobs; recovery retries them once their lease (60 s) expires.
 
 ## Commands
 
 ```powershell
-docker compose up --build -d                 # start; rebuild after dependency or alembic.ini changes
+docker compose up --build -d                 # start; rebuild after dependency, alembic.ini or Dockerfile changes
 docker compose run --rm api pytest           # all tests (unit + integration + e2e)
 docker compose run --rm api pytest -m "not e2e"   # skip the slower end-to-end tests
 docker compose logs -f worker dispatcher     # watch jobs being published and run
@@ -514,6 +576,8 @@ docker compose run --rm migrate alembic check   # do models and database agree?
 docker compose run --rm api alembic revision --autogenerate --rev-id 0005 -m "describe change"
 docker compose run --rm -v "${env:USERPROFILE}\tasklane-demo:/out" api python -m devtools.zip_samples /out   # sample ZIPs
 docker compose exec -T api python -m devtools.job_events <job_id>   # a job's event history
+docker compose exec -T api python -m devtools.sse_client http://localhost:8000/v1/jobs/<job_id>/events   # live stream
+curl.exe -N "http://127.0.0.1:8000/v1/jobs/<job_id>/events"         # raw SSE from Windows
 docker compose exec -T worker python -m devtools.ps                 # processes in the worker container
 ```
 
@@ -535,7 +599,7 @@ docker run --rm -v "${PWD}\backend:/src" -w /src python:3.13.18-slim sh -c "pip 
 | 5 | PDF workflow + retries | **Done** (awaiting developer verification) |
 | 6 | ZIP workflow + security | **Done** (awaiting developer verification) |
 | 7 | Leases, recovery, cancellation, manual retry | **Done** (awaiting developer verification) |
-| 8 | SSE with replay | Not started |
+| 8 | SSE with replay | **Done** (awaiting developer verification) |
 | 9 | Dashboard | Not started |
 | 10 | Observability | Not started |
 | 11 | Optional LLM provider | Not started |

@@ -31,8 +31,10 @@ COPY tests ./tests
 COPY devtools ./devtools
 RUN chown -R app:app /app
 USER app
+# --timeout-graceful-shutdown: open event streams (SSE) never finish on their own, so on stop or
+# reload uvicorn closes them after 5 s instead of waiting forever; clients reconnect and resume.
 EXPOSE 8000
-CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "app", "--no-access-log"]
+CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "app", "--no-access-log", "--timeout-graceful-shutdown", "5"]
 
 # ---- runtime: no dev tools, no reload ----
 FROM base AS runtime
@@ -43,4 +45,4 @@ COPY migrations ./migrations
 COPY app ./app
 USER app
 EXPOSE 8000
-CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--timeout-graceful-shutdown", "5"]
