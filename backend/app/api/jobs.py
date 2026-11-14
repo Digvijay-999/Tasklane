@@ -14,6 +14,7 @@ from app.api.schemas import (
     CreateJobRequest,
     ErrorResponse,
     JobDetailResponse,
+    JobListItemResponse,
     JobListResponse,
     JobResponse,
 )
@@ -108,7 +109,14 @@ def list_jobs(
         last = page.items[-1]
         next_cursor = encode_cursor(JobListPosition(last.created_at, last.id), fingerprint)
     return JobListResponse(
-        items=[JobResponse.model_validate(job) for job in page.items], next_cursor=next_cursor
+        items=[
+            JobListItemResponse(
+                **JobResponse.model_validate(job).model_dump(),
+                upload_filename=page.upload_filenames[job.upload_id],
+            )
+            for job in page.items
+        ],
+        next_cursor=next_cursor,
     )
 
 

@@ -48,7 +48,7 @@ The full product brief is in `PROJECT_BRIEF.md`; the planned design is in `docs/
 
 - **Backend versions approved** (see `docs/architecture.md` §7). In Phase 1, verify the latest
   stable compatible patch versions when generating `uv.lock` — do not rely on memory.
-- **Frontend versions are not locked yet.** React, Vite, and TypeScript are decided at the start of Phase 9.
+- ~~Frontend versions are not locked yet~~ (locked in Phase 9; see below).
 - **Tests run in Docker by default** (`docker compose run --rm api pytest`) against real PostgreSQL.
 - **Recovery loop runs inside the dispatcher process**, but the dispatcher loop and the recovery
   loop are separate modules with separate tests, so they can become separate services later.
@@ -477,6 +477,65 @@ Full reasoning (alternatives, plain language): `PHASE8_NOTES.md`.
   end by themselves. `devtools/sse_client.py` (stdlib only) and its parser `iter_sse` are reused
   by the tests. Pipeline fixtures are shared by assigning them from `test_e2e_pipeline`.
 
+## Decisions made (Phase 9)
+
+Full reasoning (alternatives, plain language): `PHASE9_NOTES.md`; visual design: `DESIGN.md`.
+
+- **Frontend versions** (npm, 2026-11-14): Node 24.21 (`node:24.21.0-bookworm-slim`), React
+  19.3.1, TypeScript 7.0.2 (type checking only), Vite 8.3.8 + plugin-react 6.3.0, React Router
+  8.5.1, TanStack Query 5.107.1, Base UI 1.9.0 (AlertDialog only), IBM Plex Sans/Mono via
+  @fontsource 5.3.0; Vitest 5.1.0, jsdom 31.0.1, Testing Library, Playwright 1.65.0. Exact
+  versions, committed `package-lock.json`, `npm ci`. Plain CSS with custom properties (no
+  Tailwind, no UI kit, no Markdown renderer, no icon library).
+- **Backend:** `GET /v1/overview` (`services/overview.py`, `db/repositories/overview.py`):
+  `GROUP BY status` (can use `ix_jobs_status_created_at_id`, tested), oldest queued =
+  `now() - updated_at` of queued jobs (DB clock), outbox pending (due *or* already failing: a
+  failed publish moves `available_at` forward) / scheduled / failing / max attempts / last error
+  type, oldest pending age (a failing row from `created_at`), Redis via `run_checks`. `GET /v1/meta` (in `api/overview.py`, settings + domain
+  only): workflows (extensions, content types, max bytes, signature hex, stages + weights from
+  `domain/workflows.py::WORKFLOW_STAGES`, kept equal to the worker's stages by a unit test),
+  filename limit, upload TTL, fault injection flag. Job list items gain `upload_filename` (one
+  PK query per page, `repositories/uploads.original_filenames`).
+- **Live stream** (`src/lib/live/jobEventStream.ts`, hook `useJobEvents`): history pages first,
+  then `EventSource(...?after=<last seq>)`; events kept in a Map by seq, only the contiguous
+  prefix shown; gap → history read from the last contiguous seq (deleted seqs counted, shown);
+  `stream.end` → `close()`; CONNECTING error → "reconnecting" (browser resumes with
+  Last-Event-ID); CLOSED → `fetch` probe: 503 `stream_limit_reached` → poll history every 2 s,
+  retry SSE every 30 s; 404 → stop; else reconnect with backoff 1–15 s. Job snapshot re-read
+  ~150 ms after non-progress events, at most once a second for progress, every 5 s while
+  unfinished.
+- **Timeline** (`timelineModel.ts`, pure, tested; `Timeline.tsx`): rows = attempts, columns =
+  stages from `/v1/meta`; cell states pending/running/done/reused/failed/interrupted/not_run;
+  sentences between rows (retry wait, lease expired, manual retry, lost message, cancel
+  requested); final outcome row. Container query → list under 720 px.
+- **States** are glyph shape + label + color (never color alone); the primary action is ink, not a
+  hue. Tokens in `src/styles/tokens.css` (light + full dark set; system preference, theme select
+  stored in localStorage, applied before paint by `public/theme.js`).
+- **Stale data:** React Query keeps the last data on failure; sections show "Not current: last
+  updated ..." and dim; a banner when `/health/ready` is unreachable or reports the database
+  down; stale checks never show green/red.
+- **New job:** limits from `/v1/meta` (extension, size, empty, filename rules, signature bytes);
+  XHR upload with progress and cancel; one `crypto.randomUUID()` key per submission
+  (fingerprint: workflow, file name/size/mtime, fault option), reused with the same upload after
+  a network error/5xx; `200 + Idempotent-Replayed: true` shown on the page with a link.
+- **Jobs list:** filters in the URL (`?workflow=&status=&status=`), `useInfiniteQuery` with
+  `next_cursor` ("Load more jobs"), refetch every 5 s.
+- **Security:** `SafeText` (`<bdi>` + visible `\uXXXX` for Cc/Cf/Zl/Zp/Cs); summary preview is
+  plain `<pre>` text (256 KiB cap); manifest parsed defensively (16 MiB cap); no
+  `dangerouslySetInnerHTML` (source-scan test). Production CSP as a build-only `<meta>` tag
+  (plus a `frame-ancestors 'none'` header in `vite preview`); `assetsInlineLimit: 0`; Base UI
+  `CSPProvider disableStyleElements`. Vite proxies `/v1` and `/health` (the API has no CORS).
+- **Compose `frontend`:** Vite on `127.0.0.1:5173` (listens on 0.0.0.0 inside the container),
+  `TASKLANE_API_URL=http://api:8000`, polling watcher (`TASKLANE_DEV_POLLING=true`), only
+  `src/`, `public/`, `index.html`, `vite.config.ts` mounted, runs as `node`. Locally:
+  `npm run dev` (127.0.0.1, proxy to 127.0.0.1:8000).
+- **Tests:** Vitest + Testing Library (`npm test`); Playwright (`npm run e2e`) against the real
+  stack through `vite preview` of a fresh build (`reuseExistingServer: false`), one worker, fails
+  on any console error (CSP violations); needs the demo settings (the global setup checks fault
+  injection). `npm run screenshots` regenerates `docs/screenshots/` (48 files: every screen and
+  state, light and dark; edge states via route mocking, recovery via a real
+  `docker compose kill worker`).
+
 ## Carry-forward requirements
 
 Items later phases must address. Remove an item only when it is implemented and tested.
@@ -498,12 +557,6 @@ Items later phases must address. Remove an item only when it is implemented and 
   heartbeat interval, or at its next write; never while the database is unreachable). Harmless
   while outputs are deterministic; a non-deterministic provider must write per-attempt files or
   otherwise prevent two attempts writing the same path.
-- **Phase 9 — rendering `summary.md`:** the PDF one contains PDF text as Markdown (only
-  Markdown punctuation is escaped); the repo one keeps summaries in fenced blocks. The dashboard
-  must not render either with raw HTML, active links or auto-linked bare URLs, and must escape
-  file paths from `manifest.json` (they are untrusted).
-- **Phase 9 — queue health:** surface dispatch failures (`dispatch_attempts`,
-  `last_dispatch_error`) and the oldest queued job's age.
 - **Phase 11 — repository text sent to a real provider:** indexed files can contain secrets
   (hidden files like `.env` are skipped, but a key in `config.py` is not). Add secret scanning or
   redaction before repo text leaves the machine, delimit repo text *and file paths* as data in
@@ -528,10 +581,6 @@ Items later phases must address. Remove an item only when it is implemented and 
 - **Phase 12 — work folders:** `work/{job_id}/` intermediate files are kept forever for now;
   retention must clean them (never for unfinished jobs), along with stray `.*.tmp` files left by
   a crash mid-write.
-- **Phase 9 — actions and leases:** use `can_cancel`/`can_retry` and their reasons from the job
-  detail (never derive them from `status`); show `lease.expired` ("worker not responding,
-  recovering") and attempt outcomes `lease_expired`/`cancelled` and triggers `recovery`/
-  `manual_retry`.
 - **Phase 10 — recovery metrics:** count expired leases, requeued lost messages, fenced workers,
   failed heartbeat beats and dead heartbeat threads (log lines exist: `expired lease recovered`,
   `lost message: job requeued`, `heartbeat could not renew the lease`, `heartbeat thread died`).
@@ -541,24 +590,23 @@ Items later phases must address. Remove an item only when it is implemented and 
 - **Phase 12 — long queues:** a job waiting in Redis longer than `LOST_MESSAGE_GRACE_SECONDS`
   gets a duplicate message every grace period (dropped by the claim). Revisit the default, or
   track queue depth, when measuring with many jobs.
-- **Phase 9 — untrusted text in the dashboard:** never auto-link bare URLs in file names,
-  archive paths, manifest entries or event payloads (render them as plain text; no
-  `dangerouslySetInnerHTML`, no linkify). Event payloads arrive as JSON from the stream; keep
-  them data.
-- **Phase 9 — CORS / dev proxy:** the API sends no CORS headers. Use a Vite dev proxy
-  (`/v1` → `http://127.0.0.1:8000`) so the page and the API share an origin (EventSource and
-  `fetch` then need no CORS); if CORS is added instead, allow only the Vite dev origin, and
-  remember EventSource can't send custom headers.
-- **Phase 9 — EventSource usage:** listen with `addEventListener(<event type>)` (events are
-  named; `onmessage` never fires); remember the last `seq` and reconnect with `?after=<seq>`
-  after a page reload; close on `stream.end`; on `error` with `readyState === CLOSED` (the
-  server answered 503/404) reconnect yourself with backoff and `?after=`; order by `seq`, never
-  `created_at`; de-duplicate by `seq` if combining history and stream. `docs/api.md` has an
-  example.
 - **Phase 10 — stream metrics:** open streams, streams refused (`stream_limit_reached`), stream
   closes by reason, seq gaps (log lines exist: `event stream opened/closed`, `event seq gap`).
 - **Phase 12 — event retention:** if events are ever deleted, never for unfinished jobs; a stream
   resuming before a deleted range logs `event seq gap`.
+- **All later phases — dashboard rules:** render every upload-derived string with `SafeText`
+  (never `dangerouslySetInnerHTML`, never linkify); keep Cancel/Retry driven only by
+  `can_cancel`/`can_retry`; new event types need no client change (gaps trigger a history read)
+  but should get a timeline treatment in `timelineModel.ts`; anything new in the UI must keep the
+  build's CSP (no inline scripts/styles, no other origins, no `data:` assets).
+- **Phase 10 — dashboard metrics:** when `/metrics` exists, the Overview may show only numbers it
+  provides (no invented rates); stream reconnects and polling fallbacks happen in the browser and
+  are not visible to the server.
+- **Phase 11 — real summaries in the UI:** an LLM summary is untrusted text like a PDF's; the
+  summary preview stays plain text. Show provider/model from `manifest.json` if useful.
+- **Phase 12 — e2e data:** Playwright e2e and screenshot runs create jobs in the development
+  database (and the screenshot run kills the worker once). Consider a separate demo database or a
+  cleanup step once retention exists.
 - **Dev note:** restarting the worker (including by live reload after a code change) interrupts
   running jobs; recovery retries them once their lease (60 s) expires.
 
@@ -579,6 +627,11 @@ docker compose exec -T api python -m devtools.job_events <job_id>   # a job's ev
 docker compose exec -T api python -m devtools.sse_client http://localhost:8000/v1/jobs/<job_id>/events   # live stream
 curl.exe -N "http://127.0.0.1:8000/v1/jobs/<job_id>/events"         # raw SSE from Windows
 docker compose exec -T worker python -m devtools.ps                 # processes in the worker container
+# Dashboard: http://127.0.0.1:5173 (compose). From frontend/ on Windows with Node 24:
+npm ci; npm test; npm run typecheck                                 # unit/component tests, types
+npm run e2e                                                         # Playwright, real stack + demo settings
+npm run screenshots                                                 # regenerate docs/screenshots
+docker compose up --build -d frontend                               # after changing frontend/package.json
 ```
 
 Regenerate `backend/uv.lock` after editing dependencies (runs uv in a throwaway container):
@@ -600,7 +653,7 @@ docker run --rm -v "${PWD}\backend:/src" -w /src python:3.13.18-slim sh -c "pip 
 | 6 | ZIP workflow + security | **Done** (awaiting developer verification) |
 | 7 | Leases, recovery, cancellation, manual retry | **Done** (awaiting developer verification) |
 | 8 | SSE with replay | **Done** (awaiting developer verification) |
-| 9 | Dashboard | Not started |
+| 9 | Dashboard | **Done** (awaiting developer verification) |
 | 10 | Observability | Not started |
 | 11 | Optional LLM provider | Not started |
 | 12 | Hardening, docs, demo | Not started |

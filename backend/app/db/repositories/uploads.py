@@ -80,3 +80,13 @@ def lock_upload_for_job(session: Session, upload_id: uuid.UUID) -> UploadForJob 
     if row is None:
         return None
     return UploadForJob(upload=row.Upload, expired=bool(row.expired))
+
+
+def original_filenames(session: Session, upload_ids: list[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Display filenames for a page of jobs, in one query (primary-key lookups)."""
+    if not upload_ids:
+        return {}
+    rows = session.execute(
+        select(Upload.id, Upload.original_filename).where(Upload.id.in_(upload_ids))
+    )
+    return {upload_id: filename for upload_id, filename in rows}

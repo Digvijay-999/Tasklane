@@ -65,6 +65,7 @@ class CreateJobResult:
 class JobPage:
     items: list[Job]
     has_more: bool
+    upload_filenames: dict[uuid.UUID, str]  # display name of each item's upload, by upload id
 
 
 @dataclass(frozen=True)
@@ -168,7 +169,11 @@ class JobService:
                 after=after,
                 limit=limit + 1,  # one extra row tells us whether another page exists
             )
-        return JobPage(items=rows[:limit], has_more=len(rows) > limit)
+            items = rows[:limit]
+            filenames = upload_rows.original_filenames(
+                session, list({job.upload_id for job in items})
+            )
+        return JobPage(items=items, has_more=len(rows) > limit, upload_filenames=filenames)
 
     def detail(self, job_id: uuid.UUID) -> JobDetail:
         with self.session_factory() as session:

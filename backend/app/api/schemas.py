@@ -187,8 +187,14 @@ class JobDetailResponse(JobResponse):
     )
 
 
+class JobListItemResponse(JobResponse):
+    upload_filename: str = Field(
+        description="The upload's original filename, for display only (untrusted text)."
+    )
+
+
 class JobListResponse(BaseModel):
-    items: list[JobResponse]
+    items: list[JobListItemResponse]
     next_cursor: str | None = Field(
         description="Pass as ?cursor= to get the next page; null when there are no more."
     )

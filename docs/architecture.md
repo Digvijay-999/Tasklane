@@ -11,7 +11,8 @@
 > retries with backoff, and resume from verified checkpoints (Phase 5), and the repository ZIP
 > workflow with its sandboxed ZIP reader, allowlist filtering, line chunking and three artifacts
 > (Phase 6), and the worker heartbeat thread, the recovery loop (expired leases, lost messages),
-> cancellation and manual retry (Phase 7). In the lifecycle below, steps 1–7 are implemented
+> cancellation and manual retry (Phase 7), the SSE event stream with replay (Phase 8), and the
+React dashboard with the overview and metadata routes (Phase 9). In the lifecycle below, steps 1–7 are implemented
 > (step 5 runs the real stages of both workflows), and step 8 is planned. The HTTP API is documented in [api.md](api.md);
 > delivery guarantees in [reliability.md](reliability.md); the threat model for untrusted
 > uploads in [security.md](security.md).
@@ -30,7 +31,7 @@ idempotent, repeat-safe stages*, so that a duplicate or interrupted run converge
 
 | Component | Responsibility | Node.js analogy |
 |---|---|---|
-| **Dashboard** (React + TS + Vite) | Upload files, submit jobs, show history, detail, live events, queue health | A React SPA |
+| **Dashboard** (React + TS + Vite; implemented in Phase 9) | Upload files, submit jobs, show history, detail, the live timeline, queue health. Talks to the API only over HTTP, through the Vite proxy (one origin) | A React SPA |
 | **API** (FastAPI) | Validate requests, store uploads, create jobs, serve state, stream events (SSE) | Express app |
 | **PostgreSQL** | Source of truth for uploads, jobs, attempts, events, artifacts, outbox | Like MongoDB here, but relational with transactions and constraints |
 | **Outbox dispatcher** | Reads committed outbox rows and publishes Celery tasks | A small polling loop process |
@@ -221,8 +222,12 @@ backend/
     observability/  # logging, tracing, metrics
   migrations/       # Alembic
   tests/            # unit/, integration/, e2e/
-frontend/
-  src/features/jobs/  src/features/dashboard/  src/lib/api/  src/components/
+frontend/           # (implemented in Phase 9)
+  src/lib/api/        # typed fetch client, XHR upload with progress
+  src/lib/live/       # the event stream: history + EventSource + gap fill + polling fallback
+  src/features/       # dashboard/ (Overview), jobs/ (history, new job, detail, timeline)
+  src/components/     # shell, status glyphs, SafeText (untrusted text), dialog
+  e2e/                # Playwright: real-stack scenarios and the screenshot run
 compose.yaml
 .env.example
 docs/  architecture.md  api.md  reliability.md  security.md
@@ -230,8 +235,12 @@ docs/  architecture.md  api.md  reliability.md  security.md
 
 ## 7. Versions
 
-**Frontend versions (React, TypeScript, Vite) are not locked yet.** They are decided at the start
-of Phase 9.
+Frontend versions were locked in Phase 9 (checked against npm on 2026-11-14; reasons for each
+library in `PHASE9_NOTES.md`): Node 24 LTS (`node:24.21.0-bookworm-slim` in Docker), React
+19.3.1, TypeScript 7.0.2, Vite 8.3.8 (@vitejs/plugin-react 6.3.0), React Router 8.5.1, TanStack
+Query 5.107.1, Base UI 1.9.0, IBM Plex Sans (variable) and IBM Plex Mono via @fontsource 5.3.0;
+tests: Vitest 5.1.0, jsdom 31.0.1, Testing Library (react 16.3.3, dom 10.4.2, user-event 14.6.10,
+jest-dom 7.0.1), Playwright 1.65.0.
 
 Locked in Phase 1 (checked against PyPI and Docker Hub on 2026-11-02):
 
@@ -250,8 +259,8 @@ Locked in Phase 1 (checked against PyPI and Docker Hub on 2026-11-02):
 | Redis server | 7.4.12 (`redis:7.4.12-alpine`) | |
 | pytest / httpx / ruff | 9.2.0 / 0.28.1 / 0.17.3 | Development only |
 | Alembic | 1.20.1 | Added in Phase 2 (checked against PyPI on 2026-11-02) |
-| Node | 24 LTS (tentative) | Confirmed in Phase 9 |
-| React / TypeScript / Vite | Decided in Phase 9 | Not locked yet |
+| Node | 24.21.0 (`node:24.21.0-bookworm-slim`) | Locked in Phase 9 |
+| React / TypeScript / Vite | 19.3.1 / 7.0.2 / 8.3.8 | Locked in Phase 9 (full list above) |
 
 Celery moved from the originally approved 5.5 line to 5.6 in Phase 4 (5.5 had no release since
 June 2025, and its kombu capped the Redis client at 5.2.1). Celery 5.6 sets no upper bound on
@@ -285,7 +294,7 @@ specific tags.
 | 6 | ZIP workflow + security | Path traversal, symlinks, zip bombs, file-count limits, file filtering, manifest + JSONL. Done: six stages, sandboxed ZIP reader shared with the PDF sandbox, allowlist filtering with skip reasons, line chunking, `summary.md` / `chunks.jsonl` / `manifest.json`, [security.md](security.md) |
 | 7 | Leases, recovery, cancellation, manual retry | Done: heartbeat thread, recovery loop (expired leases, lost messages), cooperative cancellation at stage boundaries, `POST /cancel`, `POST /retry`, parent-death signal for parser children; see `PHASE7_NOTES.md` |
 | 8 | SSE with replay | Done: one loop for replay and live (`Last-Event-ID` or `?after=`), `stream.end`, keepalives, stream limit and lifetime, write timeout, paginated event history, `devtools.sse_client`; see `PHASE8_NOTES.md` |
-| 9 | Dashboard | Overview, new job, job detail, live events |
+| 9 | Dashboard | Done: Overview, New job (XHR upload progress, limits from `GET /v1/meta`, idempotent retry), Jobs (URL filters, cursor paging), Job detail (live attempt × stage timeline, event history, attempts, artifacts, manifest viewer, server-driven Cancel/Retry); `GET /v1/overview`; Vite dev proxy; CSP; Playwright e2e and screenshots; see `DESIGN.md`, `PHASE9_NOTES.md` |
 | 10 | Observability | OpenTelemetry traces/metrics, `/metrics`, no job IDs as metric labels |
 | 11 | Optional LLM provider | OpenAI-compatible adapter behind config; timeouts; usage recording |
 | 12 | Hardening, docs, demo | E2E tests, retention/cleanup command, measured timings, failure demo |
@@ -311,6 +320,12 @@ specific tags.
 - Names from inside an uploaded ZIP are data, never filesystem paths: extracted bytes go into one
   generated file (`work/{job_id}/files.bin`) at recorded offsets (Phase 6; see
   `PHASE6_NOTES.md`).
+
+- The dashboard keeps no state of its own about jobs: it shows the API's job snapshot and derives
+  the timeline from the stored events (ordered by `seq`), re-reading the job after events and
+  after Cancel/Retry (never updating optimistically). The browser talks to one origin (the Vite
+  dev/preview server proxies `/v1` and `/health`), so the API sends no CORS headers (Phase 9; see
+  `PHASE9_NOTES.md`).
 
 ## 10. Open questions
 

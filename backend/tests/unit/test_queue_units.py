@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from app.config import Settings
 from app.domain.dispatch import DISPATCH_BACKOFF_MAX_SECONDS, dispatch_backoff_seconds
 from app.domain.enums import WorkflowType
+from app.domain.workflows import WORKFLOW_STAGES
 from app.queue.celery_app import CELERY_TASK_NAMES, RUN_JOB_TASK, create_celery_app
 from app.workflows.registry import stages_for
 from tests.dummy_stage import DummyStage
@@ -49,6 +50,10 @@ def test_workflow_stages(unit_settings):
     from app.queue.worker_process import workflow_config
 
     config = workflow_config(unit_settings)
+    # GET /v1/meta publishes WORKFLOW_STAGES; it must match what the worker really runs.
+    for workflow_type in WorkflowType:
+        stages = stages_for(workflow_type, config)
+        assert [(s.name, s.weight) for s in stages] == list(WORKFLOW_STAGES[workflow_type])
     assert [s.name for s in stages_for(WorkflowType.PDF_INGEST, config)] == [
         "validate_pdf",
         "extract_text",

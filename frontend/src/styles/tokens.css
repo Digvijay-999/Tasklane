@@ -1,0 +1,109 @@
+/* Design tokens (DESIGN.md §3). Light is the default; dark is a full, separately chosen set,
+   applied by the system setting unless the user picked a theme (data-theme on <html>). */
+
+:root {
+  color-scheme: light;
+  --bg: #ffffff;
+  --bg-subtle: #f4f4f5;
+  --bg-hover: #ececee;
+  --border: #e3e3e6;
+  --border-strong: #c9c9cf;
+  --text: #17171a;
+  --text-muted: #575761;
+  --text-faint: #6e6e79;
+  --ink: #17171a;
+  --ink-contrast: #ffffff;
+
+  --state-queued: #5e6675;
+  --state-running: #1e5bd6;
+  --state-retry_wait: #985700;
+  --state-cancel_requested: #a3238f;
+  --state-succeeded: #17784c;
+  --state-failed: #c42b30;
+  --state-cancelled: #6b5e54;
+
+  --font-sans: 'IBM Plex Sans Variable', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'Cascadia Mono', Consolas, monospace;
+
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 28px;
+  --leading-xs: 16px;
+  --leading-sm: 18px;
+  --leading-md: 20px;
+  --leading-lg: 24px;
+  --leading-xl: 28px;
+  --leading-2xl: 32px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  --radius-0: 0;
+  --radius-1: 2px;
+  --radius-2: 4px;
+  --radius-3: 8px;
+
+  --row-height: 36px;
+  --shadow-dialog: 0 8px 24px rgb(0 0 0 / 0.18);
+  --z-sticky: 10;
+  --z-banner: 20;
+  --z-dialog: 30;
+  --duration-fast: 160ms;
+  --duration-move: 200ms;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+    --bg: #111214;
+    --bg-subtle: #1a1b1e;
+    --bg-hover: #222428;
+    --border: #2a2c31;
+    --border-strong: #3b3e45;
+    --text: #ededef;
+    --text-muted: #a6a8b0;
+    --text-faint: #8c8f98;
+    --ink: #ededef;
+    --ink-contrast: #111214;
+
+    --state-queued: #a0a8b8;
+    --state-running: #76a5ff;
+    --state-retry_wait: #e3a13b;
+    --state-cancel_requested: #e27bd2;
+    --state-succeeded: #4cc38a;
+    --state-failed: #ff7a75;
+    --state-cancelled: #bbaea2;
+    --shadow-dialog: 0 8px 24px rgb(0 0 0 / 0.5);
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #111214;
+  --bg-subtle: #1a1b1e;
+  --bg-hover: #222428;
+  --border: #2a2c31;
+  --border-strong: #3b3e45;
+  --text: #ededef;
+  --text-muted: #a6a8b0;
+  --text-faint: #8c8f98;
+  --ink: #ededef;
+  --ink-contrast: #111214;
+
+  --state-queued: #a0a8b8;
+  --state-running: #76a5ff;
+  --state-retry_wait: #e3a13b;
+  --state-cancel_requested: #e27bd2;
+  --state-succeeded: #4cc38a;
+  --state-failed: #ff7a75;
+  --state-cancelled: #bbaea2;
+  --shadow-dialog: 0 8px 24px rgb(0 0 0 / 0.5);
+}

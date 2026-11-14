@@ -1,6 +1,6 @@
 # Tasklane HTTP API
 
-> **Status (Phase 8):** the routes marked **implemented** below work. `pdf_ingest` and
+> **Status (Phase 9):** the routes marked **implemented** below work. `pdf_ingest` and
 > `repo_index` jobs really process their input (with the built-in **stub** summarizer, not an AI
 > model) and produce downloadable artifacts; see
 > [What a pdf_ingest job does](#what-a-pdf_ingest-job-does) and
@@ -10,7 +10,7 @@
 > lease expires; jobs can be cancelled and failed jobs retried by hand
 > ([cancel](#post-v1jobsjob_idcancel--implemented), [retry](#post-v1jobsjob_idretry--implemented)).
 > A job's events can be followed live, with replay after a dropped connection
-> ([Events](#events)).
+> ([Events](#events)). The dashboard reads [`GET /v1/overview` and `GET /v1/meta`](#dashboard-routes).
 > Routes marked **planned** don't exist yet.
 
 | Route | Status |
@@ -23,6 +23,7 @@
 | `POST /v1/jobs/{job_id}/cancel`, `POST /v1/jobs/{job_id}/retry` | implemented (Phase 7) |
 | `GET /v1/jobs/{job_id}/events` (SSE), `GET /v1/jobs/{job_id}/events/history` | implemented (Phase 8) |
 | `GET /v1/jobs/{job_id}/artifacts/{artifact_id}` | implemented (Phase 5) |
+| `GET /v1/overview`, `GET /v1/meta` | implemented (Phase 9) |
 | `GET /metrics` | planned (Phase 10) |
 
 Interactive docs generated from the code: http://127.0.0.1:8000/docs
@@ -283,7 +284,10 @@ curl.exe -s "$api/v1/jobs?limit=2&cursor=$($page.next_cursor)"
 ```
 
 **Response:** `{"items": [<job>, ...], "next_cursor": "..." | null}`. `next_cursor` is `null` on
-the last page.
+the last page. Each item is a [job object](#job-object) plus `upload_filename`: the upload's
+original filename, **for display only**. It is untrusted text (it came from the client): render it
+as text, never as markup or a link. A job's duration is `finished_at - started_at` (both are in
+every item; `started_at` is `null` until a worker first claims the job).
 
 **Why a cursor instead of page numbers:** with `?page=2` (offset paging), every job created
 between your requests pushes rows down a page, so you'd see some jobs twice and miss others, and
@@ -753,6 +757,68 @@ curl.exe -s "$api/v1/jobs/<job_id>/events/history?after=5&limit=5"
 `items` are in `seq` order. `next_after` is the `after` for the next page, or `null` when you
 have everything up to `last_seq` (the job's latest event when the page was read). Unknown job:
 `404 job_not_found`.
+
+## Dashboard routes
+
+### `GET /v1/overview` — implemented
+
+```powershell
+curl.exe -s "$api/v1/overview"
+```
+
+```json
+{
+  "counts": {"queued": 2, "running": 1, "retry_wait": 0, "cancel_requested": 0,
+             "succeeded": 121, "failed": 14, "cancelled": 4},
+  "total": 142,
+  "oldest_queued": {"job_id": "3f2a9c0e-...", "queued_seconds": 12.4},
+  "queue": {"broker": "ok", "pending_messages": 2, "scheduled_messages": 1,
+            "failing_messages": 0, "max_dispatch_attempts": 0, "last_dispatch_error": null,
+            "oldest_pending_seconds": 0.8},
+  "database_time": "2026-11-14T12:00:00.000000Z"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `counts` | Jobs per status; every status is present (zeros included). One `GROUP BY status`, which can use the index `ix_jobs_status_created_at_id` (its first column is `status`). |
+| `oldest_queued` | The job that has been `queued` longest, and for how long: `now() - updated_at` by the **database** clock (a queued job's `updated_at` is when it entered `queued`: created, or reopened by a manual retry). `null` when nothing is queued. |
+| `queue.broker` | `ok` or `unavailable`: whether Redis answered PING within `DEPENDENCY_TIMEOUT_SECONDS` (as in `/health/ready`). Redis being down is reported here, not as an error. |
+| `queue.pending_messages` | Unpublished outbox messages that are due, or whose publishing already failed (a failed publish moves `available_at` forward by the dispatcher's backoff, but the message is overdue). |
+| `queue.scheduled_messages` | Unpublished messages, never tried, with a later `available_at` (delayed retries). |
+| `queue.failing_messages`, `max_dispatch_attempts`, `last_dispatch_error` | Unpublished messages whose last publish failed, the most tries among them, and the error **type** (for example `ConnectionError`; never a message) of the most-retried one. |
+| `queue.oldest_pending_seconds` | How long the oldest pending message has waited to be published (a failing one counted from when it was written, so a long Redis outage shows its real length), or `null`. |
+| `database_time` | The database clock when this was read. |
+
+`503 service_unavailable` when PostgreSQL can't be reached: without it nothing current can be
+shown.
+
+### `GET /v1/meta` — implemented
+
+The rules the dashboard must not hardcode, read from the running server's settings:
+
+```json
+{
+  "workflows": [
+    {"workflow_type": "pdf_ingest", "upload_kind": "pdf", "extensions": [".pdf"],
+     "upload_content_type": "application/pdf", "accepted_content_types": ["application/pdf"],
+     "max_upload_bytes": 52428800, "signature_hex": "255044462d",
+     "stages": [{"name": "validate_pdf", "weight": 5}, {"name": "extract_text", "weight": 30},
+                {"name": "chunk_document", "weight": 5}, {"name": "summarize", "weight": 55},
+                {"name": "write_artifacts", "weight": 5}]},
+    {"workflow_type": "repo_index", "upload_kind": "zip", "...": "..."}
+  ],
+  "max_filename_length": 255,
+  "upload_ttl_hours": 24,
+  "fault_injection_enabled": false,
+  "max_fault_failures": 20
+}
+```
+
+`max_upload_bytes` follows `MAX_PDF_UPLOAD_BYTES` / `MAX_ZIP_UPLOAD_BYTES`; `stages` (with each
+stage's share of the progress bar) is the list the worker runs (a unit test keeps the two in
+sync); `signature_hex` is the bytes a file must start with. The server still checks everything
+itself: this only lets a client reject a bad file before uploading it.
 
 ## Health
 

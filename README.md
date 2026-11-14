@@ -5,7 +5,7 @@ processing jobs (PDF ingestion and repository ZIP indexing), with a focus on dur
 retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the goals and
 [docs/architecture.md](docs/architecture.md) for the planned design.
 
-## Current status: Phase 8 of 12
+## Current status: Phase 9 of 12
 
 **What works today:**
 
@@ -108,8 +108,42 @@ retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) fo
   See [docs/api.md](docs/api.md#events) and
   [docs/reliability.md](docs/reliability.md#event-replay-phase-8).
 
-**Not implemented yet:** the dashboard, metrics, and any real LLM provider.
-See the phase list in [CLAUDE.md](CLAUDE.md).
+- **Dashboard** (React, http://127.0.0.1:5173): an operations console for the API above. See
+  [Dashboard](#dashboard) below.
+- `GET /v1/overview` (job counts by state, oldest queued job's age by the database clock, Redis
+  and outbox health) and `GET /v1/meta` (upload limits, accepted types, stages per workflow, and
+  whether fault injection is on), for the dashboard.
+
+**Not implemented yet:** metrics and tracing (Phase 10), any real LLM provider (Phase 11),
+retention and cleanup (Phase 12). See the phase list in [CLAUDE.md](CLAUDE.md).
+
+## Dashboard
+
+`docker compose up --build -d` also starts the dashboard. Open **http://127.0.0.1:5173**.
+
+| Screen | What it answers |
+|---|---|
+| **Overview** | Is the system healthy? Jobs per state, Redis and dispatcher health, the oldest queued job's age, recent jobs. |
+| **Jobs** | Job history, filtered by workflow and state (the filters are in the URL, so a view can be shared or reloaded), newest first, with cursor paging. |
+| **New job** | Upload a PDF or repository ZIP with a progress bar and start a job. The file is checked against the server's limits first. Retrying after a network error reuses the same idempotency key, so it can't create a second job. |
+| **Job detail** | A live timeline (one row per attempt, one column per stage: retries, reused checkpoints, lost workers, cancellation), the error and what you can do about it, attempts, downloads, the repository manifest, and the full event history. Cancel and Retry follow the server's `can_cancel` / `can_retry` and show its reason when unavailable. |
+
+The page follows each job live over Server-Sent Events and resumes from the last event after a
+dropped connection or a page reload; when the server's stream limit is reached it polls instead,
+and it says which of these it is doing. When the API can't be reached, the last known data stays
+on screen marked as not current. Light and dark themes follow the system setting (or the theme
+menu). Design: [DESIGN.md](DESIGN.md); decisions: [PHASE9_NOTES.md](PHASE9_NOTES.md).
+
+| | |
+|---|---|
+| ![A job that failed once with an injected transient error and succeeded on its automatic retry, reusing three checkpoints](docs/screenshots/job-retried-fault-injection-light.png) | ![The same job in the dark theme](docs/screenshots/job-retried-fault-injection-dark.png) |
+| ![A worker killed mid-job: attempt 1 shows "Worker lost", recovery took the job back and attempt 2 succeeded](docs/screenshots/job-recovered-after-worker-kill-light.png) | ![A scanned PDF that failed with pdf_no_text, with Retry disabled and the reason shown](docs/screenshots/job-failed-scanned-pdf-dark.png) |
+| ![Overview: jobs per state, queue health and recent jobs](docs/screenshots/overview-light.png) | ![A repository ZIP job with its manifest: languages, skip reasons, indexed and skipped files](docs/screenshots/job-repo-manifest-dark.png) |
+
+Every screen and state, in both themes: [docs/screenshots/](docs/screenshots/).
+
+To run the dashboard on Windows instead of in Docker (Node 24): `npm ci` and `npm run dev` in
+`frontend/`. It proxies `/v1` to `http://127.0.0.1:8000` either way, so the API needs no CORS.
 
 ## Requirements
 
@@ -257,6 +291,10 @@ under `backend/app` changes (via `backend/devtools/reload.py`). A restart, like
 `docker compose stop worker`, lets a running job finish for up to 25 seconds; a job still running
 after that is interrupted; recovery retries it once its lease (60 s) has expired.
 
+The `frontend` container runs Vite with your local `frontend/src`, and it polls for changes
+for the same reason (`TASKLANE_DEV_POLLING=true`); the page updates when you save a file. Rebuild
+it after changing `frontend/package.json`: `docker compose up --build -d frontend`.
+
 Watch logs: `docker compose logs -f api worker dispatcher`
 
 ## Tests
@@ -274,9 +312,26 @@ docker compose run --rm api pytest -m integration   # integration tests only
 docker compose run --rm api ruff check app tests migrations devtools   # lint
 ```
 
+Dashboard tests run on Windows with Node 24, from `frontend/` (`npm ci` first):
+
+```powershell
+npm test               # unit and component tests (Vitest + Testing Library, no server needed)
+npm run typecheck      # TypeScript
+npx playwright install chromium   # once: the browser for the end-to-end tests
+npm run e2e            # Playwright against the real stack (needs the demo settings, see WALKTHROUGH_PHASE9.md)
+npm run screenshots    # regenerate docs/screenshots (real stack, light and dark)
+```
+
+The end-to-end tests build the dashboard and serve the production build (with its
+Content-Security-Policy) through `vite preview` on http://127.0.0.1:4173. They create jobs in
+your development database.
+
 ## Dependency pinning
 
 - Python dependencies are declared in `backend/pyproject.toml` and locked to exact versions in
   `backend/uv.lock` (like `package.json` + `package-lock.json`). Docker installs with
   `uv sync --frozen`, which fails if the lock file is out of date.
-- Docker images are pinned to specific tags in `compose.yaml` and `backend/Dockerfile`.
+- Docker images are pinned to specific tags in `compose.yaml`, `backend/Dockerfile` and
+  `frontend/Dockerfile` (`node:24.21.0-bookworm-slim`).
+- Dashboard dependencies are exact versions in `frontend/package.json`, locked in the committed
+  `frontend/package-lock.json`, and installed with `npm ci` (which fails if the two disagree).

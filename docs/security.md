@@ -137,6 +137,25 @@ Every skipped file is listed in `manifest.json` with its reason
 | Huge repositories run up summarization cost | At most `REPO_MAX_PROVIDER_CALLS` (1,000) calls, checked before the first one | `workflows/repo/stages.py` | `test_too_many_summarization_calls_fail_with_repo_too_large` |
 | Extracted data piling up on disk after failures | When `filter_files` fails permanently (`repo_no_sources`, `repo_too_large`), it deletes `files.bin` | `workflows/repo/stages.py` | `test_a_permanent_filter_failure_does_not_keep_the_extracted_files` |
 
+## The dashboard (Phase 9)
+
+Everything the dashboard shows from an upload (file names, paths from inside a ZIP, languages,
+summaries, event payloads) is untrusted text.
+
+| Risk | Defense | Enforced in | Tested by |
+|---|---|---|---|
+| Markup or script in a name (`<img src=x onerror=...>.pdf`) | React renders strings as text; `dangerouslySetInnerHTML` is never used (a test scans the source for it) | everywhere; `frontend/src/components/SafeText.tsx` | `SafeText.test.tsx` ("renders hostile file names as inert text", "never uses dangerouslySetInnerHTML") |
+| A name that becomes a link (`javascript:alert(1)`, `https://evil.example/x.pdf`) | No linkifying anywhere; the only links are the app's own routes and artifact downloads built from ids | `JobsTable.tsx`, `Manifest.tsx` | "keeps hostile names inert inside the jobs table" (every `href` is `/jobs/<id>`) |
+| Right-to-left overrides and invisible characters (`invoice‮gpj.pdf` showing as `.jpg`) | Each untrusted string is wrapped in `<bdi>` (direction isolated) and every control, format (bidi, zero-width) and separator character is shown as a visible `‮` token | `SafeText.tsx` | `SafeText.test.tsx` |
+| `summary.md` rendered as HTML/Markdown | Shown as plain preformatted text (no Markdown renderer at all), with the same escapes; downloads go through the artifact route, which sends `Content-Disposition: attachment` and `nosniff` | `JobDetailPage.tsx` (`SummaryPreview`) | e2e "a PDF job ... summary downloads" |
+| A malformed or hostile `manifest.json` | Parsed defensively (wrong types become empty values, never markup); capped at 16 MiB, previews at 256 KiB | `Manifest.tsx` (`parseRepoManifest`), `api.artifactText` | "reads a manifest defensively" |
+| Injected scripts or third-party requests | Production Content-Security-Policy: `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'` (plus `frame-ancestors 'none'` as a header from `vite preview`). No inline scripts (the theme script is a file), no `data:` assets, Base UI told not to inject `<style>` tags. Fonts are bundled; no CDN, no analytics | `frontend/vite.config.ts`, `index.html`, `main.tsx` | every Playwright e2e test runs against the production build and fails on any console error (CSP violations are reported there) |
+| Cross-origin access to the API | None needed: the page, `fetch` and `EventSource` all go to the Vite server, which proxies `/v1` and `/health`. The API sends no CORS headers | `vite.config.ts` | e2e (same origin) |
+| Exposure on the network | The dev server listens on 127.0.0.1 on Windows; in Docker it listens inside the container and Compose publishes it on `127.0.0.1:5173` only | `vite.config.ts`, `compose.yaml` | `docker compose ps` |
+
+The dev server (`npm run dev` / the `frontend` container) has no CSP: Vite's hot reload needs
+inline scripts. The CSP applies to the built files.
+
 ## Not covered (yet)
 
 - **Secrets inside indexed files.** A source file that contains an API key is indexed like any
@@ -145,7 +164,8 @@ Every skipped file is listed in `manifest.json` with its reason
 - **Disk use of successful jobs.** A succeeded job keeps `work/{job_id}/files.bin` (up to
   `ZIP_MAX_TOTAL_BYTES`), and one upload can feed many jobs. Retention is Phase 12.
 - **Bare-URL file names** (`www.example.com/x.md`) can become links in renderers that auto-link
-  (GitHub-flavoured Markdown); the dashboard (Phase 9) must not auto-link.
+  (GitHub-flavoured Markdown) when you open a downloaded `summary.md` elsewhere. The dashboard
+  never auto-links (see above).
 - **Authentication.** Anyone who can reach `127.0.0.1:8000` can upload.
 - **Malware.** Files are never executed, but they aren't scanned either; downloaded artifacts
   contain repository text.

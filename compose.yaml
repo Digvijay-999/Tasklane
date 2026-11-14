@@ -212,6 +212,29 @@ services:
     depends_on: *backend-depends
     restart: unless-stopped
 
+  # Dashboard dev server (Vite). The browser talks only to this origin; Vite forwards /v1 and
+  # /health to the api service, so the API needs no CORS headers. Open http://127.0.0.1:5173
+  frontend:
+    build: ./frontend
+    image: tasklane-frontend:dev
+    environment:
+      TASKLANE_API_URL: http://api:8000   # the proxy target, from inside the Compose network
+      TASKLANE_DEV_HOST: 0.0.0.0          # listen on the container's interface; the host port below is 127.0.0.1 only
+      # File-change events from Windows don't reach Linux containers, so Vite polls for changes.
+      TASKLANE_DEV_POLLING: ${TASKLANE_DEV_POLLING:-true}
+    ports:
+      - "127.0.0.1:${FRONTEND_HOST_PORT:-5173}:5173"
+    volumes:
+      # Only the source is mounted; node_modules stays the one built into the image (its native
+      # packages are Linux builds, unlike a node_modules installed on Windows).
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - ./frontend/index.html:/app/index.html
+      - ./frontend/vite.config.ts:/app/vite.config.ts
+    depends_on:
+      - api
+    restart: unless-stopped
+
 volumes:
   pgdata:
   storage:

@@ -37,7 +37,11 @@ function Show-History($id, $after = 0, $limit = 4) {
 }
 function Wait-Stage($id, $stage) {
     $deadline = (Get-Date).AddSeconds(60)
-    while ((Get-DemoJob $id).current_stage -ne $stage) { if ((Get-Date) -gt $deadline) { throw "no $stage" }; Start-Sleep -Milliseconds 200 }
+    while (($job = Get-DemoJob $id).current_stage -ne $stage) {
+        if ($job.status -in "succeeded", "failed", "cancelled") { throw "job already $($job.status) before reaching ${stage}: start a new job and wait in the same paste" }
+        if ((Get-Date) -gt $deadline) { throw "no $stage within 60 s (status $($job.status))" }
+        Start-Sleep -Milliseconds 200
+    }
 }
 function Reset-Demo {
     "STUB_DELAY_SECONDS", "SSE_KEEPALIVE_SECONDS", "SSE_MAX_STREAMS", "LEASE_SECONDS", "PROVIDER_TIMEOUT_SECONDS", "RECOVERY_INTERVAL_SECONDS", "RETRY_BASE_SECONDS", "ENABLE_FAULT_INJECTION" | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
@@ -308,20 +312,17 @@ Expected: `HTTP 200` (the job has finished by now, so this stream ends at once w
 
 ## (h) Kill the worker mid-job while streaming
 
-**19. Start a job and stream it in the background.**
+**19. Start a job, stream it in the background, and kill the worker process during the
+summarize stage** (`kill -9`: no clean shutdown). One paste: the whole job takes only about 9 s,
+and summarize runs from about 3 s to 9 s after the job is created, so a pause between creating the
+job and waiting for summarize would miss it.
 ```powershell
-$h = New-DemoJob "$demo\report.pdf"; $composeFile = "$repo\compose.yaml"; $hUrl = "http://localhost:8000/v1/jobs/$h/events"; $watch = Start-Job { docker compose -f $using:composeFile exec -T api python -m devtools.sse_client $using:hUrl }
-```
-Expected: no output (the stream is being collected in the background).
-
-**20. Kill the worker process during the summarize stage** (`kill -9`: no clean shutdown).
-```powershell
-Wait-Stage $h summarize; $p = (Get-DemoJob $h).lease.worker_id.Split(":")[-1]; dc exec -T worker sh -c "kill -9 $p"; "killed worker process $p during summarize"
+$h = New-DemoJob "$demo\report.pdf"; $composeFile = "$repo\compose.yaml"; $hUrl = "http://localhost:8000/v1/jobs/$h/events"; $watch = Start-Job { docker compose -f $using:composeFile exec -T api python -m devtools.sse_client $using:hUrl }; Wait-Stage $h summarize; $p = (Get-DemoJob $h).lease.worker_id.Split(":")[-1]; dc exec -T worker sh -c "kill -9 $p"; "killed worker process $p during summarize"
 ```
 Expected: `killed worker process 31 during summarize` (your number differs). Celery starts a
-replacement worker process by itself.
+replacement worker process by itself. The stream is being collected in the background.
 
-**21. Watch the stream** (what it printed so far, then live until `stream.end`). The lease
+**20. Watch the stream** (what it printed so far, then live until `stream.end`). The lease
 (10 s) runs out, recovery closes the attempt, and the job runs again.
 ```powershell
 Receive-Job $watch -Wait -AutoRemoveJob
@@ -350,7 +351,7 @@ success.
 
 ## Reset
 
-**22. Remove the demo settings and restart the backend with your normal `.env` values.**
+**21. Remove the demo settings and restart the backend with your normal `.env` values.**
 ```powershell
 Reset-Demo
 ```
@@ -358,3 +359,4 @@ Expected (among the lines): `Container tasklane-api-1  Recreated`, `...worker-1 
 `...dispatcher-1  Recreated`, then `Started` for each. Compose may also re-run the one-shot
 `migrate` service first (`migrate-1  Exited`); that is harmless. `$env:SSE_MAX_STREAMS` and the
 other demo variables are gone (`Get-ChildItem Env:SSE*` prints nothing).
+
