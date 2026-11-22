@@ -32,6 +32,7 @@ forever. Every stage therefore has its own time limit (parser deadlines, `stage_
 the Celery hard time limit kills the whole process as a last resort.
 """
 
+import contextvars
 import logging
 import threading
 import uuid
@@ -40,6 +41,8 @@ from datetime import timedelta
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.repositories import attempts as attempt_rows
+from app.observability.tracing import suppressed_db_spans
+from app.services.worker_presence import COUNTERS, WorkerCounters
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,7 @@ class Heartbeat:
         lease: timedelta,
         interval: float,
         log_extra: dict[str, object] | None = None,
+        counters: WorkerCounters = COUNTERS,
     ) -> None:
         self.session_factory = session_factory
         self.attempt_id = attempt_id
@@ -62,9 +66,13 @@ class Heartbeat:
         self.fenced = threading.Event()  # set once a renewal found the attempt closed
         self.died = False  # the thread ended because of an unexpected error
         self.beats = 0  # successful renewals (for tests and logs)
+        self.counters = counters
         self._stop = threading.Event()
+        # The thread runs in a copy of the creator's context: its log lines carry the attempt's
+        # trace id and log fields. Its renewals add no database spans (suppressed_db_spans).
+        context = contextvars.copy_context()
         self._thread = threading.Thread(
-            target=self._run, name=f"heartbeat-{attempt_id}", daemon=True
+            target=context.run, args=(self._run,), name=f"heartbeat-{attempt_id}", daemon=True
         )
 
     def start(self) -> "Heartbeat":
@@ -100,6 +108,7 @@ class Heartbeat:
                     return
         except BaseException:
             self.died = True
+            self.counters.add("heartbeat_thread_deaths")
             logger.exception(
                 "heartbeat thread died; the lease is no longer renewed in the background",
                 extra=self.log_extra,
@@ -109,9 +118,10 @@ class Heartbeat:
         """One renewal in its own short transaction. True = still ours (or unknown: the database
         couldn't be reached, try again next time); False = fenced out."""
         try:
-            with self.session_factory.begin() as session:
+            with suppressed_db_spans(), self.session_factory.begin() as session:
                 renewed = attempt_rows.renew_lease(session, self.attempt_id, self.lease)
         except Exception:
+            self.counters.add("heartbeat_failures")
             logger.warning(
                 "heartbeat could not renew the lease; will try again",
                 exc_info=True,

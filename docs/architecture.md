@@ -183,6 +183,10 @@ usage when the provider reports it), never the text itself. Migration `0004` add
 Column definitions are in `backend/app/db/models.py`; the reason for each constraint is in
 [reliability.md](reliability.md#database-constraints).
 
+Migration `0005` (Phase 10) added `jobs.traceparent` and `outbox.traceparent` (trace
+propagation), `job_attempts.queued_at` (queue wait) and `worker_heartbeats` (one row per worker
+process: last seen, stopped, and worker-only counters); see [observability.md](observability.md).
+
 Migration `0002` (Phase 3) made `uploads.sha256` and `uploads.size_bytes` nullable while an upload
 is `receiving` (required once `ready`), added `uploads.rejection_reason`, and added three indexes on
 `jobs` for newest-first keyset pagination: `(created_at DESC, id DESC)`, and the same prefixed by
@@ -259,6 +263,9 @@ Locked in Phase 1 (checked against PyPI and Docker Hub on 2026-11-02):
 | Redis server | 7.4.12 (`redis:7.4.12-alpine`) | |
 | pytest / httpx / ruff | 9.2.0 / 0.28.1 / 0.17.3 | Development only |
 | Alembic | 1.20.1 | Added in Phase 2 (checked against PyPI on 2026-11-02) |
+| OpenTelemetry API / SDK / OTLP-HTTP exporter | 1.45.2 | Added in Phase 10 (checked against PyPI on 2026-11-17); no instrumentation packages |
+| opentelemetry-exporter-prometheus | 0.66b2 (prometheus-client 0.26.0) | Added in Phase 10 |
+| Jaeger / Prometheus (optional profile) | `jaegertracing/jaeger:2.23.0` / `prom/prometheus:v3.16.0` | Added in Phase 10 |
 | Node | 24.21.0 (`node:24.21.0-bookworm-slim`) | Locked in Phase 9 |
 | React / TypeScript / Vite | 19.3.1 / 7.0.2 / 8.3.8 | Locked in Phase 9 (full list above) |
 
@@ -295,7 +302,7 @@ specific tags.
 | 7 | Leases, recovery, cancellation, manual retry | Done: heartbeat thread, recovery loop (expired leases, lost messages), cooperative cancellation at stage boundaries, `POST /cancel`, `POST /retry`, parent-death signal for parser children; see `PHASE7_NOTES.md` |
 | 8 | SSE with replay | Done: one loop for replay and live (`Last-Event-ID` or `?after=`), `stream.end`, keepalives, stream limit and lifetime, write timeout, paginated event history, `devtools.sse_client`; see `PHASE8_NOTES.md` |
 | 9 | Dashboard | Done: Overview, New job (XHR upload progress, limits from `GET /v1/meta`, idempotent retry), Jobs (URL filters, cursor paging), Job detail (live attempt × stage timeline, event history, attempts, artifacts, manifest viewer, server-driven Cancel/Retry); `GET /v1/overview`; Vite dev proxy; CSP; Playwright e2e and screenshots; see `DESIGN.md`, `PHASE9_NOTES.md` |
-| 10 | Observability | OpenTelemetry traces/metrics, `/metrics`, no job IDs as metric labels |
+| 10 | Observability | Done: one trace per job carried through `jobs.traceparent`, `outbox.traceparent` and a Celery header; spans for requests, dispatch, attempts, stages, provider calls, recovery, SSE streams and SQL; `GET /metrics` computed from the database (plus API-local stream metrics); `worker_heartbeats` presence table; trace ids and redaction in JSON logs; optional Jaeger + Prometheus profile; see [observability.md](observability.md), `PHASE10_NOTES.md` |
 | 11 | Optional LLM provider | OpenAI-compatible adapter behind config; timeouts; usage recording |
 | 12 | Hardening, docs, demo | E2E tests, retention/cleanup command, measured timings, failure demo |
 
@@ -314,6 +321,9 @@ specific tags.
 - Idempotency keys live as long as their job row (to be documented with the API in Phase 3).
 - Integration tests run against `<POSTGRES_DB>_test`, never the development database.
 - Local uploads and artifacts live under `storage/`, which is gitignored.
+- Metrics are computed from the database at scrape time (authoritative across forked and
+  recycled worker processes); traces are one per job, parent = the span that caused the work,
+  carried through the database and a Celery header (Phase 10; see `PHASE10_NOTES.md`).
 - The SSE stream is an async generator that polls the database with short reads (no
   LISTEN/NOTIFY, no thread per stream), and ends with `stream.end` when the job is finished
   (Phase 8; see `PHASE8_NOTES.md`).

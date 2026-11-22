@@ -289,6 +289,7 @@ class LostMessageJob:
     id: uuid.UUID
     status: JobStatus
     last_published_at: datetime | None
+    traceparent: str | None = None  # the job's trace (jobs.traceparent)
 
 
 def lock_next_lost_message_job(
@@ -305,6 +306,11 @@ def lock_next_lost_message_job(
     FOR UPDATE SKIP LOCKED, so concurrent recovery passes each take different jobs. Every change
     that could make a job stop matching (a claim, a cancel, a requeue) locks or updates the job
     row, so the check holds until the caller commits.
+
+    After the lock, the conditions are checked again in a new statement: the locking statement's
+    subqueries keep the snapshot from when it started, so a requeue committed by another pass
+    just before we got the lock (its new outbox row) is invisible to them (READ COMMITTED only
+    re-checks the locked `jobs` row itself).
     """
     outbox = OutboxMessage.__table__
     attempts = JobAttempt.__table__
@@ -321,16 +327,26 @@ def lock_next_lost_message_job(
             or_(outbox.c.published_at.is_(None), outbox.c.published_at > cutoff),
         ),
     ]
-    if skip:
-        conditions.append(jobs.c.id.not_in(list(skip)))
-    row = session.execute(
-        select(jobs.c.id, jobs.c.status, _last_published(outbox))
-        .where(*conditions)
-        .order_by(jobs.c.updated_at)
-        .limit(1)
-        .with_for_update(of=jobs, skip_locked=True)
-    ).one_or_none()
-    return LostMessageJob(row.id, JobStatus(row.status), row.last_published) if row else None
+    columns = (jobs.c.id, jobs.c.status, _last_published(outbox), jobs.c.traceparent)
+    skipped = list(skip)
+    while True:
+        candidate = session.execute(
+            select(jobs.c.id)
+            .where(*conditions, *([jobs.c.id.not_in(skipped)] if skipped else []))
+            .order_by(jobs.c.updated_at)
+            .limit(1)
+            .with_for_update(of=jobs, skip_locked=True)
+        ).scalar_one_or_none()
+        if candidate is None:
+            return None
+        row = session.execute(
+            select(*columns).where(jobs.c.id == candidate, *conditions)
+        ).one_or_none()
+        if row is not None:
+            return LostMessageJob(
+                row.id, JobStatus(row.status), row.last_published, row.traceparent
+            )
+        skipped.append(candidate)  # requeued by another pass meanwhile; we keep its lock, harmless
 
 
 def _last_published(outbox: Any) -> Any:

@@ -16,10 +16,11 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.orm import Session
 
-from app.db.models import JobAttempt
+from app.db.models import Job, JobAttempt
 from app.domain.enums import AttemptOutcome, AttemptTrigger
 
 attempts = JobAttempt.__table__
+jobs = Job.__table__
 
 
 def insert_attempt(
@@ -31,6 +32,7 @@ def insert_attempt(
     worker_id: str,
     task_id: str | None,
     lease: timedelta,
+    queued_at: datetime | None = None,
 ) -> uuid.UUID:
     """Open a new attempt with a lease measured from the database clock.
 
@@ -46,6 +48,7 @@ def insert_attempt(
             trigger=trigger.value,
             worker_id=worker_id,
             task_id=task_id,
+            queued_at=queued_at,
             started_at=func.now(),
             heartbeat_at=func.now(),
             lease_expires_at=func.now() + lease,
@@ -96,6 +99,7 @@ class ExpiredAttempt:
     worker_id: str
     heartbeat_at: datetime
     lease_expires_at: datetime
+    job_traceparent: str | None = None  # the job's trace, so recovery can continue it
 
 
 def lock_next_expired_attempt(
@@ -119,6 +123,9 @@ def lock_next_expired_attempt(
             attempts.c.worker_id,
             attempts.c.heartbeat_at,
             attempts.c.lease_expires_at,
+            # A scalar subquery, not a join: FOR UPDATE must lock only the attempt row here (the
+            # job row is locked later, in the attempt-then-job order every writer uses).
+            select(jobs.c.traceparent).where(jobs.c.id == attempts.c.job_id).scalar_subquery(),
         )
         .where(*conditions)
         .order_by(attempts.c.lease_expires_at)

@@ -34,7 +34,14 @@ def run_job(task: Task, job_id: Any) -> None:
         logger.warning("message with an invalid job_id dropped", extra={"task_id": task.request.id})
         return
     try:
-        get_execution_service().run(parsed, task_id=task.request.id)
+        # traceparent: the dispatcher's publish span (a custom message header), so the attempt
+        # continues the job's trace. Missing for messages sent outside the dispatcher.
+        traceparent = getattr(task.request, "traceparent", None)
+        get_execution_service().run(
+            parsed,
+            task_id=task.request.id,
+            traceparent=traceparent if isinstance(traceparent, str) else None,
+        )
     except DATABASE_UNAVAILABLE as exc:
         retries = task.request.retries or 0
         countdown = dispatch_backoff_seconds(retries + 1)

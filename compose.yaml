@@ -61,6 +61,14 @@ x-backend-env: &backend-env
   SSE_KEEPALIVE_SECONDS: ${SSE_KEEPALIVE_SECONDS:-15}
   SSE_RETRY_MILLISECONDS: ${SSE_RETRY_MILLISECONDS:-3000}
   SSE_WRITE_TIMEOUT_SECONDS: ${SSE_WRITE_TIMEOUT_SECONDS:-30}
+  # Observability (Phase 10). Telemetry is on with no exporter unless these are set; with the
+  # "observability" profile, set OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 and
+  # TRACE_VIEWER_URL=http://127.0.0.1:16686/trace/{trace_id} (docs/observability.md).
+  OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-false}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  OTEL_EXPORT_TIMEOUT_SECONDS: ${OTEL_EXPORT_TIMEOUT_SECONDS:-2}
+  TRACE_VIEWER_URL: ${TRACE_VIEWER_URL:-}
+  WORKER_PRESENCE_INTERVAL_SECONDS: ${WORKER_PRESENCE_INTERVAL_SECONDS:-5}
   # Development only, off unless set (a shell variable overrides .env for one session).
   ENABLE_FAULT_INJECTION: ${ENABLE_FAULT_INJECTION:-false}
   # Docker Desktop on Windows doesn't reliably forward file-change events from the Windows
@@ -235,7 +243,40 @@ services:
       - api
     restart: unless-stopped
 
+  # --- Optional local trace and metrics viewers (Phase 10) -------------------------------------
+  # Started only with the "observability" profile:
+  #   docker compose --profile observability up -d
+  # A plain `docker compose up` never starts them. Both keep data in memory / a throwaway volume.
+
+  # Jaeger (all-in-one, in-memory storage): receives traces over OTLP/HTTP on 4318 inside the
+  # Compose network (the backend sends to http://jaeger:4318) and shows them at
+  # http://127.0.0.1:16686. Only the UI port is published.
+  jaeger:
+    image: jaegertracing/jaeger:2.23.0
+    profiles: ["observability"]
+    ports:
+      - "127.0.0.1:${JAEGER_UI_HOST_PORT:-16686}:16686"
+    restart: unless-stopped
+
+  # Prometheus: scrapes the API's GET /metrics every 15 s (observability/prometheus.yml) and
+  # graphs it at http://127.0.0.1:9090.
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
+    depends_on:
+      - api
+    restart: unless-stopped
+
 volumes:
   pgdata:
   storage:
   redisdata:
+  promdata:

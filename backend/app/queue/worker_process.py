@@ -24,8 +24,10 @@ from sqlalchemy import Engine
 from app.config import Settings, get_settings
 from app.db.session import create_db_engine, create_session_factory
 from app.domain.retry import RetryPolicy
+from app.observability.tracing import configure_from_settings
 from app.providers.factory import create_provider
 from app.services.execution import JobExecutionService
+from app.services.worker_presence import WorkerPresence
 from app.storage.local import LocalStorage
 from app.workflows.pdf.chunking import ChunkingSettings
 from app.workflows.pdf.sandbox import ParserLimits
@@ -38,8 +40,8 @@ from app.workflows.repo.stages import RepoConfig
 logger = logging.getLogger(__name__)
 
 # Each worker process runs one task at a time (prefetch 1): one connection for the task's own
-# writes, one for its heartbeat thread, and one spare.
-WORKER_POOL_SIZE = 3
+# writes, one for its heartbeat thread, one for the presence thread, and one spare.
+WORKER_POOL_SIZE = 4
 # How often a waiting parser sandbox checks whether the worker was fenced out (a flag check, no
 # database): a fenced worker's parser is killed within about this long.
 FENCE_CHECK_SECONDS = 1.0
@@ -50,6 +52,7 @@ class _ProcessState:
     pid: int
     engine: Engine
     service: JobExecutionService
+    presence: WorkerPresence | None = None
 
 
 _state: _ProcessState | None = None
@@ -62,6 +65,34 @@ def worker_id() -> str:
 
 
 def get_execution_service() -> JobExecutionService:
+    return _get_state().service
+
+
+def start_telemetry() -> None:
+    """Install tracing in this (child) process: after the fork, so the span export thread
+    belongs to the process that creates the spans."""
+    configure_from_settings(get_settings(), "tasklane-worker")
+
+
+def start_presence() -> None:
+    """Start reporting this process as alive (worker_heartbeats) every few seconds."""
+    state = _get_state()
+    if state.presence is None:
+        state.presence = WorkerPresence(
+            create_session_factory(state.engine),
+            state.service.worker_id,
+            interval=get_settings().worker_presence_interval_seconds,
+        ).start()
+
+
+def stop_presence() -> None:
+    with _lock:
+        presence = _state.presence if _state is not None and _state.pid == os.getpid() else None
+    if presence is not None:
+        presence.stop()
+
+
+def _get_state() -> _ProcessState:
     global _state
     with _lock:
         if _state is not None and _state.pid != os.getpid():
@@ -70,7 +101,7 @@ def get_execution_service() -> JobExecutionService:
             _state = None
         if _state is None:
             _state = _create_state()
-        return _state.service
+        return _state
 
 
 def shutdown_worker_process() -> None:

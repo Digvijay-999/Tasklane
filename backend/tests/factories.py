@@ -19,6 +19,7 @@ from app.db.models import (
     ProviderCall,
     StageCheckpoint,
     Upload,
+    WorkerHeartbeat,
 )
 from app.domain.enums import (
     ArtifactType,
@@ -183,3 +184,9 @@ def make_checkpoint(session: Session, job: Job, **overrides: Any) -> StageCheckp
     }
     values.update(overrides)
     return _add(session, StageCheckpoint(**values))
+
+
+def make_worker_heartbeat(session: Session, **overrides: Any) -> WorkerHeartbeat:
+    values: dict[str, Any] = {"worker_id": f"worker@test:{uuid.uuid4().hex[:8]}"}
+    values.update(overrides)
+    return _add(session, WorkerHeartbeat(**values))

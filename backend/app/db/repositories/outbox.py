@@ -20,13 +20,18 @@ outbox = OutboxMessage.__table__
 
 
 def enqueue_run_job(
-    session: Session, job_id: uuid.UUID, *, available_at: datetime | None = None
+    session: Session,
+    job_id: uuid.UUID,
+    *,
+    available_at: datetime | None = None,
+    traceparent: str | None = None,
 ) -> int | None:
     """Add a `run_job` message for a job, unless one is already waiting to be published.
 
     Returns the new message id, or None if the job already had an unpublished message (the
     partial unique index uq_outbox_one_pending_per_job allows only one). Written in the caller's
-    transaction, so it commits together with the job change that caused it.
+    transaction, so it commits together with the job change that caused it. `traceparent`: the
+    span that enqueued it, continued by the dispatcher (docs/observability.md).
     """
     statement = (
         insert(outbox)
@@ -35,6 +40,7 @@ def enqueue_run_job(
             task_name=OutboxTask.RUN_JOB.value,
             payload={"job_id": str(job_id)},
             available_at=available_at if available_at is not None else func.now(),
+            traceparent=traceparent,
         )
         .on_conflict_do_nothing(
             index_elements=[outbox.c.job_id],
@@ -45,7 +51,9 @@ def enqueue_run_job(
     return session.execute(statement).scalar_one_or_none()
 
 
-def enqueue_retry(session: Session, job_id: uuid.UUID, *, available_at: datetime) -> int:
+def enqueue_retry(
+    session: Session, job_id: uuid.UUID, *, available_at: datetime, traceparent: str | None = None
+) -> int:
     """The message for an automatic retry, due at `available_at` (the job's retry_at).
 
     If the job already has an unpublished message (an odd case, e.g. one due earlier), that row is
@@ -57,12 +65,14 @@ def enqueue_retry(session: Session, job_id: uuid.UUID, *, available_at: datetime
         task_name=OutboxTask.RUN_JOB.value,
         payload={"job_id": str(job_id)},
         available_at=available_at,
+        traceparent=traceparent,
     )
     statement = statement.on_conflict_do_update(
         index_elements=[outbox.c.job_id],
         index_where=outbox.c.published_at.is_(None),
         set_={
-            "available_at": func.greatest(outbox.c.available_at, statement.excluded.available_at)
+            "available_at": func.greatest(outbox.c.available_at, statement.excluded.available_at),
+            "traceparent": func.coalesce(statement.excluded.traceparent, outbox.c.traceparent),
         },
     ).returning(outbox.c.id)
     return session.execute(statement).scalar_one()
@@ -84,6 +94,7 @@ class DueMessage:
     task_name: str
     payload: dict[str, Any]
     dispatch_attempts: int
+    traceparent: str | None = None
 
 
 def claim_due_messages(session: Session, limit: int) -> list[DueMessage]:
@@ -100,6 +111,7 @@ def claim_due_messages(session: Session, limit: int) -> list[DueMessage]:
             outbox.c.task_name,
             outbox.c.payload,
             outbox.c.dispatch_attempts,
+            outbox.c.traceparent,
         )
         .where(outbox.c.published_at.is_(None), outbox.c.available_at <= func.now())
         .order_by(outbox.c.available_at, outbox.c.id)

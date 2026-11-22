@@ -3,10 +3,10 @@ import logging
 
 import pytest
 
+from app.observability.http import _incoming_request_id
 from app.observability.logging import (
+    ContextFilter,
     JsonFormatter,
-    RequestIdFilter,
-    _incoming_request_id,
     configure_logging,
     request_id_var,
 )
@@ -69,7 +69,7 @@ def test_formatter_includes_request_id_from_context():
     record = logging.makeLogRecord({"name": "t", "levelname": "INFO", "msg": "hello"})
     token = request_id_var.set("ctx-42")
     try:
-        RequestIdFilter().filter(record)
+        ContextFilter().filter(record)
     finally:
         request_id_var.reset(token)
     line = json.loads(JsonFormatter().format(record))

@@ -26,6 +26,7 @@ from tests.factories import (
     make_outbox,
     make_provider_call,
     make_upload,
+    make_worker_heartbeat,
     utcnow,
 )
 
@@ -127,6 +128,10 @@ CASES: dict[str, Case] = {
     "ck_uploads_deleted_consistent": lambda s: make_upload(s, status=UploadStatus.DELETED),
     # jobs
     "pk_jobs": _duplicate_pk(make_job, lambda s, first: make_job(s, id=first.id)),
+    # worker_heartbeats (one row per worker process)
+    "pk_worker_heartbeats": _duplicate_pk(
+        make_worker_heartbeat, lambda s, first: make_worker_heartbeat(s, worker_id=first.worker_id)
+    ),
     "uq_jobs_idempotency_key": _duplicate_idempotency_key,
     "fk_jobs_upload_id_uploads": _delete_referenced_upload,
     "ck_jobs_status": lambda s: make_job(s, status="paused"),

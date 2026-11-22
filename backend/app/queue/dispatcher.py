@@ -42,11 +42,19 @@ from datetime import timedelta
 from typing import Protocol
 
 from celery import Celery
+from opentelemetry.trace import SpanKind
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.repositories import outbox as outbox_rows
 from app.db.repositories.outbox import DueMessage
 from app.domain.dispatch import dispatch_backoff_seconds
+from app.observability.logging import log_context
+from app.observability.tracing import (
+    context_from_traceparent,
+    current_traceparent,
+    set_error,
+    span,
+)
 from app.queue.celery_app import CELERY_TASK_NAMES
 
 # A fixed name: when run with `python -m`, __name__ would be "__main__".
@@ -65,13 +73,19 @@ class CeleryPublisher:
         self.queue = queue
 
     def publish(self, message: DueMessage) -> None:
+        headers: dict[str, object] = {"outbox_id": message.id}
+        # The current span is the dispatcher's publish span (a child of the span that wrote the
+        # outbox row); the worker continues it, so the attempt joins the job's trace.
+        traceparent = current_traceparent()
+        if traceparent:
+            headers["traceparent"] = traceparent
         self.celery_app.send_task(
             CELERY_TASK_NAMES[message.task_name],
             kwargs=dict(message.payload),
             queue=self.queue,
             # The dispatcher owns retries and backoff; don't let Celery block retrying.
             retry=False,
-            headers={"outbox_id": message.id},
+            headers=headers,
         )
 
 
@@ -103,7 +117,7 @@ class Dispatcher:
             published: list[int] = []
             for index, message in enumerate(due):
                 try:
-                    self.publisher.publish(message)
+                    self._publish(message)
                 except Exception as exc:
                     error_type = type(exc).__name__
                     # The broker is most likely down: the rest of the batch would fail the same
@@ -126,12 +140,34 @@ class Dispatcher:
                     )
                     return PassResult(len(published), len(due) - index, error_type)
                 published.append(message.id)
-                logger.info(
-                    "outbox message published",
-                    extra={"outbox_id": message.id, "job_id": str(message.job_id)},
-                )
             outbox_rows.mark_published(session, published)
         return PassResult(len(published), 0)
+
+    def _publish(self, message: DueMessage) -> None:
+        """Publish one message inside an `outbox.publish` span that continues the trace stored
+        with the row. Only rows actually being published get a span; an idle poll adds none."""
+        with (
+            span(
+                "outbox.publish",
+                kind=SpanKind.PRODUCER,
+                context=context_from_traceparent(message.traceparent),
+                attributes={
+                    "job_id": str(message.job_id),
+                    "messaging.system": "celery",
+                    "dispatch_attempt": message.dispatch_attempts + 1,
+                },
+            ) as publish_span,
+            log_context(job_id=str(message.job_id)),
+        ):
+            try:
+                self.publisher.publish(message)
+            except Exception as exc:
+                publish_span.set_attribute("error.type", type(exc).__name__)
+                publish_span.set_attribute("outcome", "failed")
+                set_error(publish_span)
+                raise
+            publish_span.set_attribute("outcome", "published")
+            logger.info("outbox message published", extra={"outbox_id": message.id})
 
 
 def run_forever(
@@ -168,11 +204,13 @@ def main() -> None:
     from app.db.session import create_db_engine, create_session_factory
     from app.domain.retry import RetryPolicy
     from app.observability.logging import configure_logging
+    from app.observability.tracing import configure_from_settings
     from app.queue import recovery
     from app.queue.celery_app import create_celery_app
 
     settings = get_settings()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, secrets=(settings.postgres_password.get_secret_value(),))
+    configure_from_settings(settings, "tasklane-dispatcher")
     engine = create_db_engine(
         # One connection per loop (dispatch, recovery), plus one spare.
         settings,

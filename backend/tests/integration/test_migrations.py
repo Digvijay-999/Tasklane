@@ -34,6 +34,7 @@ APP_TABLES = {
     "outbox",
     "provider_calls",
     "stage_checkpoints",
+    "worker_heartbeats",
 }
 
 

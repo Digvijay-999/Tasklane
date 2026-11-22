@@ -14,9 +14,18 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from opentelemetry.trace import SpanKind
+
 from app.domain.enums import ProviderCallPurpose
 from app.domain.errors import JobError
-from app.providers.base import Provider, ProviderCallRecord, ProviderError, SummarizeOptions
+from app.observability.tracing import set_error, span
+from app.providers.base import (
+    Provider,
+    ProviderCallRecord,
+    ProviderError,
+    SummarizeOptions,
+    SummaryResult,
+)
 from app.providers.faults import with_fault_injection
 from app.storage.workspace import JobWorkspace, sha256_file
 from app.workflows.base import ArtifactOutput, StageContext
@@ -130,11 +139,49 @@ class SummaryCaller:
             max_output_chars=max_chars,
             timeout_seconds=self.provider_timeout_seconds,
         )
+        # One CLIENT span per real provider call (cached chunk summaries make no call and get no
+        # span). Attributes: ids, provider, model, purpose, outcome; never the text.
+        with span(
+            "provider.summarize",
+            kind=SpanKind.CLIENT,
+            attributes={
+                "job_id": str(self.context.job.job_id),
+                "attempt_no": self.context.job.attempt_no,
+                "workflow_type": self.context.job.workflow_type,
+                "stage": getattr(self.context, "stage_name", None),
+                "provider": provider.name,
+                "model": provider.model,
+                "purpose": purpose.value,
+            },
+        ) as call_span:
+            try:
+                result = self._call(provider, text, purpose, chunk_id, options)
+            except Exception as exc:
+                error_class = exc.error_class if isinstance(exc, JobError) else "internal_error"
+                call_span.set_attribute("outcome", "failure")
+                set_error(call_span, error_class)
+                raise
+            call_span.set_attribute("outcome", "success")
+            if result.usage is not None:
+                for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    value = getattr(result.usage, name)
+                    if value is not None:
+                        call_span.set_attribute(f"usage.{name}", value)
+        return self._finish(result, text, purpose, chunk_id, max_chars, cache_path)
+
+    def _call(
+        self,
+        provider: Provider,
+        text: str,
+        purpose: ProviderCallPurpose,
+        chunk_id: str | None,
+        options: SummarizeOptions,
+    ) -> SummaryResult:
         started = time.perf_counter()
         try:
             # `text` is untrusted file content and is passed ONLY as the data argument; nothing
             # from it reaches `options` (see the provider contract in providers/base.py).
-            result = provider.summarize(text, options)
+            return provider.summarize(text, options)
         except Exception as exc:
             error_class = exc.error_class if isinstance(exc, ProviderError) else None
             self.context.record_provider_call(
@@ -154,6 +201,16 @@ class SummaryCaller:
                 # An expected provider failure: its class decides whether the job retries.
                 raise JobError(error_class) from exc
             raise
+
+    def _finish(
+        self,
+        result: SummaryResult,
+        text: str,
+        purpose: ProviderCallPurpose,
+        chunk_id: str | None,
+        max_chars: int,
+        cache_path: str | None,
+    ) -> str:
         # A provider may ignore max_output_chars; enforce it here, so every combine round really
         # shrinks the text (otherwise map-reduce could loop until the stage timeout).
         text_out = result.text[:max_chars]

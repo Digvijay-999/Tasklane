@@ -77,6 +77,7 @@ test('overview: empty, loading and API unreachable', async ({ page }) => {
     total: 0,
     oldest_queued: null,
     queue: { broker: 'ok', pending_messages: 0, scheduled_messages: 0, failing_messages: 0, max_dispatch_attempts: 0, last_dispatch_error: null, oldest_pending_seconds: null },
+    workers: { alive: 2, last_seen_seconds: 1 },
     database_time: new Date().toISOString(),
   };
   await page.route('**/v1/overview', (route) => route.fulfill(json(empty)));

@@ -536,6 +536,63 @@ Full reasoning (alternatives, plain language): `PHASE9_NOTES.md`; visual design:
   state, light and dark; edge states via route mocking, recovery via a real
   `docker compose kill worker`).
 
+## Decisions made (Phase 10)
+
+Full reasoning (alternatives, plain language): `PHASE10_NOTES.md`; reference:
+`docs/observability.md`.
+
+- **Packages** (PyPI 2026-11-17): `opentelemetry-api`/`-sdk`/`-exporter-otlp-proto-http` 1.45.2,
+  `opentelemetry-exporter-prometheus` 0.66b2 (prometheus-client 0.26.0). **No instrumentation
+  packages**: our own server span (`observability/http.py`), DB hooks (`observability/db.py`),
+  Celery header. **FastAPI 0.162's built-in telemetry is off** (`FastAPI(telemetry={...False})`):
+  it records `url.query` and continues incoming `traceparent`.
+- **One trace per job, parent = the span that caused the work** (not links):
+  `jobs.traceparent` = `job.create`; `outbox.traceparent` = enqueuing span (`job.create`,
+  failed `job.attempt`, `recovery.*`, `job.manual_retry`); dispatcher `outbox.publish` continues
+  it and sends header `traceparent`; worker `job.attempt` continues that. Recovery, manual retry
+  and cancel continue `jobs.traceparent`; retry/cancel link to the HTTP span. Incoming
+  `traceparent` headers ignored. `trace_id` in every job response (`domain/tracing.py`).
+- **Spans:** `<METHOD> <route>`, `job.create`, `job.manual_retry`, `job.cancel`, `sse.stream`
+  (one per connection, not current; polls run with `suppressed_db_spans()`), `outbox.publish`,
+  `job.attempt`, `stage <name>`, `provider.summarize`, `recovery.lease_expired`,
+  `recovery.lost_message`, `db <OP>` (only under a recording span; `db.statement` with
+  placeholders). `span()` never records exceptions (ERROR status + `error_class`). Health and
+  `/metrics` untraced; idle dispatch/recovery passes create no spans; heartbeat renewals no DB
+  spans.
+- **Span scan:** root conftest installs an in-memory exporter (`tests/telemetry.py`); every
+  test's spans are checked against an attribute allowlist + forbidden fragments; e2e processes
+  write `TELEMETRY_SPAN_FILE` (JSON lines), scanned at pipeline teardown. A new attribute must be
+  added to `ALLOWED_SPAN_ATTRIBUTES` and documented.
+- **Metrics split:** job/attempt/stage/provider/outbox/worker metrics are **computed from the
+  database at scrape time** (`services/metrics.py`, `db/repositories/metrics.py`, one read-only
+  repeatable-read transaction, 5 s statement timeout); only SSE metrics are API-local
+  OpenTelemetry instruments (`observability/metrics.py`, Prometheus reader, `target_info` off,
+  `otel_scope_*` labels stripped, only `tasklane_*` rendered). Content type
+  `text/plain; version=0.0.4`. Labels: `workflow_type`, `status`, `stage`, `error_class`,
+  `provider`, `model`, `outcome` only (`ALLOWED_LABELS`, tested).
+- **Migration 0005:** `jobs.traceparent`, `outbox.traceparent`, `job_attempts.queued_at` (=
+  `retry_at` for retry_wait, else `updated_at`; queue wait = `started_at - queued_at`),
+  `worker_heartbeats` (PK `worker_id`, `last_seen_at`, `stopped_at`, counters
+  `fenced_attempts`, `heartbeat_failures`, `heartbeat_thread_deaths`).
+- **Worker presence:** each Celery child starts `WorkerPresence` at `worker_process_init`
+  (every `WORKER_PRESENCE_INTERVAL_SECONDS`=5), marks stopped at `worker_process_shutdown`;
+  alive = not stopped and seen within 3 intervals. `GET /v1/overview` `workers {alive,
+  last_seen_seconds}`; dashboard "No worker is running". Worker pool size 4. Worker-only counters
+  (`services/worker_presence.COUNTERS`) are saved in the row. Telemetry is configured in each
+  child (after the fork).
+- **Logs:** `ContextFilter` adds `request_id`, `trace_id`, `span_id` and `log_context(...)`
+  fields (job_id, attempt_no, worker_id); the heartbeat thread runs in a copy of the attempt's
+  context. **Redaction** (`observability/redaction.py`) on message, extras (recursive,
+  sensitive keys masked whole) and tracebacks; literal secrets = DB password + env vars with
+  sensitive names (8+ chars). OpenTelemetry SDK log lines: one per minute per message.
+- **Export:** default no exporter; `OTEL_EXPORTER_OTLP_ENDPOINT` (traces only, OTLP/HTTP,
+  batch, `OTEL_EXPORT_TIMEOUT_SECONDS`=2), `TRACE_VIEWER_URL` (`{trace_id}` template, in
+  `/v1/meta`), `OTEL_SDK_DISABLED`. Compose profile `observability`: `jaegertracing/jaeger:2.23.0`
+  (UI 127.0.0.1:16686, OTLP 4318 internal) + `prom/prometheus:v3.16.0` (127.0.0.1:9090,
+  `observability/prometheus.yml`, volume `promdata`).
+- **Dashboard:** job detail "Trace id" with copy button and "Open trace" (http(s) only,
+  `features/jobs/trace.ts`); Overview "Workers" fact and a notice when none is alive.
+
 ## Carry-forward requirements
 
 Items later phases must address. Remove an item only when it is implemented and tested.
@@ -573,25 +630,21 @@ Items later phases must address. Remove an item only when it is implemented and 
   before checking `ZIP_MAX_ENTRIES` (a ZIP with millions of entries is stopped by the sandbox's
   memory/time limits as `zip_too_complex`, not `zip_too_many_files`). An end-of-central-directory
   pre-check would give the clearer error.
-- **Phase 10/11 — log redaction:** worker failure logs include the full exception text (by
-  design: details stay out of the database). Add redaction before real providers and API keys
-  are involved.
+- **Phase 11 — redaction with real keys:** the redaction layer masks env vars with sensitive
+  names and known key formats; a provider key read from somewhere else must be passed to
+  `register_secret`. Never auto-instrument the provider's HTTP client (request bodies hold
+  document text); set `usage.*` attributes on `provider.summarize` when the provider reports them.
 - **Phase 12 — uploads:** clean up interrupted uploads (`receiving` rows and their files), and make
   retention never delete files of uploads referenced by unfinished jobs.
 - **Phase 12 — work folders:** `work/{job_id}/` intermediate files are kept forever for now;
   retention must clean them (never for unfinished jobs), along with stray `.*.tmp` files left by
   a crash mid-write.
-- **Phase 10 — recovery metrics:** count expired leases, requeued lost messages, fenced workers,
-  failed heartbeat beats and dead heartbeat threads (log lines exist: `expired lease recovered`,
-  `lost message: job requeued`, `heartbeat could not renew the lease`, `heartbeat thread died`).
 - **Phase 12 — vanished worker hosts:** a worker machine that disappears mid-transaction keeps
   its row lock until Postgres's TCP keepalive gives up (~2 h); SKIP LOCKED recovery skips that
   job meanwhile. Consider `idle_in_transaction_session_timeout` on worker connections.
 - **Phase 12 — long queues:** a job waiting in Redis longer than `LOST_MESSAGE_GRACE_SECONDS`
   gets a duplicate message every grace period (dropped by the claim). Revisit the default, or
   track queue depth, when measuring with many jobs.
-- **Phase 10 — stream metrics:** open streams, streams refused (`stream_limit_reached`), stream
-  closes by reason, seq gaps (log lines exist: `event stream opened/closed`, `event seq gap`).
 - **Phase 12 — event retention:** if events are ever deleted, never for unfinished jobs; a stream
   resuming before a deleted range logs `event seq gap`.
 - **All later phases — dashboard rules:** render every upload-derived string with `SafeText`
@@ -599,9 +652,15 @@ Items later phases must address. Remove an item only when it is implemented and 
   `can_cancel`/`can_retry`; new event types need no client change (gaps trigger a history read)
   but should get a timeline treatment in `timelineModel.ts`; anything new in the UI must keep the
   build's CSP (no inline scripts/styles, no other origins, no `data:` assets).
-- **Phase 10 — dashboard metrics:** when `/metrics` exists, the Overview may show only numbers it
-  provides (no invented rates); stream reconnects and polling fallbacks happen in the browser and
-  are not visible to the server.
+- **All later phases — telemetry rules:** new span attributes go into `ALLOWED_SPAN_ATTRIBUTES`
+  (tests/telemetry.py) and docs/observability.md; never record exceptions on spans; metric labels
+  only from `ALLOWED_LABELS`; new background loops must not create spans per poll; a new worker
+  child resource must stay within the pool (4).
+- **Phase 12 — retention vs metrics:** `/metrics` counters are totals over existing rows, so
+  deleting jobs/events/provider calls lowers them (a counter reset); delete old
+  `worker_heartbeats` rows (one per worker process ever started) the same way. The scrape scans
+  `job_attempts`, `job_events` and `provider_calls`: measure it with many jobs and add a partial
+  index on `job_events(event_type)` if needed. Jobs created before Phase 10 have no trace.
 - **Phase 11 — real summaries in the UI:** an LLM summary is untrusted text like a PDF's; the
   summary preview stays plain text. Show provider/model from `manifest.json` if useful.
 - **Phase 12 — e2e data:** Playwright e2e and screenshot runs create jobs in the development
@@ -632,6 +691,10 @@ npm ci; npm test; npm run typecheck                                 # unit/compo
 npm run e2e                                                         # Playwright, real stack + demo settings
 npm run screenshots                                                 # regenerate docs/screenshots
 docker compose up --build -d frontend                               # after changing frontend/package.json
+curl.exe -s http://127.0.0.1:8000/metrics                          # Prometheus metrics
+$env:OTEL_EXPORTER_OTLP_ENDPOINT="http://jaeger:4318"; $env:TRACE_VIEWER_URL="http://127.0.0.1:16686/trace/{trace_id}"
+docker compose --profile observability up -d                        # + Jaeger :16686, Prometheus :9090
+docker compose logs --no-log-prefix api dispatcher worker | Select-String <trace_id>   # logs of one job
 ```
 
 Regenerate `backend/uv.lock` after editing dependencies (runs uv in a throwaway container):
@@ -654,7 +717,7 @@ docker run --rm -v "${PWD}\backend:/src" -w /src python:3.13.18-slim sh -c "pip 
 | 7 | Leases, recovery, cancellation, manual retry | **Done** (awaiting developer verification) |
 | 8 | SSE with replay | **Done** (awaiting developer verification) |
 | 9 | Dashboard | **Done** (awaiting developer verification) |
-| 10 | Observability | Not started |
+| 10 | Observability | **Done** (awaiting developer verification) |
 | 11 | Optional LLM provider | Not started |
 | 12 | Hardening, docs, demo | Not started |
 

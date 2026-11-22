@@ -12,15 +12,19 @@ from datetime import timedelta
 
 from fastapi import FastAPI
 
-from app.api import events, health, jobs, overview, uploads
+from app.api import events, health, jobs, metrics, overview, uploads
 from app.api.errors import install_error_handling
 from app.config import Settings, get_settings
 from app.db.session import create_db_engine, create_session_factory
-from app.observability.logging import RequestContextMiddleware, configure_logging
+from app.observability.http import RequestContextMiddleware
+from app.observability.logging import configure_logging
+from app.observability.metrics import configure_metrics
+from app.observability.tracing import configure_from_settings
 from app.queue.broker import create_broker_client
 from app.services.artifacts import ArtifactService
 from app.services.events import EventService
 from app.services.jobs import JobService
+from app.services.metrics import DatabaseMetrics
 from app.services.overview import OverviewService
 from app.services.uploads import UploadLimits, UploadService
 from app.storage.local import LocalStorage
@@ -30,7 +34,9 @@ logger = logging.getLogger(__name__)
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, secrets=(settings.postgres_password.get_secret_value(),))
+    configure_from_settings(settings, "tasklane-api")  # once per process; later calls do nothing
+    configure_metrics()
 
     # "lifespan" runs once at startup (before `yield`) and once at shutdown (after it),
     # like setting things up before app.listen() in Express and closing them on SIGTERM.
@@ -59,7 +65,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         app.state.artifact_service = ArtifactService(session_factory, storage)
         app.state.event_service = EventService(session_factory)
-        app.state.overview_service = OverviewService(session_factory)
+        worker_stale_after = timedelta(seconds=settings.worker_presence_stale_seconds)
+        app.state.overview_service = OverviewService(
+            session_factory, worker_stale_after=worker_stale_after
+        )
+        app.state.database_metrics = DatabaseMetrics(
+            session_factory, worker_stale_after=worker_stale_after
+        )
         app.state.sse_slots = events.StreamSlots(settings.sse_max_streams)
         try:
             yield
@@ -69,7 +81,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.broker_client.close()
             app.state.db_engine.dispose()
 
-    app = FastAPI(title="Tasklane", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(
+        title="Tasklane",
+        version="0.1.0",
+        lifespan=lifespan,
+        # FastAPI's built-in OpenTelemetry support is off: it records the query string (upload
+        # file names travel in ?filename=), continues incoming traceparent headers, and would add
+        # a second server span. RequestContextMiddleware opens our own (PHASE10_NOTES.md).
+        telemetry={"tracing": False, "metrics": False, "logs": False, "operation_spans": False},
+    )
     app.state.settings = settings
 
     # Middleware order matters: the last one added runs first. Request IDs must be outermost so
@@ -86,4 +106,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(jobs.router)
     app.include_router(events.router)
     app.include_router(overview.router)
+    app.include_router(metrics.router)
     return app

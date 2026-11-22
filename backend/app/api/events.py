@@ -30,6 +30,8 @@ from starlette.types import Message, Receive, Scope, Send
 
 from app.api.jobs import parse_job_id
 from app.api.schemas import ErrorResponse, JobEventPageResponse, JobEventResponse
+from app.observability import metrics as stream_metrics
+from app.observability.tracing import suppressed_db_spans, tracer
 from app.services.errors import ErrorCode, ServiceError
 from app.services.events import EventService
 
@@ -126,14 +128,19 @@ async def event_frames(
     started = last_output = clock()
     sent, reason = 0, "disconnected"  # if cancelled: client gone, write timeout, or shutdown
     failures = 0  # consecutive failed reads (database unavailable)
+    # One span per stream connection (a child of the request's span), ended when the stream
+    # ends. It is deliberately NOT made current: the polls below would otherwise each add a
+    # database span. Polls run with database spans suppressed for the same reason.
+    stream_span = tracer().start_span(
+        "sse.stream", attributes={"job_id": str(job_id), "resume_after": cursor}
+    )
+    stream_metrics.SSE_STREAMS_OPEN.add(1)
     logger.info("event stream opened", extra={**log, "after": cursor})
     try:
         yield f"retry: {timings.retry_milliseconds}\n\n"
         while True:
             try:
-                page = await to_thread.run_sync(
-                    partial(service.page, job_id, after=cursor, limit=STREAM_BATCH)
-                )
+                page = await to_thread.run_sync(partial(_untraced_page, service, job_id, cursor))
             except ServiceError as exc:
                 if exc.code != ErrorCode.JOB_NOT_FOUND:
                     raise
@@ -159,6 +166,7 @@ async def event_frames(
             if page is not None:
                 for event in page.events:
                     if event.seq != cursor + 1:
+                        stream_metrics.SSE_SEQ_GAPS.add(1)
                         logger.error(
                             "event seq gap", extra={**log, "expected": cursor + 1, "got": event.seq}
                         )
@@ -170,6 +178,7 @@ async def event_frames(
                     if page.events:
                         continue  # more to replay: read the next batch at once
                     # The job says these exist but none were returned: log, never skip silently.
+                    stream_metrics.SSE_SEQ_GAPS.add(1)
                     logger.error(
                         "event seq gap",
                         extra={
@@ -197,10 +206,20 @@ async def event_frames(
             delay = timings.poll_seconds * 2 ** min(failures, 10)
             await sleep(min(delay, timings.keepalive_seconds))  # keepalive >= poll (Settings)
     finally:
+        stream_span.set_attributes({"events_sent": sent, "outcome": reason, "last_seq": cursor})
+        stream_span.end()
+        stream_metrics.SSE_STREAMS_OPEN.add(-1)
+        stream_metrics.SSE_STREAMS_CLOSED.add(1, {"outcome": reason})
+        stream_metrics.SSE_EVENTS_SENT.add(sent)
         logger.info(
             "event stream closed",
             extra={**log, "reason": reason, "events_sent": sent, "last_seq": cursor},
         )
+
+
+def _untraced_page(service: EventService, job_id: uuid.UUID, cursor: int) -> Any:
+    with suppressed_db_spans():
+        return service.page(job_id, after=cursor, limit=STREAM_BATCH)
 
 
 # --- Connection limit and response ----------------------------------------------------------------
@@ -306,6 +325,7 @@ async def stream_events(
 
     slots: StreamSlots = request.app.state.sse_slots
     if not slots.try_acquire():
+        stream_metrics.SSE_STREAMS_REFUSED.add(1)
         raise ServiceError(
             ErrorCode.STREAM_LIMIT_REACHED,
             "Too many event streams are open. Try again shortly, or poll the history route.",

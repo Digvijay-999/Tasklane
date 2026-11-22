@@ -1,0 +1,11 @@
+# Prometheus configuration for the optional "observability" Compose profile.
+# Scrapes the Tasklane API's GET /metrics (every metric: docs/observability.md).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: tasklane-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]

@@ -39,6 +39,8 @@ export interface Job {
   updated_at: string;
   started_at: string | null;
   finished_at: string | null;
+  /** OpenTelemetry trace id (32 hex digits) shared by every span of the job's story. */
+  trace_id: string | null;
 }
 
 export interface JobListItem extends Job {
@@ -127,6 +129,7 @@ export interface Overview {
     last_dispatch_error: string | null;
     oldest_pending_seconds: number | null;
   };
+  workers: { alive: number; last_seen_seconds: number | null };
   database_time: string;
 }
 
@@ -147,6 +150,8 @@ export interface Meta {
   upload_ttl_hours: number;
   fault_injection_enabled: boolean;
   max_fault_failures: number;
+  /** Link template with {trace_id}, or null when no trace viewer is configured. */
+  trace_viewer_url: string | null;
 }
 
 export interface Upload {

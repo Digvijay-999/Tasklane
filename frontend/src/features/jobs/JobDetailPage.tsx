@@ -7,7 +7,7 @@ import { ErrorNotice, ProgressBar, Skeleton, StaleNote } from '../../components/
 import { ApiError, api } from '../../lib/api/client';
 import { isTerminal, type Artifact, type JobDetail, type JobEvent } from '../../lib/api/types';
 import { durationBetween, formatBytes, formatDateTime, formatDuration, formatTime, percent } from '../../lib/format';
-import { useNow, useWorkflowMeta } from '../../lib/hooks';
+import { useMeta, useNow, useWorkflowMeta } from '../../lib/hooks';
 import { OUTCOME_LABEL, STATUS_LABEL, TRIGGER_LABEL, WORKFLOW_LABEL } from '../../lib/labels';
 import type { StreamMode } from '../../lib/live/jobEventStream';
 import { useJobEvents } from '../../lib/live/useJobEvents';
@@ -16,6 +16,7 @@ import { JobActions } from './JobActions';
 import { ManifestViewer } from './Manifest';
 import { Timeline } from './Timeline';
 import { buildTimeline } from './timelineModel';
+import { traceUrl } from './trace';
 
 const SUMMARY_PREVIEW_BYTES = 256 * 1024;
 
@@ -54,7 +55,7 @@ function LiveStatus({ mode, reconnects, missing, onRetry }: { mode: StreamMode; 
   );
 }
 
-function CopyId({ id }: { id: string }) {
+export function CopyId({ id, label = 'Copy id' }: { id: string; label?: string }) {
   const [copied, setCopied] = useState(false);
   return (
     <span className="copy-id">
@@ -71,8 +72,25 @@ function CopyId({ id }: { id: string }) {
           })
         }
       >
-        {copied ? 'Copied' : 'Copy id'}
+        {copied ? 'Copied' : label}
       </button>
+    </span>
+  );
+}
+
+/** The job's trace id, copyable, plus an "Open trace" link when the server names a viewer. */
+export function TraceFact({ traceId }: { traceId: string | null }) {
+  const meta = useMeta();
+  if (!traceId) return <span className="muted">Not recorded (tracing was off when the job was created)</span>;
+  const link = traceUrl(meta.data?.trace_viewer_url, traceId);
+  return (
+    <span className="copy-id">
+      <CopyId id={traceId} label="Copy trace id" />
+      {link && (
+        <a href={link} target="_blank" rel="noopener noreferrer" className="button" data-variant="ghost" data-size="small">
+          Open trace
+        </a>
+      )}
     </span>
   );
 }
@@ -358,6 +376,12 @@ function JobDetailView({ jobId }: { jobId: string }) {
           <dt>Job id</dt>
           <dd>
             <CopyId id={data.id} />
+          </dd>
+        </div>
+        <div className="fact-wide">
+          <dt>Trace id</dt>
+          <dd>
+            <TraceFact traceId={data.trace_id} />
           </dd>
         </div>
       </dl>

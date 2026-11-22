@@ -8,6 +8,7 @@ from sqlalchemy import URL, Engine, create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings
+from app.observability.db import instrument_engine
 
 APPLICATION_NAME = "tasklane-api"
 
@@ -31,8 +32,9 @@ def create_db_engine(
     max_overflow: int = 5,
     application_name: str = APPLICATION_NAME,
 ) -> Engine:
-    """Create the engine. No connection is opened until the first query."""
-    return create_engine(
+    """Create the engine. No connection is opened until the first query. Statements run inside a
+    traced operation get a database span (app/observability/db.py)."""
+    engine = create_engine(
         build_database_url(settings),
         # Before handing a pooled connection to our code, run a tiny "ping" on it. If the
         # connection is dead (e.g. Postgres was restarted), SQLAlchemy throws it away, invalidates
@@ -57,6 +59,8 @@ def create_db_engine(
             "tcp_user_timeout": 30_000,  # milliseconds
         },
     )
+    instrument_engine(engine)
+    return engine
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:

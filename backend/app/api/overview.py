@@ -61,11 +61,22 @@ class QueueResponse(BaseModel):
     )
 
 
+class WorkersResponse(BaseModel):
+    alive: int = Field(
+        description="Worker processes that reported within the last three presence intervals. "
+        "0 means no worker is running: queued jobs will wait."
+    )
+    last_seen_seconds: float | None = Field(
+        description="Seconds since any worker process last reported (null: never)."
+    )
+
+
 class OverviewResponse(BaseModel):
     counts: dict[str, int] = Field(description="Jobs per status; every status is present.")
     total: int
     oldest_queued: OldestQueuedResponse | None
     queue: QueueResponse
+    workers: WorkersResponse
     database_time: datetime
 
 
@@ -102,6 +113,9 @@ def overview(
             last_dispatch_error=outbox.last_dispatch_error,
             oldest_pending_seconds=outbox.oldest_pending_seconds,
         ),
+        workers=WorkersResponse(
+            alive=found.workers.alive, last_seen_seconds=found.workers.last_seen_seconds
+        ),
         database_time=found.database_time,
     )
 
@@ -131,6 +145,10 @@ class MetaResponse(BaseModel):
     upload_ttl_hours: int
     fault_injection_enabled: bool
     max_fault_failures: int
+    trace_viewer_url: str | None = Field(
+        description="Link template for a job's trace, with {trace_id} to replace "
+        "(TRACE_VIEWER_URL); null when no trace viewer is configured."
+    )
 
 
 @router.get("/meta", response_model=MetaResponse)
@@ -160,4 +178,5 @@ def meta(request: Request) -> MetaResponse:
         upload_ttl_hours=settings.upload_ttl_hours,
         fault_injection_enabled=settings.enable_fault_injection,
         max_fault_failures=MAX_ATTEMPTS_LIMIT,
+        trace_viewer_url=settings.trace_viewer_url,
     )

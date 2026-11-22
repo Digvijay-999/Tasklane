@@ -38,7 +38,7 @@ own glyph and a label, zeros in a lighter gray), a Queue section (Database, Redi
 Dispatcher reachable; oldest queued job; messages waiting; scheduled retries) and Recent jobs.
 In the top bar: "API ready". Screenshot: `overview-*.png`.
 
-**5. The empty state.** Your database already has jobs, and emptying it would delete them, so
+**5. The empty state.** Your database already has jobs, and emptying it would delete them, so   
 the empty Overview is shown in `overview-empty-*.png` (made with a mocked API by
 `npm run screenshots`): "No jobs yet. Upload a PDF or a repository ZIP to start one" and a
 **New job** button. You can see the same kind of empty state live in step 21.

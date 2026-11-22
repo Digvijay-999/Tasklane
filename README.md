@@ -114,8 +114,18 @@ retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) fo
   and outbox health) and `GET /v1/meta` (upload limits, accepted types, stages per workflow, and
   whether fault injection is on), for the dashboard.
 
-**Not implemented yet:** metrics and tracing (Phase 10), any real LLM provider (Phase 11),
-retention and cleanup (Phase 12). See the phase list in [CLAUDE.md](CLAUDE.md).
+- **Observability** (Phase 10): OpenTelemetry traces with **one trace per job**, from the request
+  that created it through the outbox, the dispatcher, every attempt, stage and provider call,
+  retries, recovery and manual retries (`trace_id` in `GET /v1/jobs/{id}` and on the job page).
+  `GET /metrics` (Prometheus text) with queue wait, workflow runtime and stage duration
+  histograms, job/retry/recovery/provider/dispatch counters, oldest queued age, outbox and
+  worker availability ("No worker is running" on the overview). JSON logs carry `trace_id`,
+  `job_id`, `attempt_no` and `worker_id`, and are redacted. Nothing is exported by default; an
+  optional Compose profile runs Jaeger and Prometheus locally. See
+  [docs/observability.md](docs/observability.md), including
+  [Investigating a failed job](docs/observability.md#investigating-a-failed-job).
+
+**Not implemented yet:** any real LLM provider (Phase 11), retention and cleanup (Phase 12). See the phase list in [CLAUDE.md](CLAUDE.md).
 
 ## Dashboard
 

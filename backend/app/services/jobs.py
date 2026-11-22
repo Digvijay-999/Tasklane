@@ -18,10 +18,12 @@ repeated cancel is a no-op, a repeated retry gets 409 `not_failed`.
 """
 
 import uuid
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from opentelemetry.trace import Span
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -40,6 +42,12 @@ from app.domain.state_machine import (
     cancel_decision,
 )
 from app.domain.uploads import required_upload_kind
+from app.observability.tracing import (
+    context_from_traceparent,
+    current_traceparent,
+    link_to_current,
+    span,
+)
 from app.providers.faults import OPTION_NAME as FAULT_INJECTION_OPTION
 from app.services.errors import ErrorCode, ServiceError
 
@@ -96,6 +104,17 @@ class JobService:
     # --- Create ----------------------------------------------------------------------------------
 
     def create(self, command: CreateJobCommand) -> CreateJobResult:
+        """Create the job inside a `job.create` span (a child of the HTTP request's span). Its
+        traceparent is stored on the job and its outbox row: the job's trace starts here."""
+        with span(
+            "job.create", attributes={"workflow_type": command.workflow_type.value}
+        ) as create_span:
+            result = self._create(command)
+            create_span.set_attribute("job_id", str(result.job.id))
+            create_span.set_attribute("outcome", "created" if result.created else "replayed")
+            return result
+
+    def _create(self, command: CreateJobCommand) -> CreateJobResult:
         key = _require_valid_key(command.idempotency_key)
         fingerprint = request_hash(command.sent_fields)
 
@@ -108,6 +127,7 @@ class JobService:
                 self._require_fault_injection_enabled()
             upload = _validated_upload(session, command)
             job_id = uuid.uuid4()
+            traceparent = current_traceparent()
             inserted = job_rows.insert_job_if_key_unused(
                 session,
                 {
@@ -119,6 +139,7 @@ class JobService:
                     "idempotency_key": key,
                     "request_hash": fingerprint,
                     "max_attempts": ATTEMPTS_PER_RUN,
+                    "traceparent": traceparent,
                 },
             )
             if inserted is None:
@@ -135,7 +156,7 @@ class JobService:
                 EventType.JOB_CREATED,
                 {"workflow_type": command.workflow_type.value, "upload_id": str(upload.id)},
             )
-            enqueue_run_job(session, job_id)
+            enqueue_run_job(session, job_id, traceparent=traceparent)
             job = session.get(Job, job_id)
             assert job is not None
         # Leaving the `begin()` block committed the job, event, and outbox row together.
@@ -220,15 +241,29 @@ def cancel_job(session: Session, job_id: uuid.UUID) -> bool:
     decision = cancel_decision(status)
     if decision.target is None:
         return False
-    payload: dict[str, Any] = {"requested_by": "api"}
-    if decision.target == JobStatus.CANCELLED:
-        payload["outbox_removed"] = delete_pending(session, job_id)
-    result = job_rows.transition_job(
-        session, job_id, from_status=status, to_status=decision.target, event_payload=payload
-    )
-    if not result.applied:  # impossible while we hold the row lock
-        raise RuntimeError(f"job {job_id} changed status while locked")
+    # In the job's trace (a child of the span that created the job), linked to the request.
+    with _job_span("job.cancel", job) as cancel_span:
+        payload: dict[str, Any] = {"requested_by": "api"}
+        if decision.target == JobStatus.CANCELLED:
+            payload["outbox_removed"] = delete_pending(session, job_id)
+        result = job_rows.transition_job(
+            session, job_id, from_status=status, to_status=decision.target, event_payload=payload
+        )
+        if not result.applied:  # impossible while we hold the row lock
+            raise RuntimeError(f"job {job_id} changed status while locked")
+        cancel_span.set_attribute("outcome", decision.target.value)
     return True
+
+
+def _job_span(name: str, job: Job) -> AbstractContextManager[Span]:
+    """A span in the job's own trace (parent: the span that created the job), linked to the
+    current span (the HTTP request), which lives in its own trace."""
+    return span(
+        name,
+        context=context_from_traceparent(job.traceparent),
+        links=link_to_current(),
+        attributes={"job_id": str(job.id), "workflow_type": job.workflow_type},
+    )
 
 
 def retry_job(session: Session, job_id: uuid.UUID) -> None:
@@ -250,6 +285,12 @@ def retry_job(session: Session, job_id: uuid.UUID) -> None:
             decision.message,
             {"reason": decision.reason.value, "status": job.status},
         )
+    with _job_span("job.manual_retry", job):
+        _reopen(session, job, decision.new_max_attempts)
+
+
+def _reopen(session: Session, job: Job, new_max_attempts: int | None) -> None:
+    job_id = job.id
     previous_error, attempt_count = job.error_class, job.attempt_count
     manual_retry_count = job.manual_retry_count + 1
     result = job_rows.transition_job(
@@ -258,7 +299,7 @@ def retry_job(session: Session, job_id: uuid.UUID) -> None:
         from_status=JobStatus.FAILED,
         to_status=JobStatus.QUEUED,
         changes={
-            "max_attempts": decision.new_max_attempts,
+            "max_attempts": new_max_attempts,
             "manual_retry_count": manual_retry_count,
         },
         event_payload={"manual_retry_count": manual_retry_count},
@@ -273,10 +314,10 @@ def retry_job(session: Session, job_id: uuid.UUID) -> None:
             "manual_retry_count": manual_retry_count,
             "previous_error_class": previous_error,
             "attempt_count": attempt_count,
-            "max_attempts": decision.new_max_attempts,
+            "max_attempts": new_max_attempts,
         },
     )
-    enqueue_run_job(session, job_id)
+    enqueue_run_job(session, job_id, traceparent=current_traceparent())
 
 
 def _require_valid_key(key: str | None) -> str:

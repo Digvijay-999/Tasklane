@@ -8,8 +8,21 @@ from fastapi.testclient import TestClient
 from app.api.health import get_broker_check, get_database_check
 from app.config import Settings
 from app.main import create_app
+from tests import telemetry
 
 TEST_PASSWORD = "unit-test-secret-p@ss:word"
+
+# Before any app is created: the test process's tracer provider, with an in-memory exporter.
+telemetry.install()
+
+
+@pytest.fixture(autouse=True)
+def spans_are_safe() -> Iterator[None]:
+    """Every span a test produces is scanned for forbidden attributes (tests/telemetry.py)."""
+    telemetry.SPANS.clear()
+    yield
+    problems = telemetry.span_problems(telemetry.captured())
+    assert problems == [], f"spans with forbidden attributes: {problems}"
 
 
 @pytest.fixture

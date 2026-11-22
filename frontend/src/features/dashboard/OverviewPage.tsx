@@ -45,7 +45,7 @@ function Queue({ overview, error }: { overview: Overview | undefined; error: unk
   if (!overview) {
     return (
       <dl className="facts facts-2" aria-busy="true">
-        {['Database', 'Redis broker', 'Dispatcher', 'Oldest queued job', 'Messages waiting', 'Scheduled retries'].map((label) => (
+        {['Database', 'Redis broker', 'Dispatcher', 'Workers', 'Oldest queued job', 'Messages waiting', 'Scheduled retries'].map((label) => (
           <div key={label}>
             <dt>{label}</dt>
             <dd>{error ? '—' : <Skeleton width={120} />}</dd>
@@ -124,6 +124,17 @@ function Queue({ overview, error }: { overview: Overview | undefined; error: unk
         <dt>Scheduled retries</dt>
         <dd className="num">{q.scheduled_messages}</dd>
       </div>
+      <div>
+        <dt>Workers</dt>
+        <dd>
+          <Check
+            ok={overview.workers.alive > 0}
+            okText={`${overview.workers.alive} ${overview.workers.alive === 1 ? 'worker process' : 'worker processes'} running`}
+            badText="No worker is running"
+            stale={stale}
+          />
+        </dd>
+      </div>
     </dl>
   );
 }
@@ -142,6 +153,17 @@ export function OverviewPage() {
       <div className="page-head">
         <h1>Overview</h1>
       </div>
+
+      {overview.data && !overview.isError && overview.data.workers.alive === 0 && (
+        <div className="notice" data-tone="failed" role="status">
+          <p>
+            <strong>No worker is running.</strong> Queued jobs wait until a worker starts
+            {overview.data.workers.last_seen_seconds !== null &&
+              ` (one was last seen ${formatDuration(overview.data.workers.last_seen_seconds * 1000)} ago)`}
+            .
+          </p>
+        </div>
+      )}
 
       {overview.isError && !overview.data && (
         <ErrorNotice error={overview.error} action={<p className="muted">The page keeps retrying every few seconds.</p>} />

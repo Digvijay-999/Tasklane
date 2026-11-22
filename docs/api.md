@@ -24,7 +24,7 @@
 | `GET /v1/jobs/{job_id}/events` (SSE), `GET /v1/jobs/{job_id}/events/history` | implemented (Phase 8) |
 | `GET /v1/jobs/{job_id}/artifacts/{artifact_id}` | implemented (Phase 5) |
 | `GET /v1/overview`, `GET /v1/meta` | implemented (Phase 9) |
-| `GET /metrics` | planned (Phase 10) |
+| `GET /metrics` (Prometheus text) | implemented (Phase 10); see [observability.md](observability.md#every-metric) |
 
 Interactive docs generated from the code: http://127.0.0.1:8000/docs
 
@@ -583,6 +583,7 @@ if they disagree. When the setting is on, the API and worker log a warning at st
 | `error_class`, `error_summary` | Safe description of the latest failure |
 | `last_event_seq` | Number of the job's latest event (see [Events](#events)) |
 | `created_at`, `updated_at`, `started_at`, `finished_at` | |
+| `trace_id` | The job's OpenTelemetry trace id (32 hex digits, Phase 10): every span of its story (the request that created it, each dispatch, attempt, stage and provider call, recovery and manual retries) shares it, and so does every log line written while working on it. `null` for jobs created while tracing was off. See [observability.md](observability.md#investigating-a-failed-job). |
 
 ## Events
 
@@ -775,6 +776,7 @@ curl.exe -s "$api/v1/overview"
   "queue": {"broker": "ok", "pending_messages": 2, "scheduled_messages": 1,
             "failing_messages": 0, "max_dispatch_attempts": 0, "last_dispatch_error": null,
             "oldest_pending_seconds": 0.8},
+  "workers": {"alive": 2, "last_seen_seconds": 1.3},
   "database_time": "2026-11-14T12:00:00.000000Z"
 }
 ```
@@ -788,6 +790,8 @@ curl.exe -s "$api/v1/overview"
 | `queue.scheduled_messages` | Unpublished messages, never tried, with a later `available_at` (delayed retries). |
 | `queue.failing_messages`, `max_dispatch_attempts`, `last_dispatch_error` | Unpublished messages whose last publish failed, the most tries among them, and the error **type** (for example `ConnectionError`; never a message) of the most-retried one. |
 | `queue.oldest_pending_seconds` | How long the oldest pending message has waited to be published (a failing one counted from when it was written, so a long Redis outage shows its real length), or `null`. |
+| `workers.alive` | Worker processes that reported within the last 15 s (three presence intervals, Phase 10). `0` means no worker is running: queued jobs wait. Read from the `worker_heartbeats` table, never from Celery over Redis. |
+| `workers.last_seen_seconds` | Seconds since any worker process last reported, or `null` if none ever did. |
 | `database_time` | The database clock when this was read. |
 
 `503 service_unavailable` when PostgreSQL can't be reached: without it nothing current can be
@@ -811,14 +815,31 @@ The rules the dashboard must not hardcode, read from the running server's settin
   "max_filename_length": 255,
   "upload_ttl_hours": 24,
   "fault_injection_enabled": false,
-  "max_fault_failures": 20
+  "max_fault_failures": 20,
+  "trace_viewer_url": "http://127.0.0.1:16686/trace/{trace_id}"
 }
 ```
+
+`trace_viewer_url` (Phase 10) is `TRACE_VIEWER_URL`: a link template for a job's trace, or `null`
+when no trace viewer is configured. The dashboard's "Open trace" link replaces `{trace_id}`.
 
 `max_upload_bytes` follows `MAX_PDF_UPLOAD_BYTES` / `MAX_ZIP_UPLOAD_BYTES`; `stages` (with each
 stage's share of the progress bar) is the list the worker runs (a unit test keeps the two in
 sync); `signature_hex` is the bytes a file must start with. The server still checks everything
 itself: this only lets a client reject a bad file before uploading it.
+
+## Metrics
+
+### `GET /metrics` — implemented (Phase 10)
+
+```powershell
+curl.exe -s "$api/metrics"
+```
+
+Prometheus text format (`text/plain; version=0.0.4`). Job, attempt, stage, provider, outbox and
+worker metrics are computed from the database on each request; event-stream metrics are counted
+in the API process. Labels are bounded enums only (never ids). Every metric, its type, unit and
+labels: [observability.md](observability.md#every-metric). Not traced, not in `/docs`.
 
 ## Health
 

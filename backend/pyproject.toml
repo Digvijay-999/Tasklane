@@ -19,6 +19,16 @@ dependencies = [
     # PDF parsing (pure Python, BSD-3). [crypto] adds `cryptography`, needed to open PDFs that
     # are encrypted with only an owner password (print/copy restrictions).
     "pypdf[crypto]>=6.21.4,<7",
+    # Observability (Phase 10). API = the calls our code makes (spans, meters); SDK = the
+    # implementation that records and exports them. Same release train, so pinned together.
+    "opentelemetry-api>=1.45.2,<1.46",
+    "opentelemetry-sdk>=1.45.2,<1.46",
+    # Optional trace export over OTLP/HTTP (protobuf). The HTTP variant avoids grpcio, a large
+    # native dependency; Jaeger and every collector accept OTLP/HTTP on port 4318.
+    "opentelemetry-exporter-otlp-proto-http>=1.45.2,<1.46",
+    # Exposes OpenTelemetry metric instruments in Prometheus text format (brings prometheus-client,
+    # which also renders the database-derived metrics on GET /metrics). Beta numbering (0.x b).
+    "opentelemetry-exporter-prometheus==0.66b2",
 ]
 
 [dependency-groups]

@@ -53,6 +53,8 @@ from app.domain.enums import AttemptOutcome, EventType, JobStatus
 from app.domain.errors import ERRORS, gave_up_summary
 from app.domain.retry import RetryPolicy
 from app.domain.state_machine import run_attempt_no, status_after_lease_expired
+from app.observability.logging import log_context
+from app.observability.tracing import context_from_traceparent, current_traceparent, span
 
 logger = logging.getLogger("tasklane.recovery")
 
@@ -94,7 +96,19 @@ class Recovery:
                     attempt = attempt_rows.lock_next_expired_attempt(session, skip=failed)
                     if attempt is None:
                         break
-                    self._expire(session, attempt)
+                    # A span per recovery action (never per pass), in the job's own trace.
+                    with (
+                        span(
+                            "recovery.lease_expired",
+                            context=context_from_traceparent(attempt.job_traceparent),
+                            attributes={
+                                "job_id": str(attempt.job_id),
+                                "attempt_no": attempt.attempt_no,
+                            },
+                        ) as action_span,
+                        log_context(job_id=str(attempt.job_id), attempt_no=attempt.attempt_no),
+                    ):
+                        action_span.set_attribute("outcome", self._expire(session, attempt))
             except Exception:
                 if attempt is None:
                     raise  # couldn't even look (database down): the loop backs off
@@ -109,7 +123,8 @@ class Recovery:
             handled += 1
         return handled
 
-    def _expire(self, session: Session, attempt: ExpiredAttempt) -> None:
+    def _expire(self, session: Session, attempt: ExpiredAttempt) -> str:
+        """Close the expired attempt and move the job on; returns the job's new status."""
         message = ERRORS[LEASE_EXPIRED].message
         # We hold the attempt's row lock, so it is still open: close_attempt can't miss.
         attempt_rows.close_attempt(
@@ -146,7 +161,7 @@ class Recovery:
                 "closed an expired attempt of a job that is not executing",
                 extra={**log, "job_status": status},
             )
-            return
+            return status.value
         attempt_count, max_attempts = job.attempt_count, job.max_attempts
         target = status_after_lease_expired(status, attempt_count, max_attempts)
         changes: dict[str, Any] = {}
@@ -182,8 +197,11 @@ class Recovery:
         if not result.applied:  # impossible while we hold the job lock; never half-recover
             raise RuntimeError(f"job {attempt.job_id} changed status while locked")
         if retry_at is not None:
-            enqueue_retry(session, attempt.job_id, available_at=retry_at)
+            enqueue_retry(
+                session, attempt.job_id, available_at=retry_at, traceparent=current_traceparent()
+            )
         logger.warning("expired lease recovered", extra={**log, "job_status": target})
+        return target.value
 
     # --- Lost messages -----------------------------------------------------------------------
 
@@ -198,7 +216,15 @@ class Recovery:
                     )
                     if job is None:
                         break
-                    self._requeue(session, job)
+                    with (
+                        span(
+                            "recovery.lost_message",
+                            context=context_from_traceparent(job.traceparent),
+                            attributes={"job_id": str(job.id), "outcome": "requeued"},
+                        ),
+                        log_context(job_id=str(job.id)),
+                    ):
+                        self._requeue(session, job)
             except Exception:
                 if job is None:
                     raise
@@ -216,7 +242,7 @@ class Recovery:
         return handled
 
     def _requeue(self, session: Session, job: LostMessageJob) -> None:
-        enqueue_run_job(session, job.id)
+        enqueue_run_job(session, job.id, traceparent=current_traceparent())
         job_rows.append_event(
             session,
             job.id,

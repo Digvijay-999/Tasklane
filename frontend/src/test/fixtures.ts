@@ -27,6 +27,7 @@ export const META: Meta = {
   upload_ttl_hours: 24,
   fault_injection_enabled: false,
   max_fault_failures: 20,
+  trace_viewer_url: null,
 };
 
 export function jobDetail(overrides: Partial<JobDetail> = {}): JobDetail {
@@ -51,6 +52,7 @@ export function jobDetail(overrides: Partial<JobDetail> = {}): JobDetail {
     updated_at: '2026-11-14T12:00:01Z',
     started_at: '2026-11-14T12:00:01Z',
     finished_at: null,
+    trace_id: '4bf92f3577b34da6a3ce929d0e0e4736',
     upload: { id: 'u-1', original_filename: 'report.pdf', kind: 'pdf', size_bytes: 10, sha256: null, status: 'ready' },
     attempts: [],
     artifacts: [],

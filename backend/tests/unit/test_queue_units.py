@@ -196,7 +196,7 @@ class FakeTask:
 
 def _service_raising(monkeypatch, exc):
     class Service:
-        def run(self, job_id, task_id=None):
+        def run(self, job_id, task_id=None, traceparent=None):
             raise exc
 
     import app.queue.worker_process as worker_process
@@ -320,3 +320,21 @@ def test_lost_message_grace_must_cover_a_few_recovery_passes(unit_settings):
     Settings(**{**values, "lost_message_grace_seconds": 10})
     with pytest.raises(ValidationError, match="LOST_MESSAGE_GRACE_SECONDS must be at least twice"):
         Settings(**{**values, "lost_message_grace_seconds": 9})
+
+
+def test_a_task_retry_keeps_the_trace_header():
+    """run_job retries itself while the database is down; the redelivered message must still
+    carry the dispatcher's traceparent, or the attempt would start a new trace."""
+    from celery import Celery
+    from celery.app.task import Context
+
+    app = Celery("t")
+
+    @app.task(bind=True)
+    def task(self):
+        return None
+
+    request = Context({"id": "1", "args": [], "kwargs": {}})
+    request.headers = {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01", "outbox_id": 5}
+    signature = task.signature_from_request(request, (), {})
+    assert signature.options["headers"]["traceparent"] == request.headers["traceparent"]

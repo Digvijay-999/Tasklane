@@ -146,6 +146,41 @@ class Settings(BaseSettings):
     # A client that can't accept a write for this long (not reading) is disconnected.
     sse_write_timeout_seconds: float = Field(default=30, ge=0.1, le=600)
 
+    # --- Observability (Phase 10) ---
+    # Telemetry is on by default with NO exporter: spans exist (trace ids in logs and the API)
+    # but nothing is sent anywhere. OTEL_SDK_DISABLED=true turns tracing off entirely.
+    otel_sdk_disabled: bool = False
+    # Base URL of an OTLP/HTTP receiver (e.g. http://jaeger:4318 with the Compose
+    # "observability" profile). Unset = no export. Traces only; metrics are pulled from /metrics.
+    otel_exporter_otlp_endpoint: str | None = None
+    # Each export attempt gives up after this long; exports run on a background thread.
+    otel_export_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    # Link template for the dashboard's "Open trace" button, containing {trace_id}, e.g.
+    # http://127.0.0.1:16686/trace/{trace_id}. Unset = the dashboard shows only the trace id.
+    trace_viewer_url: str | None = None
+    # Tests and debugging: also append every finished span to this file as JSON lines.
+    telemetry_span_file: Path | None = None
+    # Each worker process records that it is alive this often (worker_heartbeats table); it
+    # counts as not running after three missed intervals.
+    worker_presence_interval_seconds: float = Field(default=5, ge=0.5, le=60)
+
+    @model_validator(mode="after")
+    def _telemetry_urls(self) -> "Settings":
+        for name, value in (
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", self.otel_exporter_otlp_endpoint),
+            ("TRACE_VIEWER_URL", self.trace_viewer_url),
+        ):
+            if value is not None and not value.startswith(("http://", "https://")):
+                raise ValueError(f"{name} must start with http:// or https://")
+        if self.trace_viewer_url is not None and "{trace_id}" not in self.trace_viewer_url:
+            raise ValueError("TRACE_VIEWER_URL must contain {trace_id}")
+        return self
+
+    @property
+    def worker_presence_stale_seconds(self) -> float:
+        """A worker process that hasn't reported for this long is counted as not running."""
+        return self.worker_presence_interval_seconds * 3
+
     @model_validator(mode="after")
     def _sse_timings(self) -> "Settings":
         if self.sse_keepalive_seconds < self.sse_poll_seconds:

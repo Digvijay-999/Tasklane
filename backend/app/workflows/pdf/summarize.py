@@ -52,8 +52,7 @@ def summarize_document(
     settings: SummarySettings,
 ) -> DocumentSummary:
     sections = [
-        call(text, ProviderCallPurpose.CHUNK,
-             chunk_id, settings.chunk_max_chars)
+        call(text, ProviderCallPurpose.CHUNK, chunk_id, settings.chunk_max_chars)
         for chunk_id, text in chunk_ids_and_texts
     ]
     if len(sections) == 1:
@@ -71,15 +70,13 @@ def reduce_summaries(
     while True:
         rounds += 1
         outputs = [
-            call(batch, ProviderCallPurpose.COMBINE,
-                 None, settings.final_max_chars)
+            call(batch, ProviderCallPurpose.COMBINE, None, settings.final_max_chars)
             for batch in _batches(level, settings.combine_max_input_chars)
         ]
         if len(outputs) == 1:
             return outputs[0], rounds
         if len(outputs) >= len(level):  # a round must shrink the list, or this never ends
-            raise RuntimeError(
-                "combine round did not reduce the number of summaries")
+            raise RuntimeError("combine round did not reduce the number of summaries")
         level = outputs
 
 
@@ -106,8 +103,7 @@ def estimated_calls(chunk_count: int, settings: SummarySettings) -> int:
     """Rough number of provider calls, for progress reporting only."""
     if chunk_count <= 1:
         return chunk_count
-    per_batch = max(2, settings.combine_max_input_chars //
-                    (settings.chunk_max_chars + 1))
+    per_batch = max(2, settings.combine_max_input_chars // (settings.chunk_max_chars + 1))
     combines, items = 0, chunk_count
     while items > 1:
         items = -(-items // per_batch)
@@ -121,8 +117,7 @@ def reduce_calls_bound(items: int, item_max_chars: int, settings: SummarySetting
     every batch but the last, and later rounds combine summaries of at most final_max_chars."""
     calls = 0
     while items > 1:
-        per_batch = max(2, settings.combine_max_input_chars //
-                        (item_max_chars + 1))
+        per_batch = max(2, settings.combine_max_input_chars // (item_max_chars + 1))
         items = -(-items // per_batch)
         calls += items
         item_max_chars = settings.final_max_chars

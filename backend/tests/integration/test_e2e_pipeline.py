@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 from app.db.models import JobAttempt, JobEvent, OutboxMessage, ProviderCall
 from app.queue.celery_app import RUN_JOB_TASK, create_celery_app
 from devtools import pdf_samples, zip_samples
+from tests import telemetry
 from tests.integration.conftest import TEST_QUEUE
 from tests.samples import zip_bytes
 
@@ -87,6 +88,22 @@ class Pipeline:
         self.log_dir = log_dir
         self.processes: list[subprocess.Popen] = []
         self.worker_log = log_dir / "worker.log"
+        self.dispatcher_log = log_dir / "dispatcher.log"
+        # Every span the dispatcher and the worker processes finish (JSON lines).
+        self.span_file = Path(env["TELEMETRY_SPAN_FILE"])
+
+    def spans(self) -> list[dict]:
+        return telemetry.read_span_file(self.span_file)
+
+    def records(self, log: Path) -> list[dict]:
+        records = []
+        for line in self.read(log).splitlines():
+            if line.startswith("{"):
+                try:
+                    records.append(json.loads(line))
+                except ValueError:
+                    pass
+        return records
 
     def _start(self, args: list[str], log: Path) -> subprocess.Popen:
         process = subprocess.Popen(
@@ -125,7 +142,7 @@ class Pipeline:
             raise
 
     def start_dispatcher(self) -> None:
-        log = self.log_dir / "dispatcher.log"
+        log = self.dispatcher_log
         self._start(["python", "-m", "app.queue.dispatcher"], log)
         wait_until(lambda: "dispatcher started" in self.read(log), 30, "dispatcher started")
 
@@ -134,14 +151,7 @@ class Pipeline:
         return path.read_text(errors="replace") if path.exists() else ""
 
     def worker_records(self) -> list[dict]:
-        records = []
-        for line in self.read(self.worker_log).splitlines():
-            if line.startswith("{"):
-                try:
-                    records.append(json.loads(line))
-                except ValueError:
-                    pass
-        return records
+        return self.records(self.worker_log)
 
     def stop(self) -> None:
         for process in self.processes:
@@ -187,6 +197,7 @@ def start_pipeline(
             "ENABLE_FAULT_INJECTION": "true",
             "RETRY_BASE_SECONDS": str(E2E_RETRY_BASE_SECONDS),
             "RECOVERY_INTERVAL_SECONDS": "1",
+            "TELEMETRY_SPAN_FILE": str(tmp_path / "spans.jsonl"),
             **env_overrides,
         }
         pipeline = Pipeline(env, tmp_path)
@@ -199,6 +210,10 @@ def start_pipeline(
     yield start
     for pipeline in pipelines:
         pipeline.stop()
+    # Every span the real processes produced passes the same scan as the in-process ones.
+    for pipeline in pipelines:
+        problems = telemetry.span_problems(pipeline.spans())
+        assert problems == [], f"spans with forbidden attributes: {problems}"
 
 
 def submit_job(

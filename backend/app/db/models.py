@@ -39,6 +39,7 @@ from app.domain.enums import (
     WorkflowType,
 )
 from app.domain.state_machine import MAX_ATTEMPTS_LIMIT, TERMINAL_STATUSES
+from app.domain.tracing import trace_id_from_traceparent
 
 SHA256_PATTERN = "^[0-9a-f]{64}$"
 
@@ -134,6 +135,12 @@ class Job(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=now())
     started_at: Mapped[datetime | None]
     finished_at: Mapped[datetime | None]
+    # W3C traceparent of the span that created the job (migration 0005): the job's trace.
+    traceparent: Mapped[str | None]
+
+    @property
+    def trace_id(self) -> str | None:
+        return trace_id_from_traceparent(self.traceparent)
 
     __table_args__ = (
         # Idempotent submission: two requests with the same key can never both create a job.
@@ -214,6 +221,9 @@ class JobAttempt(Base):
     trigger: Mapped[str]
     worker_id: Mapped[str]
     task_id: Mapped[str | None]  # Celery message ID, for tracing
+    # When the job became claimable before this attempt (queued, or its retry came due);
+    # queue wait = started_at - queued_at (migration 0005; NULL for older attempts).
+    queued_at: Mapped[datetime | None]
     started_at: Mapped[datetime] = mapped_column(server_default=now())
     heartbeat_at: Mapped[datetime] = mapped_column(server_default=now())
     lease_expires_at: Mapped[datetime]
@@ -311,6 +321,8 @@ class OutboxMessage(Base):
     published_at: Mapped[datetime | None]
     dispatch_attempts: Mapped[int] = mapped_column(server_default="0")
     last_dispatch_error: Mapped[str | None]
+    # The span that enqueued this message (migration 0005); continued by the dispatcher.
+    traceparent: Mapped[str | None]
 
     __table_args__ = (
         CheckConstraint(one_of("task_name", OutboxTask), name="task_name"),
@@ -410,3 +422,22 @@ class StageCheckpoint(Base):
             name="outputs_nonempty",
         ),
     )
+
+
+class WorkerHeartbeat(Base):
+    """One row per worker process (migration 0005), refreshed every few seconds while it runs.
+
+    Tells the API whether any worker is alive without asking Celery over the broker, and keeps
+    counters that only the worker process itself can observe, so they survive the process.
+    """
+
+    __tablename__ = "worker_heartbeats"
+
+    # worker@<host>:<pid>#<random>: unique per process instance (pids repeat after restarts)
+    worker_id: Mapped[str] = mapped_column(primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(server_default=now())
+    last_seen_at: Mapped[datetime] = mapped_column(server_default=now())
+    stopped_at: Mapped[datetime | None]  # set on a clean shutdown
+    fenced_attempts: Mapped[int] = mapped_column(server_default="0")
+    heartbeat_failures: Mapped[int] = mapped_column(server_default="0")
+    heartbeat_thread_deaths: Mapped[int] = mapped_column(server_default="0")

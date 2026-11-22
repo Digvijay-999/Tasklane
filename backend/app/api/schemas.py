@@ -116,6 +116,11 @@ class JobResponse(BaseModel):
     updated_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+    trace_id: str | None = Field(
+        description="The job's OpenTelemetry trace id (32 hex digits): every span of its story, "
+        "from the request that created it through each attempt, shares it. Null for jobs created "
+        "while tracing was off."
+    )
 
 
 class JobUploadSummary(BaseModel):

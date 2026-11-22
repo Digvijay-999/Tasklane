@@ -44,6 +44,8 @@ from datetime import timedelta
 from enum import StrEnum
 from typing import Any
 
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind
 from sqlalchemy import func, select
 from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
@@ -79,9 +81,17 @@ from app.domain.state_machine import (
     status_after_failure,
     status_after_success,
 )
+from app.observability.logging import log_context
+from app.observability.tracing import (
+    context_from_traceparent,
+    current_traceparent,
+    set_error,
+    span,
+)
 from app.providers.base import ProviderCallRecord
 from app.providers.faults import fault_plan
 from app.services.heartbeat import Heartbeat
+from app.services.worker_presence import COUNTERS
 from app.storage.local import LocalStorage
 from app.storage.workspace import JobWorkspace
 from app.workflows.base import ArtifactOutput, JobInput, Stage, UploadInput
@@ -148,6 +158,8 @@ class ClaimedAttempt:
     attempt_no: int
     workflow_type: WorkflowType
     job_input: JobInput
+    trigger: AttemptTrigger = AttemptTrigger.INITIAL
+    queue_wait_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -183,7 +195,35 @@ class JobExecutionService:
 
     # --- Entry point -----------------------------------------------------------------------------
 
-    def run(self, job_id: uuid.UUID, task_id: str | None = None) -> RunResult:
+    def run(
+        self, job_id: uuid.UUID, task_id: str | None = None, traceparent: str | None = None
+    ) -> RunResult:
+        """Claim and run one attempt inside a `job.attempt` span. `traceparent` (from the message
+        headers) is the dispatcher's publish span, so the attempt joins the job's trace. Every
+        log line written meanwhile carries the job id, the worker id and, once claimed, the
+        attempt number."""
+        with (
+            span(
+                "job.attempt",
+                kind=SpanKind.CONSUMER,
+                context=context_from_traceparent(traceparent),
+                attributes={"job_id": str(job_id), "messaging.system": "celery"},
+            ) as attempt_span,
+            log_context(job_id=str(job_id), worker_id=self.worker_id),
+        ):
+            result = self._claim_and_execute(job_id, task_id)
+            attempt_span.set_attribute("outcome", result.outcome.value)
+            if result.drop_reason is not None:
+                attempt_span.set_attribute("drop_reason", result.drop_reason.value)
+            if result.outcome in (RunOutcome.FAILED, RunOutcome.RETRY_SCHEDULED):
+                set_error(attempt_span, result.error_class)
+            elif result.error_class:
+                attempt_span.set_attribute("error_class", result.error_class)
+            if result.outcome == RunOutcome.FENCED:
+                COUNTERS.add("fenced_attempts")
+            return result
+
+    def _claim_and_execute(self, job_id: uuid.UUID, task_id: str | None) -> RunResult:
         claim = self.claim(job_id, task_id)
         if isinstance(claim, RunResult):  # dropped
             logger.info(
@@ -203,16 +243,31 @@ class JobExecutionService:
             "attempt_no": claim.attempt_no,
             "worker_id": self.worker_id,
         }
-        logger.info("job claimed", extra=log_extra)
-        heartbeat = Heartbeat(
-            self.session_factory,
-            claim.attempt_id,
-            lease=self.lease,
-            interval=self.heartbeat_interval,
-            log_extra=log_extra,
+        trace.get_current_span().set_attributes(
+            {
+                "attempt_no": claim.attempt_no,
+                "workflow_type": claim.workflow_type.value,
+                "trigger": claim.trigger.value,
+                **(
+                    {"queue_wait_seconds": claim.queue_wait_seconds}
+                    if claim.queue_wait_seconds is not None
+                    else {}
+                ),
+            }
         )
-        with heartbeat:  # stopped and joined however the attempt ends (even on BaseException)
-            return self._execute(claim, _StageTracker(heartbeat.fenced), log_extra)
+        with log_context(attempt_no=claim.attempt_no):
+            logger.info(
+                "job claimed", extra={**log_extra, "queue_wait_seconds": claim.queue_wait_seconds}
+            )
+            heartbeat = Heartbeat(
+                self.session_factory,
+                claim.attempt_id,
+                lease=self.lease,
+                interval=self.heartbeat_interval,
+                log_extra=log_extra,
+            )
+            with heartbeat:  # stopped and joined however the attempt ends (even BaseException)
+                return self._execute(claim, _StageTracker(heartbeat.fenced), log_extra)
 
     def _execute(
         self, claim: ClaimedAttempt, progress: "_StageTracker", log_extra: dict[str, Any]
@@ -272,6 +327,9 @@ class JobExecutionService:
                     Job.options,
                     Job.upload_id,
                     Job.error_class,
+                    Job.retry_at,
+                    Job.updated_at,
+                    func.now().label("database_now"),
                 )
                 .where(Job.id == job_id)
                 .with_for_update(of=Job)
@@ -285,6 +343,9 @@ class JobExecutionService:
             upload = session.get(Upload, row.upload_id)
 
             attempt_no = row.attempt_count + 1
+            # When the job became claimable: its retry time, or when it entered `queued`
+            # (nothing else updates a queued row). Queue wait = claim time - queued_at.
+            queued_at = row.retry_at if status == JobStatus.RETRY_WAIT else row.updated_at
             if status == JobStatus.RETRY_WAIT:
                 # lease_expired: recovery put it there after the previous worker vanished.
                 trigger = (
@@ -323,6 +384,7 @@ class JobExecutionService:
                 worker_id=self.worker_id,
                 task_id=task_id,
                 lease=self.lease,
+                queued_at=queued_at,
             )
             job_rows.append_event(
                 session,
@@ -350,6 +412,8 @@ class JobExecutionService:
             attempt_no=attempt_no,
             workflow_type=workflow_type,
             job_input=job_input,
+            trigger=trigger,
+            queue_wait_seconds=round(max(0.0, (row.database_now - queued_at).total_seconds()), 3),
         )
 
     # --- Stages ----------------------------------------------------------------------------------
@@ -375,52 +439,92 @@ class JobExecutionService:
                 self, claim, tracker, stage.name, done / total, weight / total
             )
             done += weight
-            plan = self._checkpoint_plan(stage, claim, context, upstream)
-            if plan is not None:
-                decision = reuse_decision(
-                    checkpoints.get(stage.name),
-                    stage_version=plan.stage_version,
-                    fingerprint=plan.fingerprint,
-                    expected_paths=plan.output_paths,
-                    earlier_stage_ran=earlier_stage_ran,
-                    describe=context.describe_file,
-                )
-                if decision == ReuseDecision.REUSE:
-                    context.record(
-                        EventType.STAGE_SKIPPED,
-                        {"stage": stage.name, "reason": "checkpoint_reused"},
-                        stage_percent=100,
+            with span(
+                f"stage {stage.name}",
+                attributes={
+                    "job_id": str(claim.job_id),
+                    "attempt_no": claim.attempt_no,
+                    "workflow_type": claim.workflow_type.value,
+                    "stage": stage.name,
+                },
+            ) as stage_span:
+                try:
+                    ran = self._run_stage(
+                        stage,
+                        claim,
+                        context,
+                        checkpoints.get(stage.name),
+                        upstream,
+                        earlier_stage_ran,
                     )
-                    upstream.extend(checkpoints[stage.name].outputs)
-                    continue
-                if decision != ReuseDecision.NO_CHECKPOINT:
-                    logger.info(
-                        "checkpoint not reused; running the stage again",
-                        extra={
-                            "job_id": str(claim.job_id),
-                            "stage": stage.name,
-                            "reason": str(decision),
-                        },
-                    )
-            earlier_stage_ran = True
-            context.record(EventType.STAGE_STARTED, {"stage": stage.name}, stage_percent=0)
-            started = time.monotonic()
-            stage.run(context)
-            duration_ms = round((time.monotonic() - started) * 1000)
-            completed_checkpoint = None
-            if plan is not None:
-                outputs = [context.describe_file(path) for path in plan.output_paths]
-                written = [output for output in outputs if output is not None]
-                if len(written) != len(outputs):
-                    raise RuntimeError(f"stage {stage.name} did not write all of its outputs")
-                upstream.extend(written)
-                completed_checkpoint = (plan, written)
-            context.record(
-                EventType.STAGE_COMPLETED,
-                {"stage": stage.name, "duration_ms": duration_ms},
-                stage_percent=100,
-                checkpoint=completed_checkpoint,
+                except (AttemptFencedError, _CancelRequested):
+                    stage_span.set_attribute("outcome", "stopped")
+                    raise
+                except Exception as exc:
+                    stage_span.set_attribute("outcome", "failed")
+                    set_error(stage_span, _classify(exc, stage.name).error_class)
+                    raise
+                stage_span.set_attribute("outcome", "completed" if ran else "reused")
+            earlier_stage_ran = earlier_stage_ran or ran
+
+    def _run_stage(
+        self,
+        stage: Stage,
+        claim: ClaimedAttempt,
+        context: "_AttemptContext",
+        checkpoint: Checkpoint | None,
+        upstream: list[OutputFile],
+        earlier_stage_ran: bool,
+    ) -> bool:
+        """Run one stage, or skip it if its checkpoint verifies. Returns True if it ran. The
+        files it wrote (or reused) are appended to `upstream`."""
+        plan = self._checkpoint_plan(stage, claim, context, upstream)
+        if plan is not None:
+            decision = reuse_decision(
+                checkpoint,
+                stage_version=plan.stage_version,
+                fingerprint=plan.fingerprint,
+                expected_paths=plan.output_paths,
+                earlier_stage_ran=earlier_stage_ran,
+                describe=context.describe_file,
             )
+            if decision == ReuseDecision.REUSE:
+                assert checkpoint is not None
+                context.record(
+                    EventType.STAGE_SKIPPED,
+                    {"stage": stage.name, "reason": "checkpoint_reused"},
+                    stage_percent=100,
+                )
+                upstream.extend(checkpoint.outputs)
+                return False
+            if decision != ReuseDecision.NO_CHECKPOINT:
+                logger.info(
+                    "checkpoint not reused; running the stage again",
+                    extra={
+                        "job_id": str(claim.job_id),
+                        "stage": stage.name,
+                        "reason": str(decision),
+                    },
+                )
+        context.record(EventType.STAGE_STARTED, {"stage": stage.name}, stage_percent=0)
+        started = time.monotonic()
+        stage.run(context)
+        duration_ms = round((time.monotonic() - started) * 1000)
+        completed_checkpoint = None
+        if plan is not None:
+            outputs = [context.describe_file(path) for path in plan.output_paths]
+            written = [output for output in outputs if output is not None]
+            if len(written) != len(outputs):
+                raise RuntimeError(f"stage {stage.name} did not write all of its outputs")
+            upstream.extend(written)
+            completed_checkpoint = (plan, written)
+        context.record(
+            EventType.STAGE_COMPLETED,
+            {"stage": stage.name, "duration_ms": duration_ms},
+            stage_percent=100,
+            checkpoint=completed_checkpoint,
+        )
+        return True
 
     def _load_checkpoints(
         self, claim: ClaimedAttempt, stages: list[Stage]
@@ -624,7 +728,11 @@ class JobExecutionService:
             if not result.applied:
                 continue
             if retry_at is not None:
-                enqueue_retry(session, claim.job_id, available_at=retry_at)
+                # The retry's message carries this attempt's span, so the next attempt continues
+                # the job's trace under it.
+                enqueue_retry(
+                    session, claim.job_id, available_at=retry_at, traceparent=current_traceparent()
+                )
                 return RunOutcome.RETRY_SCHEDULED
             return RunOutcome.CANCELLED if target == JobStatus.CANCELLED else RunOutcome.FAILED
         raise AttemptFencedError

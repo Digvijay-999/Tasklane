@@ -156,6 +156,22 @@ summaries, event payloads) is untrusted text.
 The dev server (`npm run dev` / the `frontend` container) has no CSP: Vite's hot reload needs
 inline scripts. The CSP applies to the built files.
 
+## Logs and telemetry (Phase 10)
+
+| Risk | Defense | Where | Test |
+|---|---|---|---|
+| A secret (API key, bearer token, password, connection string, environment value) ends up in a log line or traceback | Every string of every JSON log line (message, extra fields, traceback) is redacted: private key blocks, URL credentials, `Bearer`/`Basic` values, known token formats (`sk-...`, AWS, GitHub, GitLab, Slack, Google, JWT), sensitive `name=value` pairs, whole values of sensitive-looking `extra=` keys, and the literal values of the database password and of every environment variable whose name looks sensitive (8+ characters) | `observability/redaction.py`, `observability/logging.py` | `tests/unit/test_redaction.py` |
+| Document text, file contents or archive names in logs or spans | Never logged or set as attributes; checked with a marker string inside a real PDF and ZIP | workers, `workflows/common.py` | `test_document_text_file_contents_and_archive_names_reach_neither_logs_nor_spans` |
+| Span attributes leak paths, query strings (upload file names), SQL values, secrets or exception messages | Attribute allowlist; exceptions never recorded on spans; DB spans carry SQL text with placeholders only; FastAPI's built-in telemetry (records `url.query`) is off | `observability/tracing.py`, `db.py`, `http.py`, `main.py` | Every span of every test is scanned (`tests/telemetry.py`), including the e2e processes' spans |
+| Unbounded metric labels | Labels limited to bounded enums | `services/metrics.py`, `observability/metrics.py` | `test_every_metric_has_only_allowlisted_labels_and_is_documented` |
+| A missing or slow trace collector stalls the system | Background batch export with a 2 s timeout; no exporter by default; viewers only in an optional profile, on 127.0.0.1 | `observability/tracing.py`, `compose.yaml` | `test_an_unreachable_collector_changes_nothing`, `test_an_unreachable_collector_never_blocks_span_creation` |
+
+Redaction is a safety net with limits: it can't recognise a secret that has neither a known
+format nor a telling name next to it, and it may over-mask harmless text (for example
+`total_tokens=12`). `GET /metrics` and traces (when exported) contain job ids, error classes and
+timings, nothing from uploaded files. `/metrics` is unauthenticated like the rest of the API,
+reachable only on 127.0.0.1.
+
 ## Not covered (yet)
 
 - **Secrets inside indexed files.** A source file that contains an API key is indexed like any

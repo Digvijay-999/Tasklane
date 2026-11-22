@@ -24,8 +24,8 @@ test('a PDF job runs live to succeeded and its summary downloads', async ({ page
   await expect(page.getByLabel('Summary preview')).toContainText(text.split('\n')[0]!);
 });
 
-test('a scanned PDF fails with the right message and Retry disabled with its reason', async ({ page }) => {
-  await submitJob(page, sample('scanned.pdf'));
+test('a scanned PDF fails with the right message and Retry disabled with its reason', async ({ page, request }) => {
+  const id = await submitJob(page, sample('scanned.pdf'));
   await expect(finalRow(page)).toContainText('Failed', { timeout: 60_000 });
   const error = page.getByRole('region', { name: 'Why it failed' });
   await expect(error).toContainText('pdf_no_text');
@@ -35,6 +35,20 @@ test('a scanned PDF fails with the right message and Retry disabled with its rea
   await expect(retry).toBeDisabled();
   await expect(retry).toHaveAccessibleDescription(/failed because of its input file/);
   await expect(page.locator('.tl-lane')).toHaveCount(1); // permanent: never retried
+
+  // Acceptance #10: the failed job shows its trace id (and an "Open trace" link when the server
+  // names a trace viewer), so a reviewer can find the trace and filter the logs by it.
+  const job = await (await request.get(`/v1/jobs/${id}`)).json();
+  expect(job.trace_id).toMatch(/^[0-9a-f]{32}$/);
+  await expect(page.locator('.job-facts')).toContainText(job.trace_id);
+  await expect(page.getByRole('button', { name: 'Copy trace id' })).toBeVisible();
+  const meta = await (await request.get('/v1/meta')).json();
+  if (meta.trace_viewer_url) {
+    await expect(page.getByRole('link', { name: 'Open trace' })).toHaveAttribute(
+      'href',
+      meta.trace_viewer_url.replace('{trace_id}', job.trace_id),
+    );
+  }
 });
 
 test('cancelling a running job stops it at a stage boundary', async ({ page, request }) => {
