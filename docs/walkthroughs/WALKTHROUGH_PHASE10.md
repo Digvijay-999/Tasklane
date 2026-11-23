@@ -2,7 +2,7 @@
 
 Windows PowerShell 5.1, one window, every path is a variable, no `cd`. Demo settings are **shell
 variables only** (`.env` is never edited); step 25 removes them. Ids, trace ids, times and counts
-will differ from the examples. Background: [docs/observability.md](docs/observability.md).
+will differ from the examples. Background: [docs/observability.md](../observability.md).
 
 Demo settings: traces exported to the local Jaeger, the dashboard's "Open trace" link pointing
 at it, fault injection on, first automatic retry after 0.5–1 s.

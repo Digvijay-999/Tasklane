@@ -2,7 +2,7 @@ import { defineConfig, devices } from '@playwright/test';
 
 // End-to-end tests against the REAL stack (docker compose: API, dispatcher, worker, Postgres,
 // Redis) through the production build served by `vite preview` (so the CSP is enforced too).
-// The stack must run with the demo settings; see WALKTHROUGH_PHASE9.md, "Run the tests".
+// The stack must run with the demo settings; see README.md, "End-to-end tests".
 export default defineConfig({
   testDir: 'e2e',
   globalSetup: './e2e/global-setup.ts',

@@ -306,7 +306,7 @@ anything** (logged as `message dropped` with a reason):
 
 The full story of what happens when a worker disappears. Code: `app/services/heartbeat.py`,
 `app/services/execution.py`, `app/queue/recovery.py`. Design notes with the alternatives that
-were considered: `PHASE7_NOTES.md`.
+were considered: `decisions/PHASE7_NOTES.md`.
 
 ### The lease
 
@@ -446,18 +446,25 @@ parent process killed with SIGKILL.
 - **A worker cut off from the database but still running** keeps running its stage until it
   next writes; once recovery has closed its attempt, those writes fail (fenced). It may finish a
   deterministic file write in the meantime (see Files).
-- **A worker host that vanishes in the middle of a transaction** (power loss, network cut) leaves
-  its row lock in Postgres until the server notices the dead connection (TCP keepalive, about two
-  hours on Linux by default); recovery skips the locked job meanwhile. Setting
-  `idle_in_transaction_session_timeout` would bound this (Phase 12). A *killed process* closes its
-  socket and releases its locks at once, so this needs a whole machine to disappear.
+- **A worker host that vanishes in the middle of a transaction** (power loss, network cut) would
+  keep its row lock until the server noticed the dead connection (TCP keepalive, about two hours
+  by default). Since Phase 12 every connection sets `idle_in_transaction_session_timeout`
+  (`DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS`, 60 s): PostgreSQL ends such a session, its locks are
+  released, and recovery proceeds as usual (it skips the locked rows meanwhile instead of
+  waiting). A worker that finds its own session ended this way treats it as the transient
+  `database_unavailable` (SQLSTATE `25P03`). Tested in `test_hardening.py`. A *killed process*
+  closes its socket and releases its locks at once, so this needs a whole machine to disappear.
 - **One row recovery can't handle** (a bug) is logged and skipped for that pass, never blocking
   the others; it is tried again every pass.
 - **A recovery pass needs the database.** While Postgres is down nothing is recovered; the loop
   backs off and resumes when it returns.
-- **Lost-message detection can't see inside Redis.** A job waiting longer than the grace period
-  behind a long queue gets a duplicate message every grace period (each dropped at once by the
-  claim). Raise `LOST_MESSAGE_GRACE_SECONDS` if your queue is routinely that long.
+- **Lost-message detection and long queues.** A job waiting longer than the grace period behind
+  a long queue used to get a duplicate message every grace period. Since Phase 12 recovery first
+  asks Redis how many messages are waiting (`LLEN` of the Celery queue); while any are, the grace
+  period is four times longer, because the job's message may simply be in line. A really lost
+  message is therefore still found under constant load, just later (20 minutes instead of 5 with
+  the defaults). If Redis can't be asked, the normal grace applies (a duplicate is harmless: the
+  claim drops it).
 - **Clock skew between the database and the workers doesn't matter** (every lease decision uses
   `now()` in Postgres), but a database clock jump would make leases look expired early or late.
 - **Non-deterministic outputs** (a real LLM provider, Phase 11) need per-attempt files before a
@@ -744,6 +751,15 @@ past `summarize` (because it failed later, in `write_artifacts`) makes no call, 
 Guards: the API refuses the option with `422` while the flag is off. The worker re-checks its
 own flag, and fails a mismatched job with `fault_injection_disabled` instead of silently running
 it without the requested failures. Both processes log a warning at startup when it's on.
+
+## Retention (Phase 12)
+
+Finished jobs, expired uploads, intermediate files and old bookkeeping rows are deleted by the
+cleanup command (`python -m app.maintenance.cleanup`, optionally a loop in the dispatcher), never
+anything an unfinished job uses. Events are only ever deleted together with their whole
+(finished) job, so a stream can't meet a gap caused by retention. Rows are deleted or marked in a
+committed transaction before their files are removed, and concurrent runs split the work with
+`SKIP LOCKED`. Details and every safety rule: [operations.md](operations.md#retention-and-cleanup).
 
 ## Test isolation
 

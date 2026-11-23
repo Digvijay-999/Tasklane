@@ -105,6 +105,9 @@ EXECUTING_STATUSES = frozenset({JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED})
 # Postgres SQLSTATEs meaning "this transaction lost a race; running it again will work".
 DEADLOCK_DETECTED = "40P01"
 SERIALIZATION_FAILURE = "40001"
+# The server ended our session after DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS (raised as an
+# InternalError, not an OperationalError): the connection is gone, like any other outage.
+IDLE_IN_TRANSACTION_TIMEOUT = "25P03"
 # Disk trouble that may clear up: full, I/O error, read-only remount, quota, busy.
 FAIL_TRANSACTION_TRIES = 3
 STORAGE_ERRNOS = frozenset({errno.ENOSPC, errno.EIO, errno.EROFS, errno.EDQUOT, errno.EAGAIN})
@@ -927,7 +930,7 @@ def _classify(exc: BaseException, stage: str | None) -> _Failure:
     error_class = INTERNAL_ERROR
     if _is_conflict(exc):
         error_class = "database_conflict"
-    elif isinstance(exc, (OperationalError, InterfaceError, PoolTimeoutError)):
+    elif database_unavailable(exc):
         error_class = "database_unavailable"
     elif isinstance(exc, OSError) and exc.errno in STORAGE_ERRNOS:
         error_class = "storage_unavailable"
@@ -935,7 +938,19 @@ def _classify(exc: BaseException, stage: str | None) -> _Failure:
     return _Failure(error_class, spec.message, stage, spec.kind == ErrorKind.TRANSIENT)
 
 
+def database_unavailable(exc: BaseException) -> bool:
+    """The database can't be reached or our session was ended: retrying later will work."""
+    return isinstance(exc, (OperationalError, InterfaceError, PoolTimeoutError)) or (
+        _sqlstate(exc) == IDLE_IN_TRANSACTION_TIMEOUT
+    )
+
+
 def _is_conflict(exc: BaseException) -> bool:
     """A deadlock or serialization failure: the transaction lost a race and can run again."""
-    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
-    return isinstance(exc, DBAPIError) and sqlstate in (DEADLOCK_DETECTED, SERIALIZATION_FAILURE)
+    return _sqlstate(exc) in (DEADLOCK_DETECTED, SERIALIZATION_FAILURE)
+
+
+def _sqlstate(exc: BaseException) -> str | None:
+    if not isinstance(exc, DBAPIError):
+        return None
+    return getattr(exc.orig, "sqlstate", None)

@@ -203,18 +203,21 @@ def main() -> None:
     from app.config import get_settings
     from app.db.session import create_db_engine, create_session_factory
     from app.domain.retry import RetryPolicy
+    from app.maintenance import cleanup
     from app.observability.logging import configure_logging
     from app.observability.tracing import configure_from_settings
     from app.queue import recovery
+    from app.queue.broker import create_broker_client
     from app.queue.celery_app import create_celery_app
+    from app.storage.local import LocalStorage
 
     settings = get_settings()
     configure_logging(settings.log_level, secrets=(settings.postgres_password.get_secret_value(),))
     configure_from_settings(settings, "tasklane-dispatcher")
     engine = create_db_engine(
-        # One connection per loop (dispatch, recovery), plus one spare.
+        # One connection per loop (dispatch, recovery, cleanup), plus one spare.
         settings,
-        pool_size=3,
+        pool_size=4,
         max_overflow=0,
         application_name="tasklane-dispatcher",
     )
@@ -225,8 +228,9 @@ def main() -> None:
         batch_size=settings.dispatch_batch_size,
     )
 
+    broker = create_broker_client(settings)
     stop = threading.Event()
-    recovery_stop = threading.Event()
+    recovery_stop = threading.Event()  # also stops the cleanup loop
 
     def request_stop(signum: int, _frame: object) -> None:
         logger.info("dispatcher stopping", extra={"signal": signal.Signals(signum).name})
@@ -251,6 +255,8 @@ def main() -> None:
                 base_seconds=settings.retry_base_seconds, max_seconds=settings.retry_max_seconds
             ),
             lost_message_grace=timedelta(seconds=settings.lost_message_grace_seconds),
+            # Messages still waiting in Redis: while there are any, a job behind them isn't lost.
+            queue_depth=lambda: int(broker.llen(settings.celery_queue)),
         ),
         interval_seconds=settings.recovery_interval_seconds,
         stop=recovery_stop,
@@ -262,11 +268,27 @@ def main() -> None:
             "lost_message_grace_seconds": settings.lost_message_grace_seconds,
         },
     )
+    cleanup_thread = None
+    if settings.cleanup_enabled:
+        cleanup_thread = cleanup.start_in_thread(
+            cleanup.Cleanup(
+                session_factory,
+                LocalStorage(settings.storage_root),
+                cleanup.Retention.from_settings(settings),
+            ),
+            interval_seconds=settings.cleanup_interval_seconds,
+            stop=recovery_stop,
+        )
+        logger.info(
+            "cleanup started", extra={"interval_seconds": settings.cleanup_interval_seconds}
+        )
     try:
         run_forever(dispatcher, poll_seconds=settings.dispatch_poll_seconds, stop=stop)
     finally:
         recovery_stop.set()
         recovery_thread.join(timeout=10)
+        if cleanup_thread is not None:
+            cleanup_thread.join(timeout=10)
         engine.dispose()
         logger.info("dispatcher stopped")
 

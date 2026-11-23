@@ -78,6 +78,7 @@ Every error, on every route, has this shape:
 | 400 | `invalid_cursor` | A malformed cursor, or one reused with different filters |
 | 400 | `empty_file` | The upload body is empty |
 | 400 | `upload_interrupted` | The client disconnected mid-upload |
+| 408 | `upload_timeout` | No upload bytes arrived for 30 s (`UPLOAD_IDLE_TIMEOUT_SECONDS`), or the upload took longer than 1800 s (`UPLOAD_MAX_SECONDS`) |
 | 400 | `malformed_body` | The request body couldn't be read or parsed at all |
 | 404 | `job_not_found` | No job with that id (also for ids that aren't UUIDs) |
 | 404 | `artifact_not_found` | No artifact with that id *for that job* (also for ids that aren't UUIDs) |
@@ -123,6 +124,10 @@ can check the size and file signature while the bytes arrive.
 curl.exe -s -X POST "$api/v1/uploads?filename=report.pdf" -H "Content-Type: application/pdf" --data-binary "@report.pdf"
 curl.exe -s -X POST "$api/v1/uploads?filename=repo.zip" -H "Content-Type: application/zip" --data-binary "@repo.zip"
 ```
+
+A client that stops sending (no bytes for `UPLOAD_IDLE_TIMEOUT_SECONDS`, default 30) or takes
+longer than `UPLOAD_MAX_SECONDS` (default 1800) in total gets `408 upload_timeout`; the upload is
+recorded as `rejected` (`interrupted`) and its partial file deleted.
 
 Use `--data-binary "@file"`. Plain `-d @file` strips newlines and corrupts binary files, and without
 `-H "Content-Type: ..."` curl sends `application/x-www-form-urlencoded`, which is rejected with
@@ -236,8 +241,10 @@ instead of creating a second one.
 - **Format:** 16–128 characters of letters, digits, and `.` `_` `:` `-`. A UUID works well.
   Missing → `400 idempotency_key_missing`; malformed → `400 idempotency_key_invalid`.
 - **Scope:** one key space for the whole (single-user) service.
-- **Retention:** a key lives **as long as its job row**. There is no separate expiry; when
-  retention cleanup (Phase 12) deletes a job, its key becomes usable again.
+- **Retention:** a key lives **as long as its job row**. There is no separate expiry. The
+  cleanup command deletes finished jobs `RETENTION_FINISHED_JOB_DAYS` (default 30) days after
+  they finished; from then on the key can be used for a new job. Keys of unfinished jobs are
+  never freed. See [operations.md](operations.md#retention-and-cleanup).
 - A request rejected by validation (e.g. `422 upload_not_found`) **doesn't use up** its key: fix
   the request and retry with the same key.
 - A replay doesn't re-check the upload, so retrying returns the original job even if the upload

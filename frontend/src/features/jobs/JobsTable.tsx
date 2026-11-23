@@ -1,7 +1,7 @@
 import { Link } from 'react-router';
 import { SafeText } from '../../components/SafeText';
 import { StatusBadge } from '../../components/Status';
-import { ProgressBar, SkeletonRows } from '../../components/ui';
+import { ProgressBar, SkeletonRows, TableScroll } from '../../components/ui';
 import { isTerminal, type JobListItem } from '../../lib/api/types';
 import { durationBetween, formatDateTime, formatDuration, percent } from '../../lib/format';
 import { useNow } from '../../lib/hooks';
@@ -23,7 +23,7 @@ export function JobsTable({
   const ticking = (jobs ?? []).some((job) => job.started_at && !job.finished_at);
   const now = useNow(ticking);
   return (
-    <div className="table-scroll">
+    <TableScroll label={caption}>
       <table className="table jobs-table" data-stale={stale || undefined} aria-busy={loading || undefined}>
         <caption className="visually-hidden">{caption}</caption>
         <thead>
@@ -80,6 +80,6 @@ export function JobsTable({
           )}
         </tbody>
       </table>
-    </div>
+    </TableScroll>
   );
 }

@@ -5,15 +5,10 @@ import uuid
 from typing import Any
 
 from celery import Celery, Task
-from sqlalchemy.exc import InterfaceError, OperationalError
-from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from app.domain.dispatch import dispatch_backoff_seconds
 
 logger = logging.getLogger(__name__)
-
-# The database being unreachable (or every pooled connection busy). Worth retrying.
-DATABASE_UNAVAILABLE = (OperationalError, InterfaceError, PoolTimeoutError)
 
 
 def run_job(task: Task, job_id: Any) -> None:
@@ -27,6 +22,7 @@ def run_job(task: Task, job_id: Any) -> None:
     duplicate and the claim drops it.
     """
     from app.queue.worker_process import get_execution_service
+    from app.services.execution import database_unavailable
 
     try:
         parsed = uuid.UUID(str(job_id))
@@ -42,7 +38,9 @@ def run_job(task: Task, job_id: Any) -> None:
             task_id=task.request.id,
             traceparent=traceparent if isinstance(traceparent, str) else None,
         )
-    except DATABASE_UNAVAILABLE as exc:
+    except Exception as exc:
+        if not database_unavailable(exc):  # incl. a session ended by the server (25P03)
+            raise
         retries = task.request.retries or 0
         countdown = dispatch_backoff_seconds(retries + 1)
         logger.warning(

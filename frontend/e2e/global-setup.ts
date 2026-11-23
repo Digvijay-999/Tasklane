@@ -15,9 +15,9 @@ export default async function globalSetup() {
     throw new Error(`The Tasklane API is not reachable at ${API}. Start the stack first (docker compose up -d).`);
   }
   if (!meta.fault_injection_enabled) {
-    throw new Error('Start the stack with the demo settings (ENABLE_FAULT_INJECTION=true, STUB_DELAY_SECONDS=1, ...): see WALKTHROUGH_PHASE9.md.');
+    throw new Error('Start the stack with the demo settings (ENABLE_FAULT_INJECTION=true, STUB_DELAY_SECONDS=1, ...): see README.md, "End-to-end tests".');
   }
-  if (!existsSync(resolve(SAMPLES, 'report.pdf')) || !existsSync(resolve(SAMPLES, 'repo.zip'))) {
+  if (!['report.pdf', 'medium.pdf', 'repo.zip'].every((name) => existsSync(resolve(SAMPLES, name)))) {
     mkdirSync(SAMPLES, { recursive: true });
     for (const tool of ['devtools.pdf_samples', 'devtools.zip_samples']) {
       execFileSync('docker', ['compose', 'run', '--rm', '-v', `${SAMPLES}:/out`, 'api', 'python', '-m', tool, '/out'], {

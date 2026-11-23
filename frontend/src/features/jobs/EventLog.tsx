@@ -1,5 +1,6 @@
 import { useDeferredValue, useId, useMemo, useState } from 'react';
 import { SafeText } from '../../components/SafeText';
+import { TableScroll } from '../../components/ui';
 import type { JobEvent } from '../../lib/api/types';
 import { formatTime } from '../../lib/format';
 
@@ -63,7 +64,7 @@ export function EventLog({ events }: { events: JobEvent[] }) {
           )}
         </div>
       ) : (
-        <div className="table-scroll">
+        <TableScroll label="Event history table">
           <table className="table table-compact events-table">
             <caption className="visually-hidden">Stored events of this job, in order</caption>
             <thead>
@@ -91,7 +92,7 @@ export function EventLog({ events }: { events: JobEvent[] }) {
               ))}
             </tbody>
           </table>
-        </div>
+        </TableScroll>
       )}
     </div>
   );

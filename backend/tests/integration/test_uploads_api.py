@@ -4,11 +4,13 @@ import hashlib
 import uuid
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import Upload
 from app.domain.enums import UploadRejectionReason, UploadStatus
+from app.main import create_app
 from app.storage.local import LocalStorage
 from tests.asgi import post_chunks
 from tests.integration.conftest import TEST_MAX_PDF_BYTES, TEST_MAX_ZIP_BYTES
@@ -352,3 +354,42 @@ def test_rejection_after_rename_leaves_no_empty_directory(api, engine, storage, 
     [row] = _rows(engine)
     assert row.status == UploadStatus.REJECTED
     assert not storage.absolute(row.storage_path).parent.exists()
+
+
+# --- Slow clients (Phase 12) ----------------------------------------------------------------------
+
+
+def _client_with(api_settings, **changes) -> TestClient:
+    return TestClient(create_app(api_settings.model_copy(update=changes)))
+
+
+def test_a_stalled_upload_is_cut_off_and_cleaned_up(engine, api_settings, storage):
+    with _client_with(api_settings, upload_idle_timeout_seconds=0.3) as client:
+        result = post_chunks(
+            client.app,
+            "/v1/uploads",
+            query="filename=stalled.pdf",
+            headers=PDF_HEADERS,
+            chunks=[pdf_bytes(512)],
+            stall_after=1,  # half a file, then silence
+        )
+    assert result.status == 408
+    assert result.body["error"]["code"] == "upload_timeout"
+    _assert_rejected(engine, storage, UploadRejectionReason.INTERRUPTED)
+
+
+def test_a_trickling_upload_hits_the_overall_deadline(engine, api_settings, storage):
+    with _client_with(
+        api_settings, upload_idle_timeout_seconds=0.3, upload_max_seconds=0.5
+    ) as client:
+        result = post_chunks(
+            client.app,
+            "/v1/uploads",
+            query="filename=trickle.pdf",
+            headers=PDF_HEADERS,
+            chunks=[pdf_bytes(64)] + [b"x" * 16] * 100,
+            chunk_delay=0.05,  # never idle for long, but would take 5 s in total
+        )
+    assert result.status == 408
+    assert result.chunks_read < 50
+    _assert_rejected(engine, storage, UploadRejectionReason.INTERRUPTED)

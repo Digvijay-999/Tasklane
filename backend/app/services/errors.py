@@ -13,6 +13,7 @@ class ErrorCode(StrEnum):
     UPLOAD_TOO_LARGE = "upload_too_large"
     EMPTY_FILE = "empty_file"
     UPLOAD_INTERRUPTED = "upload_interrupted"
+    UPLOAD_TIMEOUT = "upload_timeout"
     # Jobs
     IDEMPOTENCY_KEY_MISSING = "idempotency_key_missing"
     IDEMPOTENCY_KEY_INVALID = "idempotency_key_invalid"

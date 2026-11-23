@@ -1,5 +1,6 @@
 """LocalStorage: generated paths, temporary writes, atomic commit."""
 
+import os
 import uuid
 
 import pytest
@@ -52,3 +53,47 @@ def test_delete_is_idempotent(storage):
     storage.delete(storage.incoming_path(upload_id))
     storage.delete(storage.incoming_path(upload_id))  # already gone: no error
     assert not storage.exists(storage.incoming_path(upload_id))
+
+
+# --- Cleanup helpers (Phase 12) -------------------------------------------------------------------
+
+
+def test_cleanup_refuses_the_root_escapes_and_symlinks(storage, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep")
+    (storage.root / "work").mkdir(parents=True)
+    os.symlink(outside, storage.root / "work" / "link")
+
+    for relative in (".", "work/..", "../outside", "work/link"):
+        with pytest.raises(StoragePathError):
+            storage.remove_tree(relative)
+    with pytest.raises(StoragePathError):
+        storage.remove_file("work/link/keep.txt")  # through a symlinked folder
+    assert (outside / "keep.txt").read_text() == "keep"
+
+
+def test_cleanup_removes_a_symlink_itself_never_its_target(storage, tmp_path):
+    target = tmp_path / "target.txt"
+    target.write_text("keep")
+    (storage.root / "artifacts").mkdir(parents=True)
+    os.symlink(target, storage.root / "artifacts" / "link.md")
+
+    assert storage.files_under("artifacts") == ["artifacts/link.md"]
+    assert storage.remove_file("artifacts/link.md") is not None
+    assert target.read_text() == "keep"
+
+
+def test_removing_reports_bytes_freed_or_none_when_already_gone(storage):
+    folder = storage.root / "work" / "job"
+    (folder / "summaries").mkdir(parents=True)
+    (folder / "a.json").write_bytes(b"12345")
+    (folder / "summaries" / "b.json").write_bytes(b"123")
+
+    assert storage.size_of("work/job") == 8
+    assert storage.remove_file("work/job/a.json") == 5
+    assert storage.remove_file("work/job/a.json") is None
+    assert storage.remove_tree("work/job") == 3
+    assert storage.remove_tree("work/job") is None
+    assert storage.list_dir("work") == []
+    assert storage.list_dir("missing") == []

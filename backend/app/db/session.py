@@ -57,6 +57,12 @@ def create_db_engine(
             "keepalives_interval": 10,
             "keepalives_count": 3,
             "tcp_user_timeout": 30_000,  # milliseconds
+            # The settings above protect *this* side. If this machine vanishes in the middle of
+            # a transaction, the server would keep its row locks until its own TCP keepalive
+            # gives up (~2 h). This makes the server end such a session (and release the locks)
+            # once it has been idle inside a transaction for this long.
+            "options": "-c idle_in_transaction_session_timeout="
+            f"{settings.db_idle_in_transaction_timeout_seconds * 1000}",
         },
     )
     instrument_engine(engine)

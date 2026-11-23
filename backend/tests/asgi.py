@@ -28,12 +28,16 @@ def post_chunks(
     chunks: list[bytes],
     disconnect_after: int | None = None,
     cancel_after: int | None = None,
+    stall_after: int | None = None,
+    chunk_delay: float = 0,
     timeout: float = 10.0,
 ) -> AsgiResult:
     """POST `chunks` to `path`.
 
     - disconnect_after=N: the client "hangs up" after sending N chunks.
     - cancel_after=N: the request is cancelled (like a server shutdown) after N chunks.
+    - stall_after=N: the client sends N chunks of an unfinished body, then nothing more.
+    - chunk_delay: seconds the client takes to send each chunk (a slow, trickling client).
     The app must already have run its startup (e.g. inside a TestClient). The whole call fails
     after `timeout` seconds instead of hanging the test suite.
     """
@@ -48,13 +52,16 @@ def post_chunks(
             await anyio.sleep(0)  # a checkpoint where the cancellation is delivered
         if disconnect_after is not None and chunks_read >= disconnect_after:
             return {"type": "http.disconnect"}
+        if stall_after is not None and chunks_read >= stall_after:
+            await anyio.sleep_forever()
         if chunks_read < len(chunks):
+            await anyio.sleep(chunk_delay)
             chunk = chunks[chunks_read]
             chunks_read += 1
             return {
                 "type": "http.request",
                 "body": chunk,
-                "more_body": chunks_read < len(chunks),
+                "more_body": chunks_read < len(chunks) or stall_after is not None,
             }
         await anyio.sleep_forever()  # body complete; nothing more will arrive
         raise AssertionError("unreachable")

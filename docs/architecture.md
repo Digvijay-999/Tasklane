@@ -1,21 +1,12 @@
-# Tasklane architecture (draft)
+# Tasklane architecture
 
-> **Status: partly implemented.** Implemented so far: the Compose stack with a one-shot `migrate`
-> step, `/health/live` and `/health/ready`, JSON request logging (Phase 1), and the database
-> schema, migrations, job state machine, and the database functions that apply status changes and
-> append events (Phase 2), and the upload and job APIs: streaming uploads, idempotent job
-> creation with the transactional outbox write, listing and detail (Phase 3), and the delivery
-> pipeline: outbox dispatcher, Celery worker, claim with duplicate dropping, lease renewal on
-> progress, and one placeholder stage (Phase 4), and the PDF workflow with the stub provider, the
-> sandboxed parser, artifacts and their download route, error classification, automatic
-> retries with backoff, and resume from verified checkpoints (Phase 5), and the repository ZIP
-> workflow with its sandboxed ZIP reader, allowlist filtering, line chunking and three artifacts
-> (Phase 6), and the worker heartbeat thread, the recovery loop (expired leases, lost messages),
-> cancellation and manual retry (Phase 7), the SSE event stream with replay (Phase 8), and the
-React dashboard with the overview and metadata routes (Phase 9). In the lifecycle below, steps 1–7 are implemented
-> (step 5 runs the real stages of both workflows), and step 8 is planned. The HTTP API is documented in [api.md](api.md);
-> delivery guarantees in [reliability.md](reliability.md); the threat model for untrusted
-> uploads in [security.md](security.md).
+> **Status: implemented (all 12 build phases).** This document started as the Phase 0 plan and
+> was kept up to date as each phase was built; section 8 lists what each phase delivered. The
+> HTTP API is documented in [api.md](api.md); delivery guarantees in
+> [reliability.md](reliability.md); the threat model for untrusted uploads in
+> [security.md](security.md); traces, metrics and logs in [observability.md](observability.md);
+> retention, limits and the demo in [operations.md](operations.md); the reasoning behind each
+> decision in [decisions/](decisions/).
 
 ## 1. Goal
 
@@ -27,7 +18,7 @@ harm, transient failures retry with bounded backoff, and cancellation is coopera
 Tasklane does **not** guarantee "exactly once" execution. It aims for *at-least-once delivery with
 idempotent, repeat-safe stages*, so that a duplicate or interrupted run converges to the same result.
 
-## 2. Components (planned)
+## 2. Components
 
 | Component | Responsibility | Node.js analogy |
 |---|---|---|
@@ -44,7 +35,7 @@ idempotent, repeat-safe stages*, so that a duplicate or interrupted run converge
 **Key rule:** Redis and Celery result state are *never* the source of truth for the UI. If Redis is
 down, the API still returns each job's last durable state from PostgreSQL.
 
-## 3. Lifecycle of one job (planned)
+## 3. Lifecycle of one job
 
 ```mermaid
 sequenceDiagram
@@ -134,7 +125,7 @@ Step by step:
    the cursor, sleep 0.5 s, repeat; then `stream.end` once the job is finished. Each read is a
    short transaction; an idle stream holds no database connection. A client disconnect stops the
    loop and never touches the job. `GET /v1/jobs/{id}/events/history` serves the same events as
-   JSON pages. See [reliability.md](reliability.md#event-replay-phase-8) and `PHASE8_NOTES.md`.
+   JSON pages. See [reliability.md](reliability.md#event-replay-phase-8) and `decisions/PHASE8_NOTES.md`.
 
 ## 4. Job state machine (implemented in Phase 2; used by workers from Phase 4)
 
@@ -240,7 +231,7 @@ docs/  architecture.md  api.md  reliability.md  security.md
 ## 7. Versions
 
 Frontend versions were locked in Phase 9 (checked against npm on 2026-11-14; reasons for each
-library in `PHASE9_NOTES.md`): Node 24 LTS (`node:24.21.0-bookworm-slim` in Docker), React
+library in `decisions/PHASE9_NOTES.md`): Node 24 LTS (`node:24.21.0-bookworm-slim` in Docker), React
 19.3.1, TypeScript 7.0.2, Vite 8.3.8 (@vitejs/plugin-react 6.3.0), React Router 8.5.1, TanStack
 Query 5.107.1, Base UI 1.9.0, IBM Plex Sans (variable) and IBM Plex Mono via @fontsource 5.3.0;
 tests: Vitest 5.1.0, jsdom 31.0.1, Testing Library (react 16.3.3, dom 10.4.2, user-event 14.6.10,
@@ -300,12 +291,12 @@ specific tags.
 | 4 | Dispatcher + Celery worker with one dummy stage | Outbox publishing; attempt creation; duplicate-delivery guard |
 | 5 | PDF workflow + retries | **Part A:** stages, sandboxed parser and limits, provider interface + **stub provider**, artifacts and download route, `provider_calls`, lease `keep_alive`. **Part B:** transient vs permanent errors, bounded backoff with jitter via delayed outbox rows, attempt-budget CHECK, fault injection, stage checkpoints/resume (migration `0004`) |
 | 6 | ZIP workflow + security | Path traversal, symlinks, zip bombs, file-count limits, file filtering, manifest + JSONL. Done: six stages, sandboxed ZIP reader shared with the PDF sandbox, allowlist filtering with skip reasons, line chunking, `summary.md` / `chunks.jsonl` / `manifest.json`, [security.md](security.md) |
-| 7 | Leases, recovery, cancellation, manual retry | Done: heartbeat thread, recovery loop (expired leases, lost messages), cooperative cancellation at stage boundaries, `POST /cancel`, `POST /retry`, parent-death signal for parser children; see `PHASE7_NOTES.md` |
-| 8 | SSE with replay | Done: one loop for replay and live (`Last-Event-ID` or `?after=`), `stream.end`, keepalives, stream limit and lifetime, write timeout, paginated event history, `devtools.sse_client`; see `PHASE8_NOTES.md` |
-| 9 | Dashboard | Done: Overview, New job (XHR upload progress, limits from `GET /v1/meta`, idempotent retry), Jobs (URL filters, cursor paging), Job detail (live attempt × stage timeline, event history, attempts, artifacts, manifest viewer, server-driven Cancel/Retry); `GET /v1/overview`; Vite dev proxy; CSP; Playwright e2e and screenshots; see `DESIGN.md`, `PHASE9_NOTES.md` |
-| 10 | Observability | Done: one trace per job carried through `jobs.traceparent`, `outbox.traceparent` and a Celery header; spans for requests, dispatch, attempts, stages, provider calls, recovery, SSE streams and SQL; `GET /metrics` computed from the database (plus API-local stream metrics); `worker_heartbeats` presence table; trace ids and redaction in JSON logs; optional Jaeger + Prometheus profile; see [observability.md](observability.md), `PHASE10_NOTES.md` |
-| 11 | Optional LLM provider | Done: OpenAI-compatible adapter (httpx, hard per-call deadline, error classes incl. `provider_auth`/`provider_rejected`/`provider_bad_response`, `Retry-After`), key in the worker container only, secret scrubbing before sending, delimited data blocks against prompt injection, usage + estimated cost from configured prices, pacing, combine-summary cache, per-attempt artifact folders, provider notice on New job, usage table on job detail; see [providers.md](providers.md), `PHASE11_NOTES.md` |
-| 12 | Hardening, docs, demo | E2E tests, retention/cleanup command, measured timings, failure demo |
+| 7 | Leases, recovery, cancellation, manual retry | Done: heartbeat thread, recovery loop (expired leases, lost messages), cooperative cancellation at stage boundaries, `POST /cancel`, `POST /retry`, parent-death signal for parser children; see `decisions/PHASE7_NOTES.md` |
+| 8 | SSE with replay | Done: one loop for replay and live (`Last-Event-ID` or `?after=`), `stream.end`, keepalives, stream limit and lifetime, write timeout, paginated event history, `devtools.sse_client`; see `decisions/PHASE8_NOTES.md` |
+| 9 | Dashboard | Done: Overview, New job (XHR upload progress, limits from `GET /v1/meta`, idempotent retry), Jobs (URL filters, cursor paging), Job detail (live attempt × stage timeline, event history, attempts, artifacts, manifest viewer, server-driven Cancel/Retry); `GET /v1/overview`; Vite dev proxy; CSP; Playwright e2e and screenshots; see `DESIGN.md`, `decisions/PHASE9_NOTES.md` |
+| 10 | Observability | Done: one trace per job carried through `jobs.traceparent`, `outbox.traceparent` and a Celery header; spans for requests, dispatch, attempts, stages, provider calls, recovery, SSE streams and SQL; `GET /metrics` computed from the database (plus API-local stream metrics); `worker_heartbeats` presence table; trace ids and redaction in JSON logs; optional Jaeger + Prometheus profile; see [observability.md](observability.md), `decisions/PHASE10_NOTES.md` |
+| 11 | Optional LLM provider | Done: OpenAI-compatible adapter (httpx, hard per-call deadline, error classes incl. `provider_auth`/`provider_rejected`/`provider_bad_response`, `Retry-After`), key in the worker container only, secret scrubbing before sending, delimited data blocks against prompt injection, usage + estimated cost from configured prices, pacing, combine-summary cache, per-attempt artifact folders, provider notice on New job, usage table on job detail; see [providers.md](providers.md), `decisions/PHASE11_NOTES.md` |
+| 12 | Hardening, docs, demo | Done: cleanup command and optional dispatcher loop (retention for jobs, uploads, work folders, artifacts, outbox and worker rows), `idle_in_transaction_session_timeout`, ZIP entry count from the end record, queue-depth check before lost-message requeues, upload idle/total timeouts, dependency audit, axe accessibility audit in Playwright, benchmark ([performance.md](performance.md)), recovery demo script, [acceptance.md](acceptance.md), CI; see [operations.md](operations.md), `decisions/PHASE12_NOTES.md` |
 
 ## 9. Decisions
 
@@ -324,19 +315,19 @@ specific tags.
 - Local uploads and artifacts live under `storage/`, which is gitignored.
 - Metrics are computed from the database at scrape time (authoritative across forked and
   recycled worker processes); traces are one per job, parent = the span that caused the work,
-  carried through the database and a Celery header (Phase 10; see `PHASE10_NOTES.md`).
+  carried through the database and a Celery header (Phase 10; see `decisions/PHASE10_NOTES.md`).
 - The SSE stream is an async generator that polls the database with short reads (no
   LISTEN/NOTIFY, no thread per stream), and ends with `stream.end` when the job is finished
-  (Phase 8; see `PHASE8_NOTES.md`).
+  (Phase 8; see `decisions/PHASE8_NOTES.md`).
 - Names from inside an uploaded ZIP are data, never filesystem paths: extracted bytes go into one
   generated file (`work/{job_id}/files.bin`) at recorded offsets (Phase 6; see
-  `PHASE6_NOTES.md`).
+  `decisions/PHASE6_NOTES.md`).
 
 - The dashboard keeps no state of its own about jobs: it shows the API's job snapshot and derives
   the timeline from the stored events (ordered by `seq`), re-reading the job after events and
   after Cancel/Retry (never updating optimistically). The browser talks to one origin (the Vite
   dev/preview server proxies `/v1` and `/health`), so the API sends no CORS headers (Phase 9; see
-  `PHASE9_NOTES.md`).
+  `decisions/PHASE9_NOTES.md`).
 
 ## 10. Open questions
 

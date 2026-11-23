@@ -1,16 +1,17 @@
 """Database-derived metrics for GET /metrics, computed from PostgreSQL at scrape time.
 
-Why from the database (PHASE10_NOTES.md, "Which metrics come from where"): jobs, attempts, events,
-provider calls, the outbox and the worker heartbeat table already record everything these
-metrics count. Reading them is exact, survives restarts of any process, and covers every worker
-process, including Celery children that were recycled or killed (their in-memory counters would
-be gone, and the API can't read another process's memory anyway).
+Why from the database (docs/decisions/PHASE10_NOTES.md, "Which metrics come from where"): jobs,
+attempts, events, provider calls, the outbox and the worker heartbeat table already record
+everything these metrics count. Reading them is exact, survives restarts of any process, and
+covers every worker process, including Celery children that were recycled or killed (their
+in-memory counters would be gone, and the API can't read another process's memory anyway).
 
 The cost is a few aggregate queries per scrape, bounded by a 5 s statement timeout. They scan the
-attempts, events and provider-call tables, which grow until Phase 12 adds retention.
+attempts, events and provider-call tables, which the cleanup command keeps bounded
+(docs/operations.md; scrape time measured in docs/performance.md).
 
-Counters here are totals over the rows that exist. Nothing deletes rows today; once retention
-does (Phase 12), a total can go down, which Prometheus treats as a counter reset.
+Counters here are totals over the rows that exist. When the cleanup deletes finished jobs (or old
+worker rows), a total goes down, which Prometheus treats as a counter reset.
 """
 
 import logging

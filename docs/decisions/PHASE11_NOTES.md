@@ -1,7 +1,7 @@
 # Phase 11 notes: the optional real LLM provider
 
 Each decision: what was chosen, the alternatives, why, and a plain-language explanation. The
-operator's guide is [docs/providers.md](docs/providers.md).
+operator's guide is [docs/providers.md](../providers.md).
 
 Words used below:
 - **OpenAI-compatible API**: many providers (Groq, Google Gemini, OpenAI, local servers) accept

@@ -110,7 +110,31 @@ def open_archive(path: str) -> zipfile.ZipFile:
         raise  # unreachable: fail() exits
 
 
+def declared_entries(path: str) -> int | None:
+    """The entry count written in the end-of-central-directory record (the Zip64 one when
+    present), read from the last ~64 KiB of the file without parsing the directory itself.
+    None if there is no such record (open_archive then reports zip_corrupt)."""
+    with open(path, "rb") as handle:
+        # zipfile's own reader for this record: private, but unchanged for many Python versions
+        # (the interpreter is pinned in the Docker image, and a test covers it).
+        record = zipfile._EndRecData(handle)  # type: ignore[attr-defined]
+    return None if record is None else int(record[zipfile._ECD_ENTRIES_TOTAL])  # type: ignore[attr-defined]
+
+
 def inspect(path: str, output: str, root: str, max_entries: int, max_path_length: int) -> None:
+    # Check the declared count first: an archive declaring millions of entries fails here with a
+    # clear error, before zipfile reads (and holds in memory) its whole central directory. The
+    # count can lie; then the real count below, or the sandbox's limits, still stop it.
+    try:
+        declared = declared_entries(path)
+    except OSError as exc:
+        if exc.errno in STORAGE_ERRNOS:
+            raise
+        declared = None
+    except Exception:  # e.g. BadZipFile from a bad Zip64 locator: open_archive says zip_corrupt
+        declared = None
+    if declared is not None and declared > max_entries:
+        fail("zip_too_many_files", entries=declared, limit=max_entries)
     archive = open_archive(path)
     infos = archive.infolist()
     if len(infos) > max_entries:

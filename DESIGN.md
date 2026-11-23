@@ -1,7 +1,7 @@
 # Tasklane dashboard: design
 
 Written before the screens were built (Phase 9) and revised after each screenshot critique round
-(see `PHASE9_NOTES.md`, "Critique rounds"). The code follows this file; when they disagree, fix
+(see `docs/decisions/PHASE9_NOTES.md`, "Critique rounds"). The code follows this file; when they disagree, fix
 one of them.
 
 ## 1. Subject and audience
@@ -336,7 +336,7 @@ transient"). A polite live region announces job status changes only (not every p
 | Empty | Overview | "No jobs yet. Create one to see it here." + [New job] |
 | Empty | Jobs | "No jobs match these filters." + [Clear filters]; with no filters: "No jobs yet." + [New job] |
 | Empty | Event history filter | "No events match "x"." + [Clear filter] |
-| API unreachable | everywhere | Banner: "Can't reach the API. Showing data from 12:03:44. Retrying every few seconds." Values stay visible, dimmed, with "stale" in the section heading. Never blanked. |
+| API unreachable | everywhere | Banner: "Can't reach the API. Showing data from 12:03:44. Retrying every few seconds." Values stay visible at full contrast, marked with a dashed rule and a "Not current" note (not dimmed: faded text fails the contrast minimum). Never blanked. |
 | Database down (503) | Overview, Jobs | Same banner, wording from the server's safe message |
 | Stream connecting | Job detail | "Connecting to live updates…" |
 | Live | Job detail | "● Live" (running color dot + text) |

@@ -26,7 +26,10 @@ Each pass (Recovery.run_once) does two things, each job in its own short transac
    attempt and nothing in the outbox that is unpublished or was published recently (within
    LOST_MESSAGE_GRACE_SECONDS) has evidently lost its message (Redis lost it, or a worker died
    holding it before claiming). Recovery inserts a new outbox row and records `job.requeued`. A
-   duplicate message is harmless: the worker's claim drops it.
+   duplicate message is harmless: the worker's claim drops it. While messages are still waiting
+   in the Redis queue (`queue_depth` > 0), the grace period is LONG_QUEUE_GRACE_FACTOR times
+   longer: a job behind a long queue would otherwise get a duplicate message every grace period,
+   and a really lost message is still found, later, even if the queue never drains.
 
 Safe to run twice or concurrently: SKIP LOCKED gives each pass different rows, and once a row is
 handled it no longer matches (the attempt is closed; the job has a fresh outbox row). Every
@@ -59,6 +62,9 @@ from app.observability.tracing import context_from_traceparent, current_tracepar
 logger = logging.getLogger("tasklane.recovery")
 
 LEASE_EXPIRED = "lease_expired"
+# While messages wait in Redis, a job's message may simply be in line: wait this many grace
+# periods before calling it lost.
+LONG_QUEUE_GRACE_FACTOR = 4
 EXECUTING_STATUSES = frozenset({JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED})
 
 
@@ -76,11 +82,14 @@ class Recovery:
         retry_policy: RetryPolicy,
         lost_message_grace: timedelta,
         batch_size: int = 100,
+        queue_depth: Callable[[], int] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.retry_policy = retry_policy
         self.lost_message_grace = lost_message_grace
         self.batch_size = batch_size  # per kind and pass; the next pass continues
+        # Messages waiting in the broker queue (LLEN); None = unknown, check every job.
+        self.queue_depth = queue_depth
 
     def run_once(self) -> RecoveryResult:
         return RecoveryResult(self.expire_leases(), self.requeue_lost_messages())
@@ -206,14 +215,15 @@ class Recovery:
     # --- Lost messages -----------------------------------------------------------------------
 
     def requeue_lost_messages(self) -> int:
+        grace = self.lost_message_grace
+        if self._messages_waiting():
+            grace *= LONG_QUEUE_GRACE_FACTOR
         handled, failed = 0, []
         while handled + len(failed) < self.batch_size:
             job = None
             try:
                 with self.session_factory.begin() as session:
-                    job = job_rows.lock_next_lost_message_job(
-                        session, self.lost_message_grace, skip=failed
-                    )
+                    job = job_rows.lock_next_lost_message_job(session, grace, skip=failed)
                     if job is None:
                         break
                     with (
@@ -240,6 +250,18 @@ class Recovery:
                 extra={"job_id": str(job.id), "job_status": job.status},
             )
         return handled
+
+    def _messages_waiting(self) -> bool:
+        if self.queue_depth is None:
+            return False
+        try:
+            depth = self.queue_depth()
+        except Exception as exc:  # Redis down: its messages can't be counted; check the jobs
+            logger.debug("queue depth unknown", extra={"error_type": type(exc).__name__})
+            return False
+        if depth:
+            logger.debug("messages waiting: longer lost-message grace", extra={"depth": depth})
+        return depth > 0
 
     def _requeue(self, session: Session, job: LostMessageJob) -> None:
         enqueue_run_job(session, job.id, traceparent=current_traceparent())

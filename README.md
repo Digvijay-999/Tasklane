@@ -1,360 +1,271 @@
 # Tasklane
 
-Tasklane is a planned local-first service for submitting and monitoring long-running AI
-processing jobs (PDF ingestion and repository ZIP indexing), with a focus on durable job state,
-retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) for the goals and
-[docs/architecture.md](docs/architecture.md) for the planned design.
+Tasklane is a local-first service for running long AI processing jobs (PDF ingestion and
+repository ZIP indexing) and watching them in an operations dashboard. Its focus is reliable
+orchestration: job state lives in PostgreSQL, so jobs survive crashes, duplicate messages,
+worker deaths and reconnecting browsers, and every retry, recovery and cancellation is recorded.
 
-## Current status: Phase 9 of 12
+![A job whose worker was killed mid-job: attempt 1 shows "Worker lost", recovery took the job back, and attempt 2 reused the finished stages and succeeded](docs/screenshots/job-recovered-after-worker-kill-light.png)
 
-**What works today:**
+It runs on one machine with Docker Compose, needs no API key (a deterministic stub summarizer is
+the default; an OpenAI-compatible provider is optional), and is single-user with no login. It is
+a demonstration of durable job orchestration, not a hosted product: see
+[Known limitations](#known-limitations).
 
-- A Docker Compose stack with PostgreSQL 17, Redis 7.4 (with append-only persistence), a FastAPI
-  service, an outbox dispatcher, and a Celery worker. All published ports are bound to
-  `127.0.0.1`; the dispatcher and worker publish none.
-- `GET /health/live` reports whether the API process is running.
-- `GET /health/ready` checks PostgreSQL and Redis at the same time and answers within about
-  2 seconds (`DEPENDENCY_TIMEOUT_SECONDS`), even when a dependency hangs. It returns `503` only
-  when PostgreSQL is unreachable. When Redis is down it returns `200` and reports
-  `"queue": "unavailable"`.
-- The API reconnects to PostgreSQL and Redis by itself after they restart.
-- JSON logs with an `X-Request-ID` on every request.
-- Live reload in development.
-- The database schema (uploads, jobs, attempts, events, artifacts, outbox), created by Alembic
-  migrations that run automatically before the API starts.
-- The job state machine and the database functions that apply status changes (with conditional
-  updates, so concurrent changes can't both succeed) and append per-job numbered events. See
-  [docs/reliability.md](docs/reliability.md).
-- **Uploads** (`POST /v1/uploads`): PDF and ZIP files are streamed to disk in chunks, hashed
-  (SHA-256) while streaming, size-limited on the bytes actually received (50 MiB PDF, 100 MiB ZIP),
-  and checked for extension, declared type, and file signature. ZIP contents are inspected when
-  a `repo_index` job runs (below).
-- **Jobs** (`POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{id}`): job creation requires an
-  `Idempotency-Key`; replays return the same job (`200`, `Idempotent-Replayed: true`) and reusing
-  a key for a different request returns `409`. The job, its `job.created` event, and an outbox
-  message are written in one transaction. Listing is newest first with cursor pagination.
-- One error format on every route. Full reference: [docs/api.md](docs/api.md).
-- **Jobs run.** The dispatcher publishes outbox rows to Redis (Celery); a worker claims the job,
-  records an attempt with a lease, runs it, and marks it `succeeded`. Progress, stage events, and
-  attempts are visible through `GET /v1/jobs/{id}`.
-  - Duplicate or stale messages are detected by the claim and dropped without side effects, so
-    a job is never run twice at the same time.
-  - While Redis is down, new jobs stay `queued` and visible; the dispatcher backs off and
-    publishes them when Redis returns.
-  - **Transient failures are retried automatically**: provider timeouts and outages,
-    database connection trouble and deadlocks, disk trouble, and stage timeouts. The job waits
-    in `retry_wait` with a backoff (equal jitter: the first retry is 2.5–5 s away, the second
-    5–10 s), up to 3 attempts in all, and then ends `failed` with "Gave up after 3 attempts."
-    A retry resumes after the stages that already finished: their saved outputs are verified by
-    size and SHA-256 first. Errors caused by the input, and errors nobody has classified, fail
-    at once without retrying.
-  - For development, a job can ask for injected failures (`fault_injection`) to watch retries
-    happen. This needs `ENABLE_FAULT_INJECTION=true` on the server and is off by default.
-  - **A worker that dies mid-job is recovered.** A heartbeat thread renews each running attempt's
-    lease (60 s) every 15 s. If the worker is killed, the lease runs out, and the recovery loop
-    (in the dispatcher, every 5 s) closes the attempt as `lease_expired` and retries the job
-    (same backoff and 3-attempt budget as other transient errors) or fails it with "Gave up
-    after 3 attempts.". A worker that was only slow finds its attempt closed and stops without
-    writing anything more ("fencing"). A job whose queue message was lost is sent again after
-    `LOST_MESSAGE_GRACE_SECONDS` (300 s).
-  - **Cancel** (`POST /v1/jobs/{id}/cancel`): a queued or waiting job is cancelled at once; a
-    running job stops at the next stage boundary. Cancelling a finished job changes nothing.
-  - **Manual retry** (`POST /v1/jobs/{id}/retry`): reopens a failed job with 3 more attempts,
-    resuming after the stages whose outputs still verify. Refused (`409`, with a reason) for
-    jobs that failed because of their input, jobs that aren't failed, and jobs at the 20-attempt
-    limit. The job detail says in advance whether cancel and retry are possible, and why not.
-  - A parser process (PDF or ZIP) is killed by the kernel if its worker process dies, so a killed
-    worker leaves nothing running behind it.
-  See [docs/reliability.md](docs/reliability.md#leases-heartbeats-fencing-and-recovery-phase-7).
-- **PDF ingestion** (`pdf_ingest`): validate, extract text, chunk, summarize, and write two
-  artifacts, `summary.md` and `manifest.json`, downloadable with
-  `GET /v1/jobs/{id}/artifacts/{artifact_id}`.
-  - **The default summarizer is a stub, not an AI model**: it picks the first sentences of each
-    chunk and frequent key terms. It needs no API key, is deterministic, and nothing leaves the
-    machine. An optional real provider is described below.
-  - The PDF is opened in a separate process with time, memory, CPU, and output-size limits, so
-    a malicious or broken file can't hang or exhaust the worker.
-  - Password-protected, damaged, image-only (scanned), too-long, and too-large PDFs fail with a
-    clear message after one attempt. Scanned PDFs are not supported (no OCR).
-  - Details: [docs/api.md](docs/api.md#what-a-pdf_ingest-job-does).
-- **Repository indexing** (`repo_index`): validate the ZIP, extract it, filter the files,
-  chunk the sources by lines, summarize, and write three artifacts: `summary.md` (an overview
-  and one summary per file), `chunks.jsonl` (every chunk with its file, line range and
-  SHA-256), and `manifest.json` (what was included, what was skipped and why, per-language
-  counts, and the limits that applied).
-  - The ZIP is read in a separate, limited process (like PDFs). Nothing from the archive is
-    ever executed, imported, or built, symlinks are never created or followed, and files are
-    never written under their own names: their bytes go into one generated file.
-  - An archive with any unsafe name (`..`, an absolute path, a drive letter, a backslash, a NUL
-    byte, duplicate names or names differing only in case) is rejected as a whole. So are
-    encrypted, damaged, and zip-bomb archives (sizes are counted while decompressing; the sizes
-    written in the ZIP are never trusted), archives with more than 5,000 entries, and archives
-    that expand to more than 500 MiB.
-  - Only allowlisted text and code files are indexed. Everything else is skipped with a reason
-    (`excluded_dir` for `.git`, `node_modules`, `dist`, ...; `hidden`, `binary`, `too_large`
-    over 5 MiB, `minified`, `lockfile`, `symlink`, `nested_archive`, `unsupported_type`, ...).
-    An archive with nothing to index fails with `repo_no_sources`.
-  - Threat model and where each defense is enforced and tested:
-    [docs/security.md](docs/security.md). Job details: [docs/api.md](docs/api.md#what-a-repo_index-job-does).
+## Architecture
 
-- **Live event stream** (`GET /v1/jobs/{id}/events`, Server-Sent Events): every event of a job
-  (status changes, attempts, stages, progress, retries, recovery) as it is committed, within
-  about half a second. After a dropped connection a client resumes with `Last-Event-ID` (or
-  `?after=<seq>`, for a browser page that was reloaded) and receives exactly the events it
-  missed, in order. The stream ends with a `stream.end` event once the job is finished.
-  Disconnecting never affects the job. Limits: 50 open streams per API process (then `503`),
-  1 hour per stream (the client then resumes), keepalive comments every 15 s.
-  `GET /v1/jobs/{id}/events/history` returns the same events as JSON pages.
-  See [docs/api.md](docs/api.md#events) and
-  [docs/reliability.md](docs/reliability.md#event-replay-phase-8).
+```mermaid
+flowchart LR
+    UI["Dashboard<br/>React + Vite"]
+    API["API<br/>FastAPI"]
+    PG[("PostgreSQL<br/>jobs, attempts, events,<br/>outbox, artifacts")]
+    FS[("Local storage<br/>uploads, work files,<br/>artifacts")]
+    R[("Redis<br/>Celery broker")]
+    W["Worker<br/>Celery + sandboxed parsers"]
 
-- **Dashboard** (React, http://127.0.0.1:5173): an operations console for the API above. See
-  [Dashboard](#dashboard) below.
-- `GET /v1/overview` (job counts by state, oldest queued job's age by the database clock, Redis
-  and outbox health) and `GET /v1/meta` (upload limits, accepted types, stages per workflow, and
-  whether fault injection is on), for the dashboard.
+    subgraph DP["Dispatcher process"]
+        D["Outbox dispatcher"]
+        REC["Recovery loop"]
+        CL["Cleanup loop<br/>(optional)"]
+    end
 
-- **Observability** (Phase 10): OpenTelemetry traces with **one trace per job**, from the request
-  that created it through the outbox, the dispatcher, every attempt, stage and provider call,
-  retries, recovery and manual retries (`trace_id` in `GET /v1/jobs/{id}` and on the job page).
-  `GET /metrics` (Prometheus text) with queue wait, workflow runtime and stage duration
-  histograms, job/retry/recovery/provider/dispatch counters, oldest queued age, outbox and
-  worker availability ("No worker is running" on the overview). JSON logs carry `trace_id`,
-  `job_id`, `attempt_no` and `worker_id`, and are redacted. Nothing is exported by default; an
-  optional Compose profile runs Jaeger and Prometheus locally. See
-  [docs/observability.md](docs/observability.md), including
-  [Investigating a failed job](docs/observability.md#investigating-a-failed-job).
+    UI -- "uploads, jobs,<br/>cancel, retry" --> API
+    API -- "SSE event stream<br/>(replay, then live)" --> UI
+    API -- "job + first event + outbox row<br/>in ONE transaction" --> PG
+    API --> FS
+    D -- "lock due outbox rows,<br/>publish, mark published" --> PG
+    D -- "run_job message" --> R
+    R --> W
+    W -- "claim, lease heartbeat,<br/>stage events, checkpoints" --> PG
+    W --> FS
+    REC -- "expired leases, lost messages" --> PG
+    CL -- "retention" --> PG
+```
 
-- **Optional real summarization provider** (Phase 11, off by default): any OpenAI-compatible
-  chat-completions API (tested setups documented for Groq and Google Gemini), configured with
-  `PROVIDER=openai_compatible` and shell variables; the key reaches only the worker container.
-  Secrets in the text (keys, tokens, passwords, connection strings, `.env`-style lines) are
-  replaced before sending and only counted; the text is sent as delimited data with
-  prompt-injection instructions and no tools; the model's reply is treated as untrusted text.
-  Errors map to retryable (`provider_timeout`, `provider_unavailable`, `provider_rate_limited`
-  with `Retry-After`) and permanent classes (`provider_auth`, `provider_rejected`,
-  `provider_bad_response`). Reported tokens per call, an estimated cost only from prices you
-  configure, and optional pacing (`PROVIDER_MAX_CALLS_PER_MINUTE`). The New job page says when
-  document text leaves the machine. All automated tests use a fake HTTP server; one optional
-  `live` test calls the real provider. See [docs/providers.md](docs/providers.md).
+One job's path: the API writes the job, its first event and an outbox row in one transaction
+and returns. The dispatcher publishes the outbox row to Redis. A worker claims the job in
+PostgreSQL (a duplicate message is dropped here), runs the stages while a heartbeat renews its
+lease, and writes every step as a numbered event. The dashboard reads the same events through
+the API, live. Redis is only the transport: if it loses a message, recovery sends another; if
+the worker dies, recovery notices the expired lease.
 
-**Not implemented yet:** retention and cleanup (Phase 12). See the phase list in [CLAUDE.md](CLAUDE.md).
+## The reliability ideas, in plain language
 
-## Dashboard
+- **Durable state.** PostgreSQL is the only source of truth for what the user sees. Redis and
+  Celery never decide a job's status; if Redis is down, the API still shows every job.
+- **The outbox.** "Create the job" and "send it to a worker" are one database transaction, so
+  a job can never exist without its message, or the other way round. A separate process
+  (the dispatcher) moves committed messages to Redis and retries until Redis accepts them.
+- **Duplicate delivery and idempotency.** Messages can arrive twice (a crash between publishing
+  and marking the row published, Redis redelivery). The worker's claim is a conditional update in
+  PostgreSQL, so only one delivery starts an attempt; the others are dropped without writing
+  anything. Stages are deterministic and write files atomically, so re-running one is harmless.
+  On the client side, `POST /v1/jobs` needs an `Idempotency-Key`: the same key and request return
+  the same job; the same key with a different request is a `409`. This is **at-least-once
+  delivery with idempotent processing, not exactly-once execution.**
+- **Leases and heartbeats.** A running attempt holds a 60-second lease that a heartbeat thread
+  renews every 15 s. If the worker dies, the lease runs out and the recovery loop retries the job
+  (or fails it clearly when the retry budget is used up). A worker that was only slow finds its
+  attempt closed and stops without writing ("fencing").
+- **Retries.** Only errors classified as transient (provider timeouts and outages, database or
+  disk trouble, a lost worker) are retried, with exponential backoff and jitter, up to 3 attempts;
+  input errors fail at once with a clear message. A retry resumes after the stages whose saved
+  outputs still verify by size and SHA-256. A failed job can be retried by hand with a fresh budget.
+- **Cancellation.** A queued job is cancelled at once (its pending message is deleted); a running
+  job stops at the next stage boundary. It never depends on killing a process.
+- **Event replay.** Every event has a per-job sequence number and is stored before it is sent.
+  A browser that reconnects with `Last-Event-ID` gets exactly the events it missed, in order,
+  then the live ones. Disconnecting never affects the job.
+- **Retention.** A cleanup command deletes finished jobs, expired uploads and intermediate files
+  past their retention period, never anything an unfinished job uses, and only after the rows
+  that point at the files are gone.
 
-`docker compose up --build -d` also starts the dashboard. Open **http://127.0.0.1:5173**.
+The details, with the failure cases each mechanism covers: [docs/reliability.md](docs/reliability.md).
 
-| Screen | What it answers |
-|---|---|
-| **Overview** | Is the system healthy? Jobs per state, Redis and dispatcher health, the oldest queued job's age, recent jobs. |
-| **Jobs** | Job history, filtered by workflow and state (the filters are in the URL, so a view can be shared or reloaded), newest first, with cursor paging. |
-| **New job** | Upload a PDF or repository ZIP with a progress bar and start a job. The file is checked against the server's limits first. Retrying after a network error reuses the same idempotency key, so it can't create a second job. |
-| **Job detail** | A live timeline (one row per attempt, one column per stage: retries, reused checkpoints, lost workers, cancellation), the error and what you can do about it, attempts, downloads, the repository manifest, and the full event history. Cancel and Retry follow the server's `can_cancel` / `can_retry` and show its reason when unavailable. |
+## Quickstart
 
-The page follows each job live over Server-Sent Events and resumes from the last event after a
-dropped connection or a page reload; when the server's stream limit is reached it polls instead,
-and it says which of these it is doing. When the API can't be reached, the last known data stays
-on screen marked as not current. Light and dark themes follow the system setting (or the theme
-menu). Design: [DESIGN.md](DESIGN.md); decisions: [PHASE9_NOTES.md](PHASE9_NOTES.md).
-
-| | |
-|---|---|
-| ![A job that failed once with an injected transient error and succeeded on its automatic retry, reusing three checkpoints](docs/screenshots/job-retried-fault-injection-light.png) | ![The same job in the dark theme](docs/screenshots/job-retried-fault-injection-dark.png) |
-| ![A worker killed mid-job: attempt 1 shows "Worker lost", recovery took the job back and attempt 2 succeeded](docs/screenshots/job-recovered-after-worker-kill-light.png) | ![A scanned PDF that failed with pdf_no_text, with Retry disabled and the reason shown](docs/screenshots/job-failed-scanned-pdf-dark.png) |
-| ![Overview: jobs per state, queue health and recent jobs](docs/screenshots/overview-light.png) | ![A repository ZIP job with its manifest: languages, skip reasons, indexed and skipped files](docs/screenshots/job-repo-manifest-dark.png) |
-
-Every screen and state, in both themes: [docs/screenshots/](docs/screenshots/).
-
-To run the dashboard on Windows instead of in Docker (Node 24): `npm ci` and `npm run dev` in
-`frontend/`. It proxies `/v1` to `http://127.0.0.1:8000` either way, so the API needs no CORS.
-
-## Requirements
-
-- Docker Desktop (or Docker Engine with Compose v2)
-
-## Run it
-
-PowerShell on Windows (on macOS or Linux, use `cp` instead of `Copy-Item`):
+Needs Docker Desktop (or Docker Engine with Compose v2). PowerShell on Windows; on macOS or Linux
+use `cp` instead of `Copy-Item`.
 
 ```powershell
-Copy-Item .env.example .env        # then edit .env if you like; it is gitignored
-docker compose up --build -d
-curl.exe http://127.0.0.1:8000/health/live
+git clone <this repository> tasklane; cd tasklane
+Copy-Item .env.example .env            # local settings; .env is gitignored
+docker compose up --build -d           # PostgreSQL, Redis, migrations, API, dispatcher, worker, dashboard
 curl.exe http://127.0.0.1:8000/health/ready
 ```
 
-Interactive API docs (generated by FastAPI): http://127.0.0.1:8000/docs
-
-If a port is already in use, change `API_HOST_PORT`, `POSTGRES_HOST_PORT`, or `REDIS_HOST_PORT` in `.env`.
-
-`docker compose up` first runs a one-shot `migrate` container (`alembic upgrade head`); the API
-starts only after it succeeds. `docker compose ps -a` shows it as `Exited (0)` when it worked.
-
-Stop the stack with `docker compose down`; the database, uploaded files, and queued messages are
-kept in Docker volumes. `docker compose down -v` **deletes all three** (all jobs, all uploaded
-files, and any messages waiting in Redis).
-
-Watch jobs being published and run:
+Then open the dashboard at **http://127.0.0.1:5173**, choose New job, and upload a PDF or a ZIP
+of a source repository. To get sample files (a text PDF, a scanned one, a password-protected
+one, a realistic repository ZIP, a zip bomb, a zip-slip archive, ...):
 
 ```powershell
-docker compose logs -f worker dispatcher
+docker compose run --rm -v "${env:USERPROFILE}\tasklane-demo:/out" api python -m devtools.pdf_samples /out
+docker compose run --rm -v "${env:USERPROFILE}\tasklane-demo:/out" api python -m devtools.zip_samples /out
 ```
 
-To have time to watch a job (or to stop the worker mid-job), slow the stub summarizer down,
-e.g. `STUB_DELAY_SECONDS=2` (seconds per summarization call) in `.env`, then
-`docker compose up -d worker`.
+Every published port is bound to `127.0.0.1`. If 8000, 5173, 5432 or 6379 is taken, change
+`API_HOST_PORT`, `FRONTEND_HOST_PORT`, `POSTGRES_HOST_PORT` or `REDIS_HOST_PORT` in `.env`.
+`docker compose down` stops everything and keeps the data; `docker compose down -v` also deletes
+the database, the uploaded files and any queued messages.
 
-### Sample PDFs
+The API is documented in [docs/api.md](docs/api.md) (with PowerShell examples) and interactively
+at http://127.0.0.1:8000/docs.
 
-The repository contains no PDF files; a script generates small samples (a text report, a scanned
-look-alike with no text, a password-protected one, one with only an owner password, and a damaged
-one) into a folder you choose:
+## See it recover from a crash
 
 ```powershell
-$demo = "$env:USERPROFILE\tasklane-demo"
-New-Item -ItemType Directory -Force $demo | Out-Null
-docker compose run --rm -v "${demo}:/out" api python -m devtools.pdf_samples /out
+powershell -ExecutionPolicy Bypass -File scripts\demo-recovery.ps1
 ```
 
-### Sample ZIPs
+The script submits a job, **kills the worker container in the middle of it**, starts a new
+worker, and prints the job's stored events: the attempt that lost its worker
+(`attempt.lease_expired`), the backoff, the second attempt reusing the checkpoints of the
+stages that had finished, and the final `succeeded`. It takes about two minutes, mostly waiting
+for the dead worker's 60-second lease to run out. Details: [docs/operations.md](docs/operations.md#failure-and-recovery-demo).
 
-Likewise for repository ZIPs: `repo.zip` (a realistic small repository with files skipped for
-every reason), `zipslip.zip`, `symlink.zip`, `bomb.zip` (about 2 KB on disk: 2 MiB of zeros
-compressed about 1000:1, rejected before it is decompressed), `encrypted.zip`, `corrupt.zip`,
-`nested.zip`, and `empty_repo.zip`:
+## Dashboard
 
-```powershell
-docker compose run --rm -v "${demo}:/out" api python -m devtools.zip_samples /out
-```
+| Screen | What it answers |
+|---|---|
+| **Overview** | Is the system healthy? Jobs per state, Redis, dispatcher and worker health, the oldest queued job's age, recent jobs. |
+| **Jobs** | Job history, filtered by workflow and state (filters live in the URL), newest first. |
+| **New job** | Upload with a progress bar, checked against the server's limits first. A retried submission reuses its idempotency key, so it can't create a second job. |
+| **Job detail** | A live timeline (one row per attempt, one column per stage), the error and what you can do about it, attempts, downloads, the repository manifest, the full event history, the trace id. Cancel and Retry follow the server's `can_cancel` / `can_retry`. |
 
-## Try the API (PowerShell)
-
-These use `curl.exe` (not the PowerShell `curl` alias). Run them from a folder containing a PDF
-named `report.pdf`. Every route, with all options and error codes, is documented in
-[docs/api.md](docs/api.md).
-
-```powershell
-$api = "http://127.0.0.1:8000"
-
-# Upload: raw file body, --data-binary, and an explicit Content-Type (curl's default is rejected)
-$upload = curl.exe -s -X POST "$api/v1/uploads?filename=report.pdf" -H "Content-Type: application/pdf" --data-binary "@report.pdf" | ConvertFrom-Json
-$upload
-
-# Create a job. JSON goes through a file: PowerShell 5.1 mangles quotes in inline JSON.
-@{ workflow_type = "pdf_ingest"; upload_id = $upload.id } | ConvertTo-Json -Compress | Set-Content -Encoding ascii job.json
-$key = "demo-" + [guid]::NewGuid()
-curl.exe -i -X POST "$api/v1/jobs" -H "Content-Type: application/json" -H "Idempotency-Key: $key" --data-binary "@job.json"
-
-# Same key + same body again: 200 with "Idempotent-Replayed: true", same job
-curl.exe -i -X POST "$api/v1/jobs" -H "Content-Type: application/json" -H "Idempotency-Key: $key" --data-binary "@job.json"
-
-# List jobs (newest first) and fetch one
-curl.exe -s "$api/v1/jobs?limit=5"
-$job = (curl.exe -s "$api/v1/jobs?limit=1" | ConvertFrom-Json).items[0]
-curl.exe -s "$api/v1/jobs/$($job.id)"
-
-# Once it has succeeded, download the summary
-$detail = curl.exe -s "$api/v1/jobs/$($job.id)" | ConvertFrom-Json
-$summary = $detail.artifacts | Where-Object artifact_type -eq "summary"
-curl.exe -s -o summary.md "$api$($summary.download_url)"
-
-# Cancel a job, or retry a failed one (409 with a reason if it can't be retried)
-curl.exe -s -X POST "$api/v1/jobs/$($job.id)/cancel"
-curl.exe -s -X POST "$api/v1/jobs/$($job.id)/retry"
-
-# Follow a job's events live (-N: print as they arrive). Ctrl+C to stop; a finished job's
-# stream ends by itself with "event: stream.end".
-curl.exe -N "$api/v1/jobs/$($job.id)/events"
-# Resume after event 5 (as a reconnecting client would), by header or by query parameter
-curl.exe -N -H "Last-Event-ID: 5" "$api/v1/jobs/$($job.id)/events"
-curl.exe -N "$api/v1/jobs/$($job.id)/events?after=5"
-# The same events as JSON pages
-curl.exe -s "$api/v1/jobs/$($job.id)/events/history?limit=10"
-
-# A readable view of the stream (runs inside the api container, where the API is localhost:8000)
-docker compose exec -T api python -m devtools.sse_client "http://localhost:8000/v1/jobs/$($job.id)/events"
-```
-
-Uploaded files, intermediate files (`work/`), and artifacts live in the `storage` Docker volume,
-not in your project folder:
-
-```powershell
-docker compose exec api find /data/storage -type f
-```
-
-## Database migrations
-
-Migrations live in `backend/migrations/versions/` (like knex or Prisma migrations).
-
-```powershell
-docker compose run --rm migrate                                   # apply new migrations
-docker compose run --rm migrate alembic current                   # show the applied version
-docker compose run --rm migrate alembic history                   # list migrations
-docker compose run --rm migrate alembic check                     # "No new upgrade operations
-                                                                  #  detected" = models match DB
-docker compose run --rm api alembic revision --autogenerate --rev-id 0005 -m "describe change"
-```
-
-Autogenerate writes a *draft* into `backend/migrations/versions/`. Always review it by hand: it
-does not detect CHECK constraints and is unreliable with partial indexes. Tests fail if the models
-and migrations disagree.
-
-## Development
-
-The `api` container runs your local `backend/app` source code, and uvicorn restarts when a file
-changes, so you don't need to rebuild after editing code. Rebuild only after changing dependencies
-(`backend/pyproject.toml` / `backend/uv.lock`), `backend/alembic.ini`, or `backend/Dockerfile`:
-`docker compose up --build -d`.
-
-On Docker Desktop for Windows, file-change events from the Windows filesystem don't reach Linux
-containers, so `.env` sets `WATCHFILES_FORCE_POLLING=true` and the reloader checks files on a timer.
-
-The `worker` and `dispatcher` containers also run your local code and restart when a `.py` file
-under `backend/app` changes (via `backend/devtools/reload.py`). A restart, like
-`docker compose stop worker`, lets a running job finish for up to 25 seconds; a job still running
-after that is interrupted; recovery retries it once its lease (60 s) has expired.
-
-The `frontend` container runs Vite with your local `frontend/src`, and it polls for changes
-for the same reason (`TASKLANE_DEV_POLLING=true`); the page updates when you save a file. Rebuild
-it after changing `frontend/package.json`: `docker compose up --build -d frontend`.
-
-Watch logs: `docker compose logs -f api worker dispatcher`
+When the API can't be reached, the last data stays on screen marked "Not current". Light and dark
+themes; an automated accessibility audit (axe, WCAG 2.2 AA) covers every screen in both.
+Every screen and state: [docs/screenshots/](docs/screenshots/). Design: [DESIGN.md](DESIGN.md).
 
 ## Tests
 
-Tests run inside Docker against the real PostgreSQL and Redis containers. Integration tests use a
-separate database, `<POSTGRES_DB>_test` (for example `tasklane_test`), which they drop and recreate
-on every run; they never touch your development database.
+Backend tests run inside Docker against real PostgreSQL and Redis (a separate `<db>_test`
+database and Redis database 15; your data is never touched):
 
 ```powershell
-docker compose run --rm api pytest                  # everything (about 7 minutes)
-docker compose run --rm api pytest -m "not e2e"     # skip the end-to-end tests
-docker compose run --rm api pytest -m e2e           # only end-to-end: real worker + dispatcher
-docker compose run --rm api pytest tests/unit       # unit tests only (no database needed)
-docker compose run --rm api pytest -m integration   # integration tests only
-docker compose run --rm api ruff check app tests migrations devtools   # lint
+docker compose run --rm api pytest                  # everything: unit, integration, end-to-end
+docker compose run --rm api pytest -m "not e2e"     # skip the slower end-to-end tests (what CI runs)
+docker compose run --rm api ruff check app tests migrations devtools
 ```
 
-Dashboard tests run on Windows with Node 24, from `frontend/` (`npm ci` first):
+The end-to-end tests start real worker and dispatcher processes and, among other things, kill a
+worker mid-job, deliver messages twice, and check that nothing reaches the real storage volume.
+
+Dashboard tests, from `frontend/` with Node 24 (`npm ci` first):
 
 ```powershell
-npm test               # unit and component tests (Vitest + Testing Library, no server needed)
-npm run typecheck      # TypeScript
-npx playwright install chromium   # once: the browser for the end-to-end tests
-npm run e2e            # Playwright against the real stack (needs the demo settings, see WALKTHROUGH_PHASE9.md)
-npm run screenshots    # regenerate docs/screenshots (real stack, light and dark)
+npm test                 # unit and component tests (Vitest)
+npm run typecheck
 ```
 
-The end-to-end tests build the dashboard and serve the production build (with its
-Content-Security-Policy) through `vite preview` on http://127.0.0.1:4173. They create jobs in
-your development database.
+### End-to-end tests
 
-## Dependency pinning
+The Playwright suite (including the accessibility audit) drives a production build of the
+dashboard against the real stack, which must run with the demo settings: fault injection on and
+slower stub calls, so jobs can be watched and interrupted. Set them for one PowerShell session,
+run the tests, then restore your own settings:
 
-- Python dependencies are declared in `backend/pyproject.toml` and locked to exact versions in
-  `backend/uv.lock` (like `package.json` + `package-lock.json`). Docker installs with
-  `uv sync --frozen`, which fails if the lock file is out of date.
-- Docker images are pinned to specific tags in `compose.yaml`, `backend/Dockerfile` and
-  `frontend/Dockerfile` (`node:24.21.0-bookworm-slim`).
-- Dashboard dependencies are exact versions in `frontend/package.json`, locked in the committed
-  `frontend/package-lock.json`, and installed with `npm ci` (which fails if the two disagree).
+```powershell
+$env:ENABLE_FAULT_INJECTION="true"; $env:STUB_DELAY_SECONDS="1"; $env:LEASE_SECONDS="20"; $env:PROVIDER_TIMEOUT_SECONDS="10"; $env:RECOVERY_INTERVAL_SECONDS="2"; $env:RETRY_BASE_SECONDS="2"
+docker compose up -d
+cd frontend; npx playwright install chromium; npm run e2e; cd ..
+"ENABLE_FAULT_INJECTION","STUB_DELAY_SECONDS","LEASE_SECONDS","PROVIDER_TIMEOUT_SECONDS","RECOVERY_INTERVAL_SECONDS","RETRY_BASE_SECONDS" | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
+docker compose up -d
+```
+
+These runs create jobs in the development database (remove finished ones with the cleanup:
+[docs/operations.md](docs/operations.md#retention-and-cleanup)).
+
+**CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs lint, the backend unit and
+integration tests (with PostgreSQL and Redis service containers), and the dashboard's unit tests
+and type check on every push and pull request. The end-to-end suites (backend `e2e`, Playwright,
+accessibility) are not in CI: they need the whole Compose stack, and run locally as above.
+
+Which test proves which acceptance criterion: [docs/acceptance.md](docs/acceptance.md).
+
+## Measured performance
+
+Measured on one development machine (Windows 11 laptop, i5-12450H, Docker Desktop with 12 CPUs
+and 7.6 GiB) with the stub summarizer and the default two worker processes; local measurements,
+not production scale:
+
+| | PDF job (4 pages) | Repository job (25 entries) |
+|---|---|---|
+| Worker time per job (median) | 1.33 s | 1.08 s |
+| One job on an idle system, submit to finished | 2.30 s | 2.06 s |
+| 40 jobs submitted at once: queue wait median / p95 | 11.7 s / 21.8 s | 11.8 s / 22.0 s |
+
+With an instant summarizer, a batch is limited by the number of worker processes (40 jobs took
+26.8 s). Command, inputs, settings and caveats: [docs/performance.md](docs/performance.md).
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [PROJECT_BRIEF.md](PROJECT_BRIEF.md) | The original goals and acceptance criteria |
+| [docs/architecture.md](docs/architecture.md) | Components, the lifecycle of a job, build phases, versions |
+| [docs/api.md](docs/api.md) | Every route, error code and limit, with PowerShell examples |
+| [docs/reliability.md](docs/reliability.md) | State machine, outbox, claim, leases, recovery, cancellation, replay, retries |
+| [docs/security.md](docs/security.md) | Threat model: uploads, the parser sandbox, ZIP and PDF defenses, the dashboard, logs |
+| [docs/observability.md](docs/observability.md) | One trace per job, metrics, logs, investigating a failed job |
+| [docs/providers.md](docs/providers.md) | The optional OpenAI-compatible provider |
+| [docs/operations.md](docs/operations.md) | Retention and cleanup, every time and size limit, the demo, the benchmark, the dependency audit |
+| [docs/performance.md](docs/performance.md) | Benchmark results |
+| [docs/acceptance.md](docs/acceptance.md) | Each acceptance criterion, its tests, and how to see it |
+| [docs/decisions/](docs/decisions/) | Why each design decision was made, with the alternatives |
+| [docs/walkthroughs/](docs/walkthroughs/) | Step-by-step manual checks, one per phase |
+| [DESIGN.md](DESIGN.md) | Dashboard design |
+| [CLAUDE.md](CLAUDE.md) | Maintainer guide: module boundaries, design rules, commands |
+
+## Development
+
+The `api`, `worker` and `dispatcher` containers run your local `backend/` code and restart when
+a Python file changes; the `frontend` container runs Vite on your local `frontend/src`. Rebuild
+only after changing dependencies (`backend/pyproject.toml`, `backend/uv.lock`,
+`frontend/package.json`) or a Dockerfile: `docker compose up --build -d`. On Docker Desktop for
+Windows, file changes are detected by polling (`WATCHFILES_FORCE_POLLING`, `TASKLANE_DEV_POLLING`).
+Restarting the worker interrupts running jobs; recovery retries them once their lease expires.
+
+Migrations live in `backend/migrations/versions/` and run in the one-shot `migrate` service
+before the API starts (`docker compose run --rm migrate alembic check` compares them with the
+models). Python dependencies are locked in `backend/uv.lock`, dashboard dependencies in
+`frontend/package-lock.json` (exact versions), Docker images by tag.
+
+## Known limitations
+
+What Tasklane deliberately does not do, and why:
+
+- **Single user, local only.** No authentication: anyone who can reach `127.0.0.1:8000` can
+  upload. No cloud storage, Kubernetes or multi-machine deployment. The benchmark measures one
+  development machine, not production scale.
+- **At-least-once, not exactly-once.** A stage can run more than once (duplicate delivery, a
+  retry after a lost worker); this is safe because stages are deterministic and idempotent, not
+  because duplicates can't happen. With a real LLM provider, re-running a stage can produce a
+  different summary (per-attempt artifact folders keep a late, fenced write from replacing the
+  registered one).
+- **Recovery takes a lease period.** A killed worker's job is retried only after its 60 s lease
+  runs out. A worker machine that vanishes mid-transaction holds its row locks until PostgreSQL
+  ends the idle session (60 s, `DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS`).
+- **Cancellation waits for the stage boundary.** A long stage (summarizing a 500-page PDF) runs
+  to its end before the job becomes `cancelled`.
+- **Scanned PDFs are not supported** (no OCR): they fail with `pdf_no_text`.
+- **The real provider's limits were documented, not measured.** Whether a 1000-call repository
+  fits the 900 s summarize limit with pacing depends on the provider; measuring it needs a paid
+  key and sends data to a third party, so it was not done. With the stub nothing leaves the
+  machine.
+- **Secrets without a recognisable format** inside indexed files are sent to a real provider as
+  they are (known formats and `.env`-style lines are replaced first). Files are not scanned for
+  malware.
+- **No extraction cap below the configured limits.** A repository job extracts allowlisted files
+  up to `ZIP_MAX_TOTAL_BYTES` (500 MiB) even if the provider-call limit would later stop it; a
+  byte cap before filtering would misfire on files the filter skips (minified, binary). The
+  filter stage stops early once the text can't fit, and the work folder is deleted after
+  `RETENTION_WORK_DAYS`.
+- **A ZIP whose end record understates its entry count** falls back to the real count, or to the
+  reader's memory and time limits (`zip_too_complex`) for millions of entries.
+- **Cleanup is off by default** and deletes nothing until you run it or enable the loop; deleting
+  rows lowers the `/metrics` counters (a counter reset for Prometheus). A manual retry after the
+  upload was deleted fails with `input_unavailable`.
+- **Test runs share the development database.** Playwright, the screenshot run and the benchmark
+  create jobs there (the cleanup removes finished ones); there is no separate demo database.
+- **Not in CI:** the end-to-end suites, which need the full Compose stack.
+- **Jobs created before Phase 10** have no trace id.

@@ -3,6 +3,16 @@ import type { ReactNode } from 'react';
 import { ApiError } from '../lib/api/client';
 import { formatTime } from '../lib/format';
 
+/** A table that may scroll sideways on a narrow screen. It is a named, focusable region, so a
+ * keyboard user can scroll it too (WCAG 2.1.1; axe rule scrollable-region-focusable). */
+export function TableScroll({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="table-scroll" role="region" aria-label={label} tabIndex={0}>
+      {children}
+    </div>
+  );
+}
+
 export function ProgressBar({ value, label, tone }: { value: number; label: string; tone?: string }) {
   const clamped = Math.max(0, Math.min(100, value));
   return (

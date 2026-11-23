@@ -1,0 +1,83 @@
+# Continuous integration: lint, backend unit + integration tests (real PostgreSQL and Redis as
+# service containers), frontend unit tests and type check, on every push and pull request.
+#
+# Not run here: the end-to-end suites. The backend's `e2e` tests start real worker and dispatcher
+# processes, and the Playwright suites (`npm run e2e`, accessibility audit included) need the
+# whole Docker Compose stack with the demo settings. Both run locally (README.md, "Tests").
+#
+# Actions are pinned to full commit SHAs (the tag is in the comment), so a moved tag can't change
+# what runs.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17.11-alpine
+        env:
+          POSTGRES_USER: tasklane
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: tasklane
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tasklane -d tasklane"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7.4.12-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      POSTGRES_USER: tasklane
+      POSTGRES_PASSWORD: ci-only-password
+      POSTGRES_DB: tasklane
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      REDIS_URL: redis://localhost:6379/0
+      STORAGE_ROOT: ${{ runner.temp }}/storage
+      UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/venv
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13.18"
+      - name: Install uv and the locked dependencies
+        run: |
+          python -m pip install uv==0.13.6
+          uv sync --frozen
+      - name: Lint and format check
+        run: |
+          uv run ruff check app tests migrations devtools
+          uv run ruff format --check app tests migrations devtools
+      - name: Unit and integration tests (no e2e)
+        run: uv run pytest -m "not e2e" -q
+
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.21.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

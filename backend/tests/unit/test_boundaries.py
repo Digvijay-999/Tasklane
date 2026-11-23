@@ -62,6 +62,18 @@ FORBIDDEN = {
         "app.storage",
         "app.workflows",
     ),
+    # Cleanup (Phase 12): database rows and files only; no HTTP, no queue, no workflow code.
+    "maintenance": (
+        "fastapi",
+        "starlette",
+        "celery",
+        "kombu",
+        "app.api",
+        "app.queue",
+        "app.services",
+        "app.workflows",
+        "app.providers",
+    ),
 }
 
 

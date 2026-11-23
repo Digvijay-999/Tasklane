@@ -50,6 +50,10 @@ class UploadInterruptedError(Exception):
     """The client disconnected before the whole file arrived (raised by the api layer)."""
 
 
+class _UploadTimeoutError(Exception):
+    """No bytes arrived within the idle timeout, or the upload took too long in total."""
+
+
 @dataclass(frozen=True)
 class UploadLimits:
     pdf_bytes: int
@@ -75,11 +79,16 @@ class UploadService:
         storage: LocalStorage,
         limits: UploadLimits,
         ttl: timedelta,
+        *,
+        idle_timeout: float = 30,
+        max_seconds: float = 1800,
     ) -> None:
         self.session_factory = session_factory
         self.storage = storage
         self.limits = limits
         self.ttl = ttl
+        self.idle_timeout = idle_timeout
+        self.max_seconds = max_seconds
 
     async def receive(
         self,
@@ -99,7 +108,7 @@ class UploadService:
         await to_thread.run_sync(self._insert_receiving, upload_id, final_path, filename, kind)
 
         try:
-            sha256, size = await self._stream_to_disk(upload_id, kind, limit, chunks)
+            sha256, size = await self._stream_to_disk(upload_id, kind, limit, self._timed(chunks))
             await to_thread.run_sync(self.storage.commit_incoming, upload_id, final_path)
             await to_thread.run_sync(self._mark_ready, upload_id, sha256, size)
         except _RejectedError as rejected:
@@ -108,6 +117,13 @@ class UploadService:
         except UploadInterruptedError:
             await self._reject(upload_id, final_path, UploadRejectionReason.CLIENT_DISCONNECTED)
             raise
+        except _UploadTimeoutError:
+            await self._reject(upload_id, final_path, UploadRejectionReason.INTERRUPTED)
+            raise ServiceError(
+                ErrorCode.UPLOAD_TIMEOUT,
+                f"The upload was too slow: no data for {self.idle_timeout:g} seconds, or more "
+                f"than {self.max_seconds:g} seconds in total.",
+            ) from None
         except anyio.get_cancelled_exc_class():
             # The request was cancelled (e.g. the server is shutting down): clean up, re-raise.
             await self._reject(upload_id, final_path, UploadRejectionReason.INTERRUPTED)
@@ -193,6 +209,27 @@ class UploadService:
             if not handle.closed:
                 handle.close()
         return hasher.hexdigest(), size
+
+    async def _timed(self, chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+        """The chunks, but each one must arrive within the idle timeout and all of them within
+        the overall deadline."""
+        deadline = anyio.current_time() + self.max_seconds
+        iterator = aiter(chunks)
+        try:
+            while True:
+                wait = min(self.idle_timeout, deadline - anyio.current_time())
+                try:
+                    with anyio.fail_after(max(wait, 0)):
+                        chunk = await anext(iterator)
+                except StopAsyncIteration:
+                    return
+                except TimeoutError:
+                    raise _UploadTimeoutError from None
+                yield chunk
+        finally:
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                await close()
 
     def _mark_ready(self, upload_id: uuid.UUID, sha256: str, size: int) -> None:
         with self.session_factory.begin() as session:

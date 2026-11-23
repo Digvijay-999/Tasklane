@@ -2,7 +2,7 @@
 
 Windows PowerShell 5.1, one window, every path is a variable, no `cd`. All settings are **shell
 variables only** (`.env` is never edited); step 13 removes them. Ids, token counts, costs and
-summaries will differ from the examples. Background: [docs/providers.md](docs/providers.md).
+summaries will differ from the examples. Background: [docs/providers.md](../providers.md).
 
 Steps marked **(you run this)** need your Groq key (or call Groq's servers) and were not run by
 Claude; every other step was run twice exactly as written. You set the key yourself with

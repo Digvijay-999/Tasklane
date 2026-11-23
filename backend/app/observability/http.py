@@ -1,11 +1,11 @@
 """Per-request context for the API: a request ID, a server span, and one log line per request.
 
 Plain ASGI middleware (not Starlette's BaseHTTPMiddleware), so it works with streaming responses
-(SSE). Written here instead of using opentelemetry-instrumentation-fastapi (PHASE10_NOTES.md):
-that package records the full URL including the query string (upload file names travel in
-`?filename=`) and adds a span for every ASGI message, which for an event stream is a span per
-event. This span records only the method, the route *template* (`/v1/jobs/{job_id}`), the
-status code and, for job routes, the job id.
+(SSE). Written here instead of using opentelemetry-instrumentation-fastapi
+(docs/decisions/PHASE10_NOTES.md): that package records the full URL including the query
+string (upload file names travel in `?filename=`) and adds a span for every ASGI message, which
+for an event stream is a span per event. This span records only the method, the route
+*template* (`/v1/jobs/{job_id}`), the status code and, for job routes, the job id.
 
 Incoming `traceparent` headers are ignored: every request starts its own trace. Health checks
 and /metrics (polled every few seconds by Docker and Prometheus) are not traced.

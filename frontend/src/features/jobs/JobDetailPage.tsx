@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router';
 import { SafeText } from '../../components/SafeText';
 import { StatusBadge } from '../../components/Status';
-import { ErrorNotice, ProgressBar, Skeleton, StaleNote } from '../../components/ui';
+import { ErrorNotice, ProgressBar, Skeleton, StaleNote, TableScroll } from '../../components/ui';
 import { ApiError, api } from '../../lib/api/client';
 import { isTerminal, type Artifact, type JobDetail, type JobEvent, type ModelUsage } from '../../lib/api/types';
 import { durationBetween, formatBytes, formatDateTime, formatDuration, formatTime, percent } from '../../lib/format';
@@ -209,7 +209,7 @@ const tokens = (value: number | null) => (value === null ? '—' : value.toLocal
 export function Usage({ usage }: { usage: ModelUsage[] }) {
   if (usage.length === 0) return <p className="muted">No summarization calls yet.</p>;
   return (
-    <div className="table-scroll">
+    <TableScroll label="Summarization usage table">
       <table className="table table-compact">
         <caption className="visually-hidden">Summarization usage</caption>
         <thead>
@@ -260,14 +260,14 @@ export function Usage({ usage }: { usage: ModelUsage[] }) {
         Tokens as reported by the provider, over every attempt (failed ones included). The estimated cost uses the prices configured
         on the server and is shown only when they are set.
       </p>
-    </div>
+    </TableScroll>
   );
 }
 
 function Attempts({ job, now }: { job: JobDetail; now: number }) {
   if (job.attempts.length === 0) return <p className="muted">No attempt yet: the job is waiting for a worker.</p>;
   return (
-    <div className="table-scroll">
+    <TableScroll label="Attempts table">
       <table className="table table-compact">
         <caption className="visually-hidden">Attempts</caption>
         <thead>
@@ -309,7 +309,7 @@ function Attempts({ job, now }: { job: JobDetail; now: number }) {
           ))}
         </tbody>
       </table>
-    </div>
+    </TableScroll>
   );
 }
 

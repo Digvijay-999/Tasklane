@@ -195,12 +195,30 @@ data, are sent as they are (the New job page says so). Prompt-injection defenses
 a misleading summary; they can't rule it out. A summary from a model is untrusted text, like the
 document itself.
 
+## Hardening review (Phase 12)
+
+- **Slow and stalled uploads**: an upload with no bytes for 30 s, or longer than 30 minutes in
+  total, is cut off with `408 upload_timeout` and cleaned up (before, a stalled client held its
+  request, partial file and `receiving` row open indefinitely). Every other limit and timeout
+  was reviewed; the table is in [operations.md](operations.md#time-and-size-limits).
+- **Archives declaring millions of entries** fail with `zip_too_many_files` from the
+  end-of-central-directory record, before the directory is read into memory. A record that
+  understates the count is still caught by the real count (or the sandbox's limits).
+- **Cleanup path safety**: only canonical UUID folder names in the known storage folders are
+  considered; every path is resolved and refused if it leaves the storage root or passes
+  through a symlink (a planted symlink is logged, never followed).
+- **Dependency audit** (2026-11-23): `pip-audit` 2.10.1 over every locked Python package
+  (`uv export --frozen`, runtime and dev) and `npm audit` over the dashboard's lock file: no
+  known vulnerabilities in either. How to re-run them:
+  [operations.md](operations.md#dependency-audit).
+
 ## Not covered (yet)
 
 - **Secrets without a recognisable format or name** inside indexed files are sent to a real
   provider as they are (see above). With the stub nothing leaves the machine.
-- **Disk use of successful jobs.** A succeeded job keeps `work/{job_id}/files.bin` (up to
-  `ZIP_MAX_TOTAL_BYTES`), and one upload can feed many jobs. Retention is Phase 12.
+- **Disk use between cleanups.** A finished repository job keeps `work/{job_id}/files.bin` (up to
+  `ZIP_MAX_TOTAL_BYTES`) until `RETENTION_WORK_DAYS` (7) have passed and the cleanup runs, and
+  one upload can feed many jobs. The cleanup is off by default ([operations.md](operations.md)).
 - **Bare-URL file names** (`www.example.com/x.md`) can become links in renderers that auto-link
   (GitHub-flavoured Markdown) when you open a downloaded `summary.md` elsewhere. The dashboard
   never auto-links (see above).

@@ -54,6 +54,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 pdf_bytes=settings.max_pdf_upload_bytes, zip_bytes=settings.max_zip_upload_bytes
             ),
             ttl=timedelta(hours=settings.upload_ttl_hours),
+            idle_timeout=settings.upload_idle_timeout_seconds,
+            max_seconds=settings.upload_max_seconds,
         )
         app.state.job_service = JobService(
             session_factory,
@@ -90,7 +92,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
         # FastAPI's built-in OpenTelemetry support is off: it records the query string (upload
         # file names travel in ?filename=), continues incoming traceparent headers, and would add
-        # a second server span. RequestContextMiddleware opens our own (PHASE10_NOTES.md).
+        # a second server span. RequestContextMiddleware opens our own
+        # (docs/decisions/PHASE10_NOTES.md).
         telemetry={"tracing": False, "metrics": False, "logs": False, "operation_spans": False},
     )
     app.state.settings = settings

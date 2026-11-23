@@ -1,7 +1,7 @@
 # Phase 10 notes: observability (traces, metrics, structured logs)
 
 Each decision: what was chosen, the alternatives, why, and a plain-language explanation. The
-reference for operators is [docs/observability.md](docs/observability.md).
+reference for operators is [docs/observability.md](../observability.md).
 
 Words used below:
 - **Trace / span**: a trace is the story of one piece of work, drawn as a tree of timed steps

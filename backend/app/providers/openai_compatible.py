@@ -4,7 +4,7 @@
     Authorization: Bearer <PROVIDER_API_KEY>
     {"model": ..., "messages": [system, user], "temperature": 0, "max_tokens": ...}
 
-Design (PHASE11_NOTES.md):
+Design (docs/decisions/PHASE11_NOTES.md):
 - Plain httpx, no SDK: one request shape, our own timeout and error mapping, no hidden retries
   (the job's retry policy owns retries, with checkpoints and the per-chunk cache).
 - Prompt injection: the text is DATA. It sits in a block fenced by markers that carry a random

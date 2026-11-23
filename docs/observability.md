@@ -9,7 +9,7 @@ Tasklane records three signals, all with OpenTelemetry where it fits:
 | **Logs** | stdout of each container, one JSON object per line, redacted | `docker compose logs` |
 
 Nothing is sent anywhere unless you set `OTEL_EXPORTER_OTLP_ENDPOINT`, and nothing extra is
-printed. Why each design choice was made (with the alternatives): `PHASE10_NOTES.md`.
+printed. Why each design choice was made (with the alternatives): `decisions/PHASE10_NOTES.md`.
 
 ## Investigating a failed job
 
@@ -161,8 +161,11 @@ Worker-only counters (fenced attempts, failed heartbeat beats, dead heartbeat th
 in each worker process's memory and saved in its `worker_heartbeats` row every few seconds, so
 they are read from the database too.
 
-Counters computed from rows are totals over the rows that exist; nothing deletes rows yet. Once
-retention does (Phase 12), a total can drop, which Prometheus treats as a counter reset.
+Counters computed from rows are totals over the rows that exist. The cleanup command
+([operations.md](operations.md#retention-and-cleanup)) deletes finished jobs past their retention
+and old `worker_heartbeats` rows, so a total can drop, which Prometheus treats as a counter reset
+(`rate()` and `increase()` handle it); histograms lose the deleted jobs' observations the same
+way.
 
 ### Every metric
 

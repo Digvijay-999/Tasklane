@@ -1,9 +1,9 @@
 """Database spans: one CLIENT span per SQL statement, but only inside a traced operation.
 
 Hand-written SQLAlchemy event hooks instead of the opentelemetry-instrumentation-sqlalchemy
-package (reasons in PHASE10_NOTES.md): spans are created only when a recording span is current
-(a request, a job attempt, a recovery action), so the dispatcher's idle polls, heartbeats and
-SSE polls add nothing; and the attributes are exactly these:
+package (reasons in docs/decisions/PHASE10_NOTES.md): spans are created only when a recording
+span is current (a request, a job attempt, a recovery action), so the dispatcher's idle polls,
+heartbeats and SSE polls add nothing; and the attributes are exactly these:
 
 - db.system = "postgresql", db.operation = the statement's first keyword (SELECT, UPDATE, ...);
 - db.statement = the SQL text with its placeholders (%(job_id)s), never the parameter values.

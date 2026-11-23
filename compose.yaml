@@ -21,6 +21,8 @@ x-backend-env: &backend-env
   MAX_ZIP_UPLOAD_BYTES: ${MAX_ZIP_UPLOAD_BYTES:-104857600}
   UPLOAD_TTL_HOURS: ${UPLOAD_TTL_HOURS:-24}
   MAX_JSON_BODY_BYTES: ${MAX_JSON_BODY_BYTES:-65536}
+  UPLOAD_IDLE_TIMEOUT_SECONDS: ${UPLOAD_IDLE_TIMEOUT_SECONDS:-30}
+  UPLOAD_MAX_SECONDS: ${UPLOAD_MAX_SECONDS:-1800}
   CELERY_QUEUE: tasklane
   DISPATCH_POLL_SECONDS: ${DISPATCH_POLL_SECONDS:-1}
   DISPATCH_BATCH_SIZE: ${DISPATCH_BATCH_SIZE:-50}
@@ -75,6 +77,17 @@ x-backend-env: &backend-env
   OTEL_EXPORT_TIMEOUT_SECONDS: ${OTEL_EXPORT_TIMEOUT_SECONDS:-2}
   TRACE_VIEWER_URL: ${TRACE_VIEWER_URL:-}
   WORKER_PRESENCE_INTERVAL_SECONDS: ${WORKER_PRESENCE_INTERVAL_SECONDS:-5}
+  # Hardening and retention (Phase 12; docs/operations.md). CLEANUP_ENABLED runs the cleanup in
+  # the dispatcher; `docker compose run --rm api python -m app.maintenance.cleanup` runs it once.
+  DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS: ${DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS:-60}
+  CLEANUP_ENABLED: ${CLEANUP_ENABLED:-false}
+  CLEANUP_INTERVAL_SECONDS: ${CLEANUP_INTERVAL_SECONDS:-3600}
+  CLEANUP_BATCH_SIZE: ${CLEANUP_BATCH_SIZE:-100}
+  RETENTION_FINISHED_JOB_DAYS: ${RETENTION_FINISHED_JOB_DAYS:-30}
+  RETENTION_WORK_DAYS: ${RETENTION_WORK_DAYS:-7}
+  RETENTION_INTERRUPTED_UPLOAD_MINUTES: ${RETENTION_INTERRUPTED_UPLOAD_MINUTES:-60}
+  RETENTION_PUBLISHED_OUTBOX_HOURS: ${RETENTION_PUBLISHED_OUTBOX_HOURS:-24}
+  RETENTION_WORKER_HEARTBEAT_DAYS: ${RETENTION_WORKER_HEARTBEAT_DAYS:-7}
   # Development only, off unless set (a shell variable overrides .env for one session).
   ENABLE_FAULT_INJECTION: ${ENABLE_FAULT_INJECTION:-false}
   # Docker Desktop on Windows doesn't reliably forward file-change events from the Windows
@@ -157,8 +170,8 @@ services:
     depends_on: *backend-depends
 
   # Publishes committed outbox rows to Redis, and runs the recovery loop (expired leases, lost
-  # messages) in a second thread. No ports. It keeps running, and keeps jobs queued, while Redis
-  # is down.
+  # messages) in a second thread, plus the cleanup loop in a third if CLEANUP_ENABLED=true.
+  # No ports. It keeps running, and keeps jobs queued, while Redis is down.
   #
   # Dev only: devtools/reload.py restarts it when Python files change, stops it gracefully on
   # `docker compose stop` (SIGTERM, then up to --grace seconds), and exits if the dispatcher exits
@@ -185,6 +198,7 @@ services:
     volumes:
       - ./backend/app:/app/app
       - ./backend/devtools:/app/devtools
+      - storage:/data/storage   # for the optional cleanup loop (CLEANUP_ENABLED)
     depends_on: *backend-depends
     restart: unless-stopped
 

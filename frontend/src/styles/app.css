@@ -259,8 +259,15 @@ code,
   margin-bottom: var(--space-4);
 }
 
+/* Not current (API unreachable): a dashed rule beside the section plus the "Not current" note.
+   Never faded: dimmed text fails the WCAG contrast minimum (axe audit, Phase 12). */
 [data-stale] {
-  opacity: 0.55;
+  border-left: 2px dashed var(--state-failed);
+  padding-left: var(--space-3);
+}
+/* Tables ignore padding (collapsed borders): indent their first column instead. */
+table[data-stale] :is(th, td):first-child {
+  padding-left: var(--space-3);
 }
 .stale-note {
   margin-bottom: var(--space-3);

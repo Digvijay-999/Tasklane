@@ -4,8 +4,11 @@ Covers acceptance #8 at the lowest level: every malicious archive is rejected wi
 error class (or the entry skipped), before anything is written by name.
 """
 
+import io
 import os
 import stat
+import struct
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -114,6 +117,47 @@ def test_too_many_entries(tmp_path):
     error = error_of(inspect, tmp_path, data)
     assert error.error_class == "zip_too_many_files"
     assert error.safe_message == "The archive has 51 entries; the limit is 50."
+
+
+def zip64_archive(entries: int) -> bytearray:
+    """A real archive with more than 65,535 (empty) entries, so it ends with Zip64 records."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
+        for i in range(entries):
+            archive.writestr(f"src/f{i}.py", b"")
+    return bytearray(buffer.getvalue())
+
+
+def test_too_many_entries_is_decided_from_the_end_record(tmp_path):
+    """Phase 12: the count is read from the end-of-central-directory record, so an archive with
+    millions of entries gets the clear zip_too_many_files, not zip_too_complex after the parser
+    ran out of memory or time reading its directory."""
+    data = zip64_archive(70_000)
+    assert error_of(inspect, tmp_path, bytes(data)).params == {"entries": 70_000, "limit": 50}
+
+    # The Zip64 end record claims five million entries (entries on this disk and in total, two
+    # 8-byte numbers at offset 24). The directory is never parsed, so this fails just as clearly.
+    start = data.rfind(b"PK\x06\x06")
+    struct.pack_into("<QQ", data, start + 24, 5_000_000, 5_000_000)
+    error = error_of(inspect, tmp_path, bytes(data))
+    assert error.error_class == "zip_too_many_files"
+    assert error.safe_message == "The archive has 5000000 entries; the limit is 50."
+
+
+def test_a_zip64_locator_naming_several_disks_is_corrupt_not_a_crash(tmp_path):
+    data = zip64_archive(70_000)
+    start = data.rfind(b"PK\x06\x07")  # Zip64 end-of-central-directory locator
+    struct.pack_into("<I", data, start + 16, 2)  # "the archive spans 2 disks"
+    assert error_of(inspect, tmp_path, bytes(data)).error_class == "zip_corrupt"
+
+
+def test_a_declared_count_that_understates_is_still_caught_by_the_real_count(tmp_path):
+    data = bytearray(zip_samples.build_zip([(f"src/f{i}.py", b"x = 1\n") for i in range(51)]))
+    start = data.rfind(b"PK\x05\x06")
+    struct.pack_into("<HH", data, start + 8, 3, 3)  # the classic record says 3 entries
+    (tmp_path / "lying.zip").write_bytes(data)
+    assert zip_child.declared_entries(str(tmp_path / "lying.zip")) == 3
+    assert error_of(inspect, tmp_path, bytes(data)).params == {"entries": 51, "limit": 50}
 
 
 # --- Entries that are skipped, not extracted ------------------------------------------------------

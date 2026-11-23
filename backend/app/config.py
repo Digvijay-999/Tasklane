@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     upload_ttl_hours: int = Field(default=24, ge=1)
     # Limit for JSON request bodies (every route except uploads).
     max_json_body_bytes: int = Field(default=64 * 1024, ge=1024)
+    # An upload is cut off (408 upload_timeout) when no bytes arrive for this long, or when it
+    # takes longer than the maximum in total (Phase 12: a stalled or trickling client would
+    # otherwise hold its request, file and 'receiving' row open forever).
+    upload_idle_timeout_seconds: float = Field(default=30, gt=0, le=3600)
+    upload_max_seconds: float = Field(default=1800, gt=0, le=86_400)
 
     # --- Queue (Phase 4) ---
     # Celery queue name. Tests use their own Redis database and queue, so a running dev worker
@@ -179,6 +184,51 @@ class Settings(BaseSettings):
     # Each worker process records that it is alive this often (worker_heartbeats table); it
     # counts as not running after three missed intervals.
     worker_presence_interval_seconds: float = Field(default=5, ge=0.5, le=60)
+
+    # --- Hardening and retention (Phase 12) ---
+    # PostgreSQL ends a session that sits inside an open transaction without sending anything
+    # for this long, releasing its row locks. Covers a worker host that vanished mid-transaction
+    # (otherwise its locks stay until the server's TCP keepalive gives up, about 2 hours).
+    # Every transaction in this code base is short; the longest idle gap is a dispatcher batch
+    # being published to Redis.
+    db_idle_in_transaction_timeout_seconds: int = Field(default=60, ge=1, le=86_400)
+    # Cleanup (python -m app.maintenance.cleanup). CLEANUP_ENABLED also runs it inside the
+    # dispatcher process every CLEANUP_INTERVAL_SECONDS (off by default).
+    cleanup_enabled: bool = False
+    cleanup_interval_seconds: float = Field(default=3600, ge=10, le=7 * 86_400)
+    cleanup_batch_size: int = Field(default=100, ge=1, le=10_000)  # rows per transaction
+    # Finished (succeeded, failed, cancelled) jobs older than this are deleted with everything
+    # they own: events, attempts, artifacts, provider calls, checkpoints, outbox rows, files.
+    retention_finished_job_days: float = Field(default=30, ge=0)
+    # Intermediate files (work/{job_id}/, including a repository's files.bin) of finished jobs.
+    # A manual retry after this starts from the first stage again.
+    retention_work_days: float = Field(default=7, ge=0)
+    # An upload still 'receiving' after this long was interrupted (crash, killed request).
+    retention_interrupted_upload_minutes: float = Field(default=60, ge=1)
+    # Published outbox rows (the record of messages sent to Redis).
+    retention_published_outbox_hours: float = Field(default=24, ge=0)
+    # worker_heartbeats rows of worker processes not seen for this long (stopped or crashed).
+    retention_worker_heartbeat_days: float = Field(default=7, ge=0)
+
+    @model_validator(mode="after")
+    def _upload_deadline_fits_cleanup(self) -> "Settings":
+        # The cleanup must never mark an upload interrupted while it can still legitimately be
+        # streaming in.
+        if self.upload_max_seconds >= self.retention_interrupted_upload_minutes * 60:
+            raise ValueError(
+                "UPLOAD_MAX_SECONDS must be shorter than RETENTION_INTERRUPTED_UPLOAD_MINUTES"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _retention_fits_recovery(self) -> "Settings":
+        # Recovery decides a message is lost when nothing was published within the grace
+        # period; deleting younger published rows would make it requeue jobs that are fine.
+        if self.retention_published_outbox_hours * 3600 < self.lost_message_grace_seconds:
+            raise ValueError(
+                "RETENTION_PUBLISHED_OUTBOX_HOURS must cover LOST_MESSAGE_GRACE_SECONDS"
+            )
+        return self
 
     @model_validator(mode="after")
     def _telemetry_urls(self) -> "Settings":

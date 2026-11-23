@@ -8,7 +8,7 @@ Tasklane summarizes text through a **provider**. There are two:
 | `openai_compatible` | Any OpenAI-compatible chat-completions API: Groq, Google Gemini, OpenAI, a local server, ... | **Yes**: the document's text is sent to that API |
 
 With no settings, Tasklane uses the stub and behaves exactly as before Phase 11. Why each design
-choice was made (with alternatives): `PHASE11_NOTES.md`.
+choice was made (with alternatives): `decisions/PHASE11_NOTES.md`.
 
 ## Setup
 

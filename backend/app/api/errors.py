@@ -31,6 +31,7 @@ STATUS_BY_CODE: dict[str, int] = {
     ErrorCode.INVALID_CURSOR: 400,
     ErrorCode.EMPTY_FILE: 400,
     ErrorCode.UPLOAD_INTERRUPTED: 400,
+    ErrorCode.UPLOAD_TIMEOUT: 408,
     ErrorCode.JOB_NOT_FOUND: 404,
     ErrorCode.ARTIFACT_NOT_FOUND: 404,
     ErrorCode.ARTIFACT_GONE: 410,
