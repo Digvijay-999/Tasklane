@@ -183,8 +183,8 @@ Expected: four lines, every one with `"trace_id": "<the same id>"`: the dispatch
 `outbox message published`, the worker's `job claimed` (with `"queue_wait_seconds"`) and
 `job attempt failed` (with `"error_class": "pdf_no_text"`, `"stage": "extract_text"`,
 `"attempt_no": 1`, `"worker_id": "worker@..."`), and the API's `request` line for
-`POST /v1/jobs` (`docker compose logs` prints the services one after the other, so the API line
-comes last).
+`POST /v1/jobs`. The order of the lines can vary: `docker compose logs` mixes the services'
+output.
 
 ## (e) Metrics, after
 
@@ -245,10 +245,11 @@ still recorded; only the export fails, in the background.
 ```powershell
 Start-Sleep -Seconds 5; dc logs --since 2m --no-log-prefix api dispatcher worker | Select-String '"logger": "opentelemetry' | Select-Object -First 5; dc start jaeger
 ```
-Expected: one to three lines, one per process that had spans to send (API, dispatcher, worker;
-at most one per message per process per minute, not one per second), each like:
+Expected: a few lines, at most one per message per process per minute (not one per second),
+from each process that had spans to send (API, dispatcher, worker). Mostly
 `{"level": "ERROR", "logger": "opentelemetry.exporter.otlp.proto.http.trace_exporter",
-"message": "Failed to export spans batch due to timeout, max retries or shutdown."}`. Then
+"message": "Failed to export spans batch due to timeout, max retries or shutdown."}`, sometimes
+also a `"level": "WARNING"` line starting `"message": "Transient error HTTPConnectionPool(host='jaeger', port=4318)"`. Then
 `Container tasklane-jaeger-1  Started`. (Spans of the job in step 21 were dropped; new jobs are
 traced again.)
 

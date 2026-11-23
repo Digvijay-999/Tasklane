@@ -100,6 +100,22 @@ export interface JobDetail extends Job {
   cancel_blocked_reason: 'already_cancel_requested' | 'already_finished' | null;
   can_retry: boolean;
   retry_blocked_reason: 'not_failed' | 'input_error' | 'retry_limit_reached' | null;
+  /** Summarization calls per provider and model, over all attempts. */
+  usage: ModelUsage[];
+}
+
+export interface ModelUsage {
+  provider: string;
+  model: string;
+  calls: number;
+  failed_calls: number;
+  /** As reported by the provider; null when it reported none (never estimated). */
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+  /** A decimal string, only when prices are configured for this model. */
+  estimated_cost: string | null;
+  estimated_cost_currency: string | null;
 }
 
 export interface JobEvent {
@@ -152,6 +168,14 @@ export interface Meta {
   max_fault_failures: number;
   /** Link template with {trace_id}, or null when no trace viewer is configured. */
   trace_viewer_url: string | null;
+  provider: {
+    name: string;
+    model: string;
+    /** True when document text is sent to this provider over the network. */
+    remote: boolean;
+    host: string | null;
+    estimated_cost: boolean;
+  };
 }
 
 export interface Upload {

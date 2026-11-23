@@ -152,3 +152,7 @@ def configure_logging(level: str = "INFO", secrets: tuple[str | None, ...] = ())
     access_logger = logging.getLogger("uvicorn.access")
     access_logger.handlers = []
     access_logger.propagate = False
+    # httpx logs every request at INFO (the provider's URL, never headers); one line per
+    # summarization call is noise, so only its warnings come through.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)

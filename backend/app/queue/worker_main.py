@@ -7,6 +7,7 @@ never creates an app from environment settings as a side effect.
 """
 
 import logging
+from urllib.parse import urlsplit
 
 from celery.signals import (
     setup_logging,
@@ -29,13 +30,29 @@ from app.queue.worker_process import (
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
+# A real provider without a key stops the worker at once, with this message (not on every job).
+if (_key_problem := settings.provider_key_problem()) is not None:
+    raise SystemExit(f"tasklane worker cannot start: {_key_problem}")
 celery_app = create_celery_app(settings)
 
 
 @setup_logging.connect
 def _configure_logging(**_: object) -> None:
     # Connecting to this signal stops Celery from installing its own logging; we use JSON logs.
-    configure_logging(settings.log_level, secrets=(settings.postgres_password.get_secret_value(),))
+    # The provider key is masked as a literal wherever it might appear (it is also registered as
+    # a sensitive-looking environment variable).
+    provider_key = (
+        settings.provider_api_key.get_secret_value() if settings.provider_api_key else None
+    )
+    configure_logging(
+        settings.log_level,
+        # Both forms: the provider sends the trimmed key.
+        secrets=(
+            settings.postgres_password.get_secret_value(),
+            provider_key,
+            provider_key.strip() if provider_key else None,
+        ),
+    )
 
 
 @worker_process_init.connect
@@ -48,6 +65,15 @@ def _start_child(**_: object) -> None:
 
 @worker_ready.connect
 def _warn_about_fault_injection(**_: object) -> None:
+    if settings.provider != "stub":
+        logger.warning(
+            "document text is sent to a remote summarization provider",
+            extra={
+                "provider": settings.provider,
+                "model": settings.provider_model,
+                "provider_host": urlsplit(settings.provider_base_url or "").hostname,
+            },
+        )
     if settings.enable_fault_injection:
         logger.warning(
             "fault injection is ENABLED: jobs may request injected failures "

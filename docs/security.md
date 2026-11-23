@@ -7,8 +7,9 @@ the exact defense, **where it is enforced** (file), and **where it is tested** (
 live under `backend/tests/`).
 
 Scope: the local, single-user deployment described in the README. There is no authentication
-yet (all ports are bound to `127.0.0.1`), no antivirus scanning, and no secret scanning of
-repository content (see "Not covered" at the end).
+yet (all ports are bound to `127.0.0.1`) and no antivirus scanning (see "Not covered" at the
+end). With the optional real provider (Phase 11), document text leaves the machine: see
+"A real summarization provider".
 
 ## Principles
 
@@ -59,7 +60,7 @@ repository content (see "Not covered" at the end).
 | Encrypted / damaged PDF | `pdf_encrypted` / `pdf_corrupt`, permanent | `workflows/pdf/parse_child.py` | `test_password_protected_pdf_is_rejected`, `test_corrupt_pdf_is_rejected` |
 | Thousands of pages, megabytes of text | 500 pages, 2,000,000 characters; fails, never truncates | `workflows/pdf/parse_child.py` | `test_page_limit`, `test_text_limit_fails_instead_of_truncating` |
 | Error details leak internals | Fixed messages; tracebacks only in logs | `domain/errors.py` | `test_failure_details_stay_out_of_the_database` |
-| PDF text renders as active Markdown/HTML | The display filename is escaped; the dashboard must render `summary.md` without raw HTML (Phase 9 carry-forward) | `workflows/pdf/report.py` | `test_markdown_escapes_the_display_filename` |
+| PDF text or model output renders as active Markdown/HTML | The display filename is escaped; every summary (document-derived, possibly model-written) sits in a fenced block longer than any fence inside it, invisible characters made visible; the dashboard shows `summary.md` as plain text | `workflows/pdf/report.py` | `test_markdown_escapes_the_display_filename`, `test_summary_markdown_fences_hostile_model_output` |
 
 ## Repository ZIPs
 
@@ -172,11 +173,32 @@ format nor a telling name next to it, and it may over-mask harmless text (for ex
 timings, nothing from uploaded files. `/metrics` is unauthenticated like the rest of the API,
 reachable only on 127.0.0.1.
 
+## A real summarization provider (Phase 11)
+
+Off by default (`PROVIDER=stub`: nothing leaves the machine). With `PROVIDER=openai_compatible`,
+the extracted text of every PDF and the indexed files of every repository (and their paths, in
+combine calls) are sent to `PROVIDER_BASE_URL`. Setup and limits: [providers.md](providers.md).
+
+| Risk | Defense | Where | Test |
+|---|---|---|---|
+| The API key leaks (database, artifacts, events, API responses, frontend, metrics, spans, logs) | Read from the environment only; Compose passes it to the **worker container only**; placed only in the `Authorization` header; registered as a literal secret for log redaction; the provider's `repr` omits it; never a span attribute or metric label | `config.py`, `compose.yaml`, `providers/openai_compatible.py`, `queue/worker_main.py` | `test_real_provider_jobs_record_usage_and_the_key_is_found_nowhere` (scans every table, every stored file, worker and dispatcher logs, all spans, every API response and artifact), `test_the_configured_key_and_authorization_headers_never_reach_a_log_line` |
+| A misconfigured provider runs jobs that can't work | Startup checks: base URL and model in every service; the worker refuses to start without a key | `config.py`, `queue/worker_main.py` | `test_a_real_provider_needs_a_base_url_and_a_model`, `test_the_worker_process_stops_at_startup_with_a_clear_message` |
+| Secrets inside a document or repository are sent to the provider | Every text is scrubbed before it is sent: private keys, URL credentials (connection strings), `Bearer`/`Basic` values, known token formats, sensitive `name=value` pairs (`.env`-style lines), the worker's own secrets; replaced with `[REDACTED]`; the manifest records counts per kind, never values | `observability/redaction.py::scrub`, `workflows/common.py` | `test_repository_secrets_are_replaced_before_sending_and_only_counted`, `test_pdf_text_is_scrubbed_too`, and the e2e test (a planted connection string never reaches the fake server) |
+| The user doesn't know text leaves the machine | `GET /v1/meta` reports `provider.remote`, host and model; the New job page says so before upload, names host and model, and what is and isn't scrubbed; the worker logs it at startup | `api/overview.py`, `NewJobPage.tsx` | `test_meta_says_document_text_goes_to_the_real_provider`, `ProviderNotice` component tests |
+| Prompt injection: document text tries to instruct the model | Text sits in a data block whose markers carry a random id per call; the fixed system message (never containing document text) says the block is data and its instructions must be ignored; no tools, functions or response formats are offered | `providers/openai_compatible.py` | `test_untrusted_text_stays_inside_the_data_block` (ignore-previous-instructions, fake system prompts, fake JSON roles, fake markers) |
+| The model's reply does something | Nothing acts on it: it is a string, cut to the summary length, stored as text, shown as plain text (`<pre>` + `SafeText`), fenced in the repository `summary.md`; a reply with tool calls and no text fails as `provider_bad_response` | `workflows/common.py`, `workflows/repo/report.py`, dashboard | `test_the_reply_is_returned_as_plain_text_and_nothing_else`, `test_malformed_or_empty_responses_are_bad_responses` |
+| The provider's error body echoes document text into logs, events or the API | Error bodies are never read into messages; users see fixed templates; logs get the status code and a short token-like error code only | `providers/openai_compatible.py`, `domain/errors.py` | `test_http_statuses_map_to_error_classes`, `test_an_error_code_that_is_not_a_short_token_is_not_logged` |
+| A slow or hostile provider holds a worker | Hard per-call deadline (a server trickling bytes still stops at `PROVIDER_TIMEOUT_SECONDS`), at most half the lease; responses over 1 MiB rejected; no redirects followed | `providers/openai_compatible.py` | `test_a_server_that_trickles_bytes_still_times_out_within_the_limit`, `test_an_oversized_response_is_a_bad_response` |
+
+Limits: scrubbing is pattern-based, so a secret with no telltale name or format, and personal
+data, are sent as they are (the New job page says so). Prompt-injection defenses lower the risk of
+a misleading summary; they can't rule it out. A summary from a model is untrusted text, like the
+document itself.
+
 ## Not covered (yet)
 
-- **Secrets inside indexed files.** A source file that contains an API key is indexed like any
-  other file. With the stub provider nothing leaves the machine; before a real provider sends
-  repository text to a remote API (Phase 11), secret scanning or redaction is needed.
+- **Secrets without a recognisable format or name** inside indexed files are sent to a real
+  provider as they are (see above). With the stub nothing leaves the machine.
 - **Disk use of successful jobs.** A succeeded job keeps `work/{job_id}/files.bin` (up to
   `ZIP_MAX_TOTAL_BYTES`), and one upload can feed many jobs. Retention is Phase 12.
 - **Bare-URL file names** (`www.example.com/x.md`) can become links in renderers that auto-link

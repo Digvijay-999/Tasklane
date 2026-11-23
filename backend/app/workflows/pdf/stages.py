@@ -10,7 +10,7 @@ by type).
     extract_text    upload file      -> pages.jsonl, extract.json
     chunk_document  pages.jsonl      -> chunks.jsonl
     summarize       chunks.jsonl     -> summary.json        (provider calls recorded)
-    write_artifacts all of the above -> artifacts/{job_id}/summary.md, manifest.json
+    write_artifacts all of the above -> artifacts/{job_id}/attempt-{n}/summary.md, manifest.json
 
 Checkpoints (resume on retry): the first four stages declare `stage_version` (bump it whenever a
 stage's output for the same input changes), `output_paths()` (every file the stage writes) and
@@ -26,6 +26,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from app.domain.costs import Pricing
 from app.domain.enums import ArtifactType
 from app.domain.errors import JobError
 from app.providers.base import Provider
@@ -64,6 +65,7 @@ class PdfConfig:
     keep_alive_interval_seconds: float
     chunking: ChunkingSettings
     summary: SummarySettings
+    pricing: Pricing | None = None  # for the manifest's estimated cost (only when configured)
 
 
 class ValidatePdfStage:
@@ -217,7 +219,8 @@ class ChunkDocumentStage:
 class SummarizeStage:
     name = "summarize"
     weight = 55
-    stage_version = 1
+    # 2 (Phase 11): summary.json also holds prompt/completion tokens and secret-scrubbing counts.
+    stage_version = 2
 
     def __init__(self, config: PdfConfig, provider: Provider) -> None:
         self.config = config
@@ -232,6 +235,7 @@ class SummarizeStage:
         return {
             "provider": self.provider.name,
             "model": self.provider.model,
+            "cache_scope": getattr(self.provider, "cache_scope", None),
             "chunk_max_chars": settings.chunk_max_chars,
             "final_max_chars": settings.final_max_chars,
             "combine_max_input_chars": settings.combine_max_input_chars,
@@ -244,7 +248,6 @@ class SummarizeStage:
             context,
             self.provider,
             stage_version=self.stage_version,
-            chunk_sha256={c["chunk_id"]: c["sha256"] for c in chunks},
             expected_calls=estimated_calls(len(chunks), self.config.summary),
             stage_timeout_seconds=self.config.summarize_timeout_seconds,
             provider_timeout_seconds=self.config.provider_timeout_seconds,
@@ -269,7 +272,7 @@ class SummarizeStage:
                 "provider": self.provider.name,
                 "model": self.provider.model,
                 "calls": caller.done,
-                "total_tokens": caller.total_tokens,
+                **caller.usage_record(),
             },
         )
         caller.log_reuse()
@@ -291,7 +294,7 @@ class WriteArtifactsStage:
         summary = workspace.read_json(workspace.work(SUMMARY_FILE))
         chunk_count = sum(1 for _ in workspace.iter_jsonl(workspace.work(CHUNKS_FILE)))
 
-        summary_path = workspace.artifact(SUMMARY_ARTIFACT)
+        summary_path = workspace.artifact(SUMMARY_ARTIFACT, job.attempt_no)
         workspace.write_text(
             summary_path,
             build_summary_markdown(
@@ -307,7 +310,7 @@ class WriteArtifactsStage:
         )
 
         settings = self.config.chunking
-        manifest_path = workspace.artifact(MANIFEST_ARTIFACT)
+        manifest_path = workspace.artifact(MANIFEST_ARTIFACT, job.attempt_no)
         workspace.write_json(
             manifest_path,
             build_manifest(
@@ -330,6 +333,7 @@ class WriteArtifactsStage:
                     "chunks": chunk_count,
                 },
                 summary=summary,
+                pricing=self.config.pricing,
                 artifacts=[
                     {
                         "type": summary_artifact.artifact_type,

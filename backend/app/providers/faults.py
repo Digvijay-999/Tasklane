@@ -52,6 +52,7 @@ class FaultInjectingProvider:
         self.attempt_no = attempt_no
         self.name = inner.name
         self.model = inner.model
+        self.remote = inner.remote
         self._fired = False
 
     def summarize(self, text: str, options: SummarizeOptions) -> SummaryResult:

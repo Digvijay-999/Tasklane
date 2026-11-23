@@ -131,6 +131,21 @@ ERRORS: dict[str, ErrorSpec] = {
         ErrorKind.PERMANENT, "Injected permanent failure (fault injection test)."
     ),
     # --- Configuration (permanent: retrying with the same configuration fails the same way) ---
+    # A real provider (Phase 11). Never the provider's own error text: it could echo the document.
+    "provider_auth": ErrorSpec(
+        ErrorKind.PERMANENT,
+        "The summarization provider rejected the API key (not valid, or not allowed to use this "
+        "model). Check PROVIDER_API_KEY and PROVIDER_MODEL.",
+    ),
+    "provider_rejected": ErrorSpec(
+        ErrorKind.PERMANENT,
+        "The summarization provider rejected the request (for example an unknown model, or "
+        "text it refuses or can't accept).",
+    ),
+    "provider_bad_response": ErrorSpec(
+        ErrorKind.PERMANENT,
+        "The summarization provider returned an empty or malformed response.",
+    ),
     "fault_injection_disabled": ErrorSpec(
         ErrorKind.PERMANENT,
         "The job asks for fault injection, but fault injection is disabled on the worker.",
@@ -179,9 +194,14 @@ def gave_up_summary(safe_message: str, attempts: int) -> str:
 class JobError(Exception):
     """An expected failure of a job attempt, carrying a stable class and a safe message."""
 
-    def __init__(self, error_class: str, **params: Any) -> None:
+    def __init__(
+        self, error_class: str, *, retry_after_seconds: float | None = None, **params: Any
+    ) -> None:
         spec = ERRORS[error_class]
         self.error_class = error_class
+        # A provider's Retry-After hint (rate limiting): the next attempt waits at least this
+        # long, capped by RETRY_MAX_SECONDS (domain/retry.py). Not part of the message.
+        self.retry_after_seconds = retry_after_seconds
         self.kind = spec.kind
         self.params = params
         self.safe_message = spec.message.format(**params)

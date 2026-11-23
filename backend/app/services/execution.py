@@ -168,6 +168,7 @@ class _Failure:
     summary: str
     stage: str | None
     transient: bool
+    retry_after: float | None = None  # a provider's Retry-After hint, in seconds
 
 
 class JobExecutionService:
@@ -704,7 +705,8 @@ class JobExecutionService:
             if target == JobStatus.RETRY_WAIT:
                 # Counted within the current run, so a manual retry starts the backoff over.
                 delay = self.retry_policy.delay_seconds(
-                    run_attempt_no(claim.attempt_no, row.max_attempts)
+                    run_attempt_no(claim.attempt_no, row.max_attempts),
+                    retry_after=failure.retry_after,
                 )
                 # now() is frozen for the whole transaction: one database-clock instant.
                 retry_at = session.execute(
@@ -915,7 +917,13 @@ def _checkpointable(stage: Stage) -> bool:
 def _classify(exc: BaseException, stage: str | None) -> _Failure:
     """Turn any exception from a running attempt into an error class and a safe message."""
     if isinstance(exc, JobError):
-        return _Failure(exc.error_class, exc.safe_message, stage, exc.kind == ErrorKind.TRANSIENT)
+        return _Failure(
+            exc.error_class,
+            exc.safe_message,
+            stage,
+            exc.kind == ErrorKind.TRANSIENT,
+            exc.retry_after_seconds,
+        )
     error_class = INTERNAL_ERROR
     if _is_conflict(exc):
         error_class = "database_conflict"

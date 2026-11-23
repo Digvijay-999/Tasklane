@@ -245,7 +245,17 @@ def test_summary_markdown_labels_the_stub_and_missing_pages():
     text = build_summary_markdown(display_filename="r.pdf", extract=extract, summary=summary)
     assert "not an AI-generated summary" in text
     assert "1 of 2 pages had no extractable text" in text
-    assert "- **pages 1-2:** S1." in text
+    assert "### Pages 1-2\n\n~~~\nS1.\n~~~" in text
+
+
+def test_summary_markdown_fences_hostile_model_output():
+    extract, summary = _report_inputs()
+    hostile = "~~~\n# Owned\n![x](https://attacker.example/p.png) <img src=x>"
+    summary["final"] = hostile
+    summary["sections"][0]["summary"] = hostile
+    text = build_summary_markdown(display_filename="r.pdf", extract=extract, summary=summary)
+    # Both copies sit inside a longer fence, so nothing renders as a heading, image or HTML.
+    assert text.count("~~~~\n" + hostile + "\n~~~~") == 2
 
 
 def test_manifest_is_deterministic_json():

@@ -126,7 +126,7 @@ short `job.attempt` span with `outcome=dropped` in the same trace.
 | `outbox.publish` | PRODUCER | dispatcher | `job_id`, `messaging.system`, `dispatch_attempt`, `outcome` (`published`/`failed`), `error.type` |
 | `job.attempt` | CONSUMER | worker | `job_id`, `messaging.system`, `attempt_no`, `workflow_type`, `trigger`, `queue_wait_seconds`, `outcome` (`succeeded`, `failed`, `retry_scheduled`, `cancelled`, `dropped`, `fenced`), `drop_reason`, `error_class` |
 | `stage <name>` | INTERNAL | worker | `job_id`, `attempt_no`, `workflow_type`, `stage`, `outcome` (`completed`, `reused`, `failed`, `stopped`), `error_class` |
-| `provider.summarize` | CLIENT | worker | `job_id`, `attempt_no`, `workflow_type`, `stage`, `provider`, `model`, `purpose` (`chunk`/`combine`), `outcome`, `error_class`, `usage.*_tokens` (when reported) |
+| `provider.summarize` | CLIENT | worker | `job_id`, `attempt_no`, `workflow_type`, `stage`, `provider`, `model`, `purpose` (`chunk`/`combine`), `outcome`, `error_class`, `usage.*_tokens` (when reported). One per real call; a cached summary makes no call and no span. With a real provider the span includes any pacing wait (`PROVIDER_MAX_CALLS_PER_MINUTE`); `provider_calls.latency_ms` is the HTTP call alone |
 | `recovery.lease_expired` | INTERNAL | dispatcher | `job_id`, `attempt_no`, `outcome` (the job's new status) |
 | `recovery.lost_message` | INTERNAL | dispatcher | `job_id`, `outcome=requeued` |
 | `db <OPERATION>` | CLIENT | all | `db.system`, `db.operation`, `db.statement` (placeholders only), `error.type`, `db.response.status_code` (SQLSTATE) on errors |
@@ -204,6 +204,13 @@ Not measurable by the server: browser-side stream reconnects and the dashboard's
 fallback (they happen in the browser).
 
 ### Cardinality rules
+
+**Provider labels (Phase 11):** `provider` is `stub` or `openai_compatible`; `model` is the
+*configured* model (`PROVIDER_MODEL`), never the id a provider reports back, so a provider can't
+add label values. The real provider fills every `tasklane_provider_*` metric, including the token
+counters (checked by the e2e test with the real worker and a fake provider). The provider's HTTP
+client is not instrumented (request bodies hold document text), and its key is never a label or
+attribute.
 
 Labels are bounded enums only: `workflow_type`, `status`, `stage`, `error_class`, `provider`,
 `model`, `outcome` (plus Prometheus' own `le`). Never job, upload or attempt ids, worker ids,

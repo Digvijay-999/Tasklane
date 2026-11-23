@@ -14,6 +14,8 @@ worker longer than its lease allows. Network calls can be cancelled by a timeout
 providers, unlike the PDF parser, don't need a separate process.
 """
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -25,6 +27,9 @@ class SummarizeOptions:
     purpose: ProviderCallPurpose
     max_output_chars: int
     timeout_seconds: float
+    # How a provider waits before a call (pacing). The summarize stage passes a sleep that keeps
+    # checking for fencing and the stage deadline, so a long wait never outlives the attempt.
+    sleep: Callable[[float], None] = time.sleep
 
 
 @dataclass(frozen=True)
@@ -48,6 +53,9 @@ class SummaryResult:
 class Provider(Protocol):
     name: str
     model: str
+    # True when text leaves the machine (a real provider): the summarize stage then replaces
+    # secrets in it first (observability/redaction.scrub).
+    remote: bool
 
     def summarize(self, text: str, options: SummarizeOptions) -> SummaryResult:
         """Summarize `text`. Raise a ProviderError subclass for an expected failure; anything
@@ -72,6 +80,22 @@ class ProviderUnavailable(ProviderError):
 
 class ProviderRateLimited(ProviderError):
     error_class = "provider_rate_limited"
+
+    def __init__(self, message: str, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds  # the provider's Retry-After, if any
+
+
+class ProviderAuthError(ProviderError):
+    error_class = "provider_auth"
+
+
+class ProviderRejected(ProviderError):
+    error_class = "provider_rejected"
+
+
+class ProviderBadResponse(ProviderError):
+    error_class = "provider_bad_response"
 
 
 @dataclass(frozen=True)

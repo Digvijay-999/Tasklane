@@ -102,7 +102,7 @@ def test_the_realistic_repository_gives_the_expected_manifest(pipeline):
     stages, workspace, job = pipeline
     context = run_all(stages, workspace, job)
 
-    manifest = json.loads(workspace.read_text(workspace.artifact("manifest.json")))
+    manifest = json.loads(workspace.read_text(workspace.artifact("manifest.json", job.attempt_no)))
     assert manifest["schema"] == "tasklane.repo_manifest/1"
     included = {f["path"]: f["language"] for f in manifest["included"]}
     assert included == {
@@ -171,7 +171,7 @@ def test_nothing_skipped_was_ever_decompressed_or_written(pipeline):
 def test_chunks_artifact(pipeline):
     stages, workspace, job = pipeline
     run_all(stages, workspace, job)
-    raw = workspace.absolute(workspace.artifact("chunks.jsonl")).read_bytes()
+    raw = workspace.absolute(workspace.artifact("chunks.jsonl", job.attempt_no)).read_bytes()
     raw.decode("ascii")  # pure ASCII
     chunks = [json.loads(line) for line in raw.splitlines()]
     assert {c["path"] for c in chunks} == {
@@ -196,7 +196,7 @@ def test_chunks_artifact(pipeline):
 def test_summary_markdown(pipeline):
     stages, workspace, job = pipeline
     run_all(stages, workspace, job)
-    summary = workspace.read_text(workspace.artifact("summary.md"))
+    summary = workspace.read_text(workspace.artifact("summary.md", job.attempt_no))
     assert summary.startswith("# Repository summary of repo.zip\n")
     assert "built-in stub provider" in summary.split("## Overview")[0]
     assert "### src/shop/orders.py" in summary
@@ -211,11 +211,13 @@ def test_files_with_markdown_or_invisible_characters_in_their_names_are_escaped(
     archive = zip_samples.small_repo([(tricky, b"print('x')\n")])
     stages, workspace, job = make_pipeline(tmp_path, small_settings, archive, "my *repo*.zip")
     run_all(stages, workspace, job)
-    summary = workspace.read_text(workspace.artifact("summary.md"))
+    summary = workspace.read_text(workspace.artifact("summary.md", job.attempt_no))
     assert r"# Repository summary of my \*repo\*.zip" in summary
     assert r"### src/\[click\](javascript:x)\_\\u202egnp.py" in summary
     assert rlo not in summary
-    manifest_bytes = workspace.absolute(workspace.artifact("manifest.json")).read_bytes()
+    manifest_bytes = workspace.absolute(
+        workspace.artifact("manifest.json", job.attempt_no)
+    ).read_bytes()
     manifest_bytes.decode("ascii")  # the name is \u-escaped JSON
     assert tricky in {f["path"] for f in json.loads(manifest_bytes)["included"]}
 
@@ -228,7 +230,7 @@ def test_summaries_cannot_break_out_of_their_block(tmp_path, small_settings):
     archive = zip_samples.small_repo([("docs/evil.md", hostile)])
     stages, workspace, job = make_pipeline(tmp_path, small_settings, archive)
     run_all(stages, workspace, job)
-    summary = workspace.read_text(workspace.artifact("summary.md"))
+    summary = workspace.read_text(workspace.artifact("summary.md", job.attempt_no))
     section = summary.split("### docs/evil.md")[1].split("###")[0]
     fences = [line for line in section.split("\n") if line and set(line) == {"~"}]
     # Opened and closed by the same fence, longer than the ~~~ inside: the hostile text stays

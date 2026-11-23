@@ -161,7 +161,7 @@ def test_files_are_not_hashed_when_cheaper_checks_already_fail():
 
 
 class _Echo:
-    name, model = "echo", "echo-1"
+    name, model, remote = "echo", "echo-1", False
 
     def summarize(self, text, options):
         return SummaryResult(text=text, provider=self.name, model=self.model, latency_ms=0)

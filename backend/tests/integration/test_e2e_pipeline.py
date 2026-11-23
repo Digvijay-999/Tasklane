@@ -548,7 +548,7 @@ def test_worker_and_dispatcher_use_the_test_storage_root_never_the_real_volume(
     detail = api.get(f"/v1/jobs/{job_id}").json()
     assert (test_root / "uploads" / detail["upload_id"]).is_dir()
     assert (test_root / "work" / job_id / work_file).is_file()
-    assert (test_root / "artifacts" / job_id / "summary.md").is_file()
+    assert (test_root / "artifacts" / job_id / "attempt-1" / "summary.md").is_file()
 
     # 3. ... and nothing for this job or its upload exists on the real volume.
     assert not (real_root / "uploads" / detail["upload_id"]).exists()

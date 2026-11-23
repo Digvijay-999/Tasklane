@@ -1,9 +1,10 @@
 import { useQueryClient } from '@tanstack/react-query';
 import { useId, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router';
+import { SafeText } from '../../components/SafeText';
 import { ErrorNotice, ProgressBar, Skeleton } from '../../components/ui';
 import { ApiError, api, type CreateJobResult } from '../../lib/api/client';
-import type { WorkflowMeta, WorkflowType } from '../../lib/api/types';
+import type { Meta, WorkflowMeta, WorkflowType } from '../../lib/api/types';
 import { uploadFile } from '../../lib/api/upload';
 import { formatBytes, percent } from '../../lib/format';
 import { useMeta } from '../../lib/hooks';
@@ -222,6 +223,8 @@ export function NewJobPage() {
           )}
         </div>
 
+        <ProviderNotice provider={meta.data.provider} />
+
         {meta.data.fault_injection_enabled && (
           <fieldset className="field" disabled={busy}>
             <legend>Fault injection (development only)</legend>
@@ -315,5 +318,30 @@ export function NewJobPage() {
         </div>
       </form>
     </>
+  );
+}
+
+/** Said before upload: where the document's text goes. Server-provided strings are plain text. */
+export function ProviderNotice({ provider }: { provider: Meta['provider'] }) {
+  if (!provider.remote) {
+    return (
+      <p className="muted">
+        Summaries are made on this machine by the built-in stub (<code className="mono">{provider.model}</code>). No document text leaves
+        it.
+      </p>
+    );
+  }
+  return (
+    <div className="notice" data-tone="info" role="note">
+      <p>
+        <strong>Document text is sent to an external AI provider.</strong> The text extracted from your file (PDF text, or the source
+        files of a repository) is sent to <SafeText text={provider.host ?? provider.name} /> for summarization, using the model{' '}
+        <code className="mono">
+          <SafeText text={provider.model} />
+        </code>
+        . Secrets that look like keys, tokens, passwords or connection strings are replaced first, but anything else in the file is
+        sent as it is. Don&apos;t upload files that must not leave this machine.
+      </p>
+    </div>
   );
 }

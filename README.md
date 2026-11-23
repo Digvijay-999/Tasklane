@@ -69,9 +69,9 @@ retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) fo
 - **PDF ingestion** (`pdf_ingest`): validate, extract text, chunk, summarize, and write two
   artifacts, `summary.md` and `manifest.json`, downloadable with
   `GET /v1/jobs/{id}/artifacts/{artifact_id}`.
-  - **The summarizer is a stub, not an AI model**: it picks the first sentences of each chunk
-    and frequent key terms. It needs no API key and is deterministic. A real (optional) LLM
-    provider is Phase 11.
+  - **The default summarizer is a stub, not an AI model**: it picks the first sentences of each
+    chunk and frequent key terms. It needs no API key, is deterministic, and nothing leaves the
+    machine. An optional real provider is described below.
   - The PDF is opened in a separate process with time, memory, CPU, and output-size limits, so
     a malicious or broken file can't hang or exhaust the worker.
   - Password-protected, damaged, image-only (scanned), too-long, and too-large PDFs fail with a
@@ -125,7 +125,20 @@ retries, cancellation, and recovery. See [PROJECT_BRIEF.md](PROJECT_BRIEF.md) fo
   [docs/observability.md](docs/observability.md), including
   [Investigating a failed job](docs/observability.md#investigating-a-failed-job).
 
-**Not implemented yet:** any real LLM provider (Phase 11), retention and cleanup (Phase 12). See the phase list in [CLAUDE.md](CLAUDE.md).
+- **Optional real summarization provider** (Phase 11, off by default): any OpenAI-compatible
+  chat-completions API (tested setups documented for Groq and Google Gemini), configured with
+  `PROVIDER=openai_compatible` and shell variables; the key reaches only the worker container.
+  Secrets in the text (keys, tokens, passwords, connection strings, `.env`-style lines) are
+  replaced before sending and only counted; the text is sent as delimited data with
+  prompt-injection instructions and no tools; the model's reply is treated as untrusted text.
+  Errors map to retryable (`provider_timeout`, `provider_unavailable`, `provider_rate_limited`
+  with `Retry-After`) and permanent classes (`provider_auth`, `provider_rejected`,
+  `provider_bad_response`). Reported tokens per call, an estimated cost only from prices you
+  configure, and optional pacing (`PROVIDER_MAX_CALLS_PER_MINUTE`). The New job page says when
+  document text leaves the machine. All automated tests use a fake HTTP server; one optional
+  `live` test calls the real provider. See [docs/providers.md](docs/providers.md).
+
+**Not implemented yet:** retention and cleanup (Phase 12). See the phase list in [CLAUDE.md](CLAUDE.md).
 
 ## Dashboard
 

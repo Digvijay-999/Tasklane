@@ -26,6 +26,8 @@ interface RepoManifest {
   skipReasons: [string, number][];
   included: IncludedFile[];
   skipped: SkippedFile[];
+  /** Secrets replaced before text went to a real provider; null with the offline stub. */
+  secretsReplaced: number | null;
 }
 
 const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
@@ -65,6 +67,7 @@ export function parseRepoManifest(text: string): RepoManifest {
       const v = obj(f);
       return { path: s(v.path), reason: s(v.reason) };
     }),
+    secretsReplaced: raw.secret_scrubbing ? n(obj(raw.secret_scrubbing).replaced) : null,
   };
 }
 
@@ -176,6 +179,12 @@ export function ManifestViewer({ artifact }: { artifact: Artifact }) {
           <dt>Indexed lines</dt>
           <dd className="num">{m.totals.included_lines.toLocaleString()}</dd>
         </div>
+        {m.secretsReplaced !== null && (
+          <div>
+            <dt>Secrets replaced before sending</dt>
+            <dd className="num">{m.secretsReplaced}</dd>
+          </div>
+        )}
       </dl>
 
       <div className="manifest-grid">

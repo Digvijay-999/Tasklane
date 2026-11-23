@@ -18,6 +18,7 @@ from app.api.schemas import (
     JobListResponse,
     JobResponse,
 )
+from app.domain.costs import CURRENCY
 from app.domain.enums import JobStatus, WorkflowType
 from app.domain.listing import JobListPosition
 from app.services.errors import ErrorCode, ServiceError
@@ -183,6 +184,16 @@ def _detail_response(request: Request, parsed_id: uuid.UUID) -> JobDetailRespons
             "retry_blocked_reason": detail.retry.reason,
             "upload": detail.upload,
             "attempts": detail.attempts,
+            "usage": [
+                {
+                    **vars(row),
+                    "estimated_cost": None
+                    if row.estimated_cost is None
+                    else str(row.estimated_cost),
+                    "estimated_cost_currency": None if row.estimated_cost is None else CURRENCY,
+                }
+                for row in detail.usage
+            ],
             "artifacts": [
                 {
                     "id": a.id,

@@ -29,12 +29,15 @@ dependencies = [
     # Exposes OpenTelemetry metric instruments in Prometheus text format (brings prometheus-client,
     # which also renders the database-derived metrics on GET /metrics). Beta numbering (0.x b).
     "opentelemetry-exporter-prometheus==0.66b2",
+    # HTTP client for the optional OpenAI-compatible provider (Phase 11): sync API, per-phase
+    # timeouts, no retries of its own. Already locked as a dev dependency (FastAPI's TestClient),
+    # so this adds no new package. Pre-1.0: stay on the 0.28 line.
+    "httpx>=0.28.1,<0.29",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.2.0,<10",
-    "httpx>=0.28.1,<0.29",   # used by FastAPI's TestClient
     "ruff>=0.17.3,<0.18",
 ]
 
@@ -45,6 +48,7 @@ addopts = ["--import-mode=importlib", "-p", "no:cacheprovider"]
 markers = [
     "integration: needs the real PostgreSQL and Redis containers from compose.yaml",
     "e2e: starts real worker and dispatcher processes (slower); skip with -m 'not e2e'",
+    "live: calls the real provider configured by PROVIDER_* (skipped unless PROVIDER_API_KEY is set)",
 ]
 
 [tool.ruff]

@@ -5,6 +5,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Annotated
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
@@ -28,6 +29,7 @@ from app.domain.uploads import (
     WORKFLOW_UPLOAD_KIND,
 )
 from app.domain.workflows import WORKFLOW_STAGES
+from app.providers.stub import STUB_MODEL, STUB_PROVIDER
 from app.services.health import DependencyCheck
 from app.services.overview import OverviewService
 
@@ -139,8 +141,21 @@ class WorkflowInfo(BaseModel):
     stages: list[StageInfo]
 
 
+class ProviderInfo(BaseModel):
+    name: str = Field(description="stub (offline, built in) or openai_compatible.")
+    model: str
+    remote: bool = Field(
+        description="True when document text is sent to this provider over the network."
+    )
+    host: str | None = Field(description="The provider's host name (remote providers only).")
+    estimated_cost: bool = Field(
+        description="True when token prices are configured, so jobs show an estimated cost."
+    )
+
+
 class MetaResponse(BaseModel):
     workflows: list[WorkflowInfo]
+    provider: ProviderInfo
     max_filename_length: int
     upload_ttl_hours: int
     fault_injection_enabled: bool
@@ -172,8 +187,16 @@ def meta(request: Request) -> MetaResponse:
                 stages=[StageInfo(name=n, weight=w) for n, w in WORKFLOW_STAGES[workflow_type]],
             )
         )
+    remote = settings.provider != STUB_PROVIDER
     return MetaResponse(
         workflows=workflows,
+        provider=ProviderInfo(
+            name=settings.provider,
+            model=settings.provider_model if remote else STUB_MODEL,
+            remote=remote,
+            host=urlsplit(settings.provider_base_url).hostname if remote else None,
+            estimated_cost=settings.provider_pricing is not None,
+        ),
         max_filename_length=MAX_FILENAME_LENGTH,
         upload_ttl_hours=settings.upload_ttl_hours,
         fault_injection_enabled=settings.enable_fault_injection,

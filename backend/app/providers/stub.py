@@ -30,6 +30,7 @@ _KEY_TERMS = 5
 class StubProvider:
     name = STUB_PROVIDER
     model = STUB_MODEL
+    remote = False  # nothing leaves the machine
 
     def __init__(self, delay_seconds: float = 0) -> None:
         # Simulated latency (development and tests only: STUB_DELAY_SECONDS), so a job runs long

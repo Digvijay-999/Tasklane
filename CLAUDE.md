@@ -593,6 +593,76 @@ Full reasoning (alternatives, plain language): `PHASE10_NOTES.md`; reference:
 - **Dashboard:** job detail "Trace id" with copy button and "Open trace" (http(s) only,
   `features/jobs/trace.ts`); Overview "Workers" fact and a notice when none is alive.
 
+## Decisions made (Phase 11)
+
+Full reasoning (alternatives, plain language): `PHASE11_NOTES.md`; operator guide:
+`docs/providers.md`.
+
+- **httpx 0.28.1** (already locked as a dev dependency) moved to runtime; no SDK (it retries by
+  itself and brings ~8 dependencies). `app/providers/openai_compatible.py`:
+  `POST {PROVIDER_BASE_URL}/chat/completions`, temperature 0 (constant), `max_tokens` =
+  `PROVIDER_MAX_OUTPUT_TOKENS` (1024), no tools/functions/response_format, `follow_redirects=False`,
+  1 MiB response cap. **Hard deadline**: the request runs on a daemon thread and the caller waits
+  at most `PROVIDER_TIMEOUT_SECONDS` (httpx timeouts are per operation; a trickling server is
+  tested). `SummaryResult.model` is the configured model (bounded metric labels).
+- **Settings:** `PROVIDER` (`stub` | `openai_compatible`), `PROVIDER_BASE_URL`, `PROVIDER_MODEL`
+  (both required for openai_compatible, every service), `PROVIDER_API_KEY` (SecretStr; Compose
+  passes it to the **worker only**; `Settings.provider_key_problem()` makes `worker_main` exit
+  with `tasklane worker cannot start: ...`), `PROVIDER_MAX_CALLS_PER_MINUTE`, prices
+  `PROVIDER_INPUT/OUTPUT_PRICE_PER_MILLION_TOKENS` (Decimal, both or neither;
+  `Settings.provider_pricing`). `create_provider(settings)`.
+- **Errors:** 408/timeouts → `provider_timeout`; connection errors/5xx → `provider_unavailable`;
+  429 → `provider_rate_limited` with `retry_after_seconds` (seconds or HTTP date, ≤ 1 day);
+  401/403 → `provider_auth`; other 4xx → `provider_rejected`; malformed/empty/oversized/1xx-3xx →
+  `provider_bad_response` (also undecodable bodies; the three new classes permanent, not input errors: manual retry
+  allowed). `JobError(retry_after_seconds=)` → `_Failure.retry_after` →
+  `RetryPolicy.delay_seconds(n, retry_after)` = max(backoff, min(hint, RETRY_MAX_SECONDS)).
+  A `JobError` raised inside `provider.summarize` (stage deadline during a pacing wait) is
+  re-raised without a `provider_calls` row. Provider error bodies are never read into messages or logs; logs get `status_code` and a
+  token-like `provider_error_code` only.
+- **Secret scrubbing:** `observability/redaction.scrub(text) -> (text, counts)` (same patterns as
+  log redaction, kinds `known_secret`, `private_key`, `url_credentials`, `authorization`,
+  `token`, `assignment`; never truncates). `SummaryCaller` scrubs every text when
+  `provider.remote` (new Provider attribute: stub False, openai True), counting chunks only,
+  before the cache check. `summary.json`/manifests: `secret_scrubbing {replaced, by_kind}` or
+  null (stub).
+- **Prompt structure:** fixed system message (never document text); user message = task + block
+  `<<<DATA <id>` ... `DATA <id>>>>`, id = 16 random hex per call (redrawn if in the text).
+- **Summary cache** (`workflows/common.py`): keyed by SHA-256 of the exact text sent (after
+  scrubbing) + configured provider/model + `cache_scope` (OpenAI-compatible: base URL + max output
+  tokens; also in the summarize fingerprint) + stage_version + max chars; chunk entries
+  `summaries/{chunk_id}.json`, **combine calls cached too** (`summaries/combine-<sha>.json`).
+  Entries store prompt/completion/total tokens. `SummaryCaller` no longer takes `chunk_sha256`.
+- **summarize stage_version 2** (both workflows): `summary.json` adds `prompt_tokens`,
+  `completion_tokens`, `secret_scrubbing`. Manifests: `usage {provider_calls, prompt_tokens,
+  completion_tokens, total_tokens, estimated_cost}`, `secret_scrubbing`; schema names stay `/1`.
+  `summary.md` gets `LLM_NOTICE` for non-stub providers; the PDF `summary.md` now fences every
+  summary (`fenced`/`visible` live in `workflows/pdf/report.py`), sections as `### Page N`.
+- **Cost** (`domain/costs.py`): `Pricing`, `estimate_cost` (Decimal, 6 places, USD),
+  `cost_record`. Manifest = calls behind the summary (cached included); job detail
+  `usage[]` (`db/repositories/provider_calls.usage_by_model`, `JobService(pricing=,
+  priced_model=)`) = all calls of all attempts per provider/model, priced only for the
+  configured (provider, model).
+- **Pacing, not a semaphore:** a worker process never has two calls in flight (prefork + sequential
+  map-reduce), so the setting is a rate: `CallPacer` per process; waits go through
+  `SummarizeOptions.sleep` = `SummaryCaller._sleep` (1 s slices, `keep_alive()`, stage deadline).
+- **Per-attempt artifact folders:** `JobWorkspace.artifact(name, attempt_no)` →
+  `artifacts/{job_id}/attempt-{n}/name` (a fenced attempt can't replace a registered file).
+- **API:** `GET /v1/meta` → `provider {name, model, remote, host, estimated_cost}`;
+  `GET /v1/jobs/{id}` → `usage[] {provider, model, calls, failed_calls, prompt_tokens,
+  completion_tokens, total_tokens, estimated_cost (decimal string), estimated_cost_currency}`.
+- **Dashboard:** New job `ProviderNotice` (remote: host, model, what is scrubbed, before upload;
+  stub: nothing leaves the machine); job detail "Summarization" table (`Usage`); repo manifest
+  viewer shows "Secrets replaced before sending".
+- **Logging:** worker registers the key literal; httpx/httpcore loggers at WARNING; worker logs
+  `document text is sent to a remote summarization provider` (provider, model, host) at ready.
+- **Tests:** `tests/fake_provider.py` (stdlib server: scripted status/body/headers/delay/trickle,
+  records requests); unit (`test_openai_provider.py`, `test_real_provider_stages.py`,
+  `test_provider_settings.py`), integration (`test_real_provider.py`), e2e
+  (`test_real_provider_e2e.py`: real worker + fake server; the key is searched in every table,
+  stored file, log, span and API response). `live` marker: `tests/live/test_live_provider.py`,
+  skipped without `PROVIDER_API_KEY` (`docker compose run --rm -e PROVIDER_API_KEY api pytest -m live`).
+
 ## Carry-forward requirements
 
 Items later phases must address. Remove an item only when it is implemented and tested.
@@ -603,37 +673,17 @@ Items later phases must address. Remove an item only when it is implemented and 
   worker), and keep provider timeouts at most half the lease. A checkpointed stage must list
   every file it writes in `output_paths` and every setting its output depends on in
   `fingerprint_params`, and bump `stage_version` when its output changes for the same input.
-- **Phase 11 — real providers:** raise `ProviderTimeout`/`ProviderUnavailable`/
-  `ProviderRateLimited` for transient failures; add permanent `provider_auth` and
-  `provider_rejected` classes. Per-chunk cache keys include provider and model, so switching
-  models re-summarizes.
 - **All later phases — e2e isolation:** keep e2e processes on the test `STORAGE_ROOT`; the
   isolation test (now for a PDF and a repo job) must keep passing.
-- **Phase 11 — fenced writes to files:** a fenced worker makes no more database writes, but it
-  can finish replacing a file under `work/` or `artifacts/` first (it notices within one
-  heartbeat interval, or at its next write; never while the database is unreachable). Harmless
-  while outputs are deterministic; a non-deterministic provider must write per-attempt files or
-  otherwise prevent two attempts writing the same path.
-- **Phase 11 — repository text sent to a real provider:** indexed files can contain secrets
-  (hidden files like `.env` are skipped, but a key in `config.py` is not). Add secret scanning or
-  redaction before repo text leaves the machine, delimit repo text *and file paths* as data in
-  the prompt, and test with prompt-injection content (`docs/security.md`, "Not covered").
 - **Phase 12 — repo work folders are large:** `work/{job_id}/files.bin` can approach
   `ZIP_MAX_TOTAL_BYTES` (500 MiB) per *succeeded* job (one upload can feed many jobs), plus
   `files.jsonl`; retention must clean them. Consider also capping extraction near the text the
   call limit allows (`calls × chunk_max_chars × 4` bytes) without misfiring on files the filter
   would skip (minified, binary).
-- **Phase 11 — summarize time vs call limit:** 1,000 calls at ~2 s each exceed the 900 s
-  summarize limit, and combine calls aren't cached across attempts. Revisit
-  `SUMMARIZE_TIMEOUT_SECONDS` / `REPO_MAX_PROVIDER_CALLS` and cache combines for a real provider.
 - **Phase 12 — huge central directories:** the ZIP child reads the whole central directory
   before checking `ZIP_MAX_ENTRIES` (a ZIP with millions of entries is stopped by the sandbox's
   memory/time limits as `zip_too_complex`, not `zip_too_many_files`). An end-of-central-directory
   pre-check would give the clearer error.
-- **Phase 11 — redaction with real keys:** the redaction layer masks env vars with sensitive
-  names and known key formats; a provider key read from somewhere else must be passed to
-  `register_secret`. Never auto-instrument the provider's HTTP client (request bodies hold
-  document text); set `usage.*` attributes on `provider.summarize` when the provider reports them.
 - **Phase 12 — uploads:** clean up interrupted uploads (`receiving` rows and their files), and make
   retention never delete files of uploads referenced by unfinished jobs.
 - **Phase 12 — work folders:** `work/{job_id}/` intermediate files are kept forever for now;
@@ -661,11 +711,23 @@ Items later phases must address. Remove an item only when it is implemented and 
   `worker_heartbeats` rows (one per worker process ever started) the same way. The scrape scans
   `job_attempts`, `job_events` and `provider_calls`: measure it with many jobs and add a partial
   index on `job_events(event_type)` if needed. Jobs created before Phase 10 have no trace.
-- **Phase 11 — real summaries in the UI:** an LLM summary is untrusted text like a PDF's; the
-  summary preview stays plain text. Show provider/model from `manifest.json` if useful.
 - **Phase 12 — e2e data:** Playwright e2e and screenshot runs create jobs in the development
   database (and the screenshot run kills the worker once). Consider a separate demo database or a
   cleanup step once retention exists.
+- **Phase 12 — artifact folders per attempt:** artifacts now live in
+  `artifacts/{job_id}/attempt-{n}/`; a failed `write_artifacts` attempt can leave files in its
+  folder. Retention must clean folders of attempts that registered no artifact rows (never for
+  unfinished jobs), and older jobs' `artifacts/{job_id}/` files (pre-Phase 11 layout).
+- **Phase 12 — summary cache files:** `work/{job_id}/summaries/` now also holds
+  `combine-<sha256>.json` files; retention cleans them with the rest of `work/`.
+- **All later phases — provider rules:** text sent to a remote provider goes through
+  `SummaryCaller` (scrubbing, cache, pacing, recording); never call a provider elsewhere. The
+  provider key stays in the worker container only; new code must never log provider error
+  bodies (they echo document text) or put the key anywhere but the Authorization header. New
+  tests use `tests/fake_provider.py`, never the network; a real call belongs in `tests/live`.
+- **Phase 12 — live provider measurements:** the 900 s summarize limit vs `REPO_MAX_PROVIDER_CALLS`
+  (1000) with pacing was documented, not measured; measure a large repository against a real
+  provider and revisit the defaults for `openai_compatible`.
 - **Dev note:** restarting the worker (including by live reload after a code change) interrupts
   running jobs; recovery retries them once their lease (60 s) expires.
 
@@ -675,6 +737,7 @@ Items later phases must address. Remove an item only when it is implemented and 
 docker compose up --build -d                 # start; rebuild after dependency, alembic.ini or Dockerfile changes
 docker compose run --rm api pytest           # all tests (unit + integration + e2e)
 docker compose run --rm api pytest -m "not e2e"   # skip the slower end-to-end tests
+docker compose run --rm -e PROVIDER_API_KEY api pytest -m live   # real provider smoke test (needs the key)
 docker compose logs -f worker dispatcher     # watch jobs being published and run
 docker compose run --rm api ruff check app tests migrations devtools
 docker compose run --rm api ruff format app tests migrations devtools
@@ -718,7 +781,7 @@ docker run --rm -v "${PWD}\backend:/src" -w /src python:3.13.18-slim sh -c "pip 
 | 8 | SSE with replay | **Done** (awaiting developer verification) |
 | 9 | Dashboard | **Done** (awaiting developer verification) |
 | 10 | Observability | **Done** (awaiting developer verification) |
-| 11 | Optional LLM provider | Not started |
+| 11 | Optional LLM provider | **Done** (awaiting developer verification) |
 | 12 | Hardening, docs, demo | Not started |
 
 Update the **Status** column when a phase is finished and verified. Notes on the scope of each

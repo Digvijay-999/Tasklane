@@ -47,10 +47,15 @@ class RetryPolicy:
     max_seconds: float = 300.0
     random: Callable[[], float] = _random.random
 
-    def delay_seconds(self, attempt_no: int) -> float:
-        return retry_delay_seconds(
+    def delay_seconds(self, attempt_no: int, retry_after: float | None = None) -> float:
+        """The backoff, or a provider's Retry-After hint when that is longer; never more than
+        max_seconds (a hint can't park a job for hours)."""
+        delay = retry_delay_seconds(
             attempt_no,
             base_seconds=self.base_seconds,
             max_seconds=self.max_seconds,
             random=self.random,
         )
+        if retry_after is not None and retry_after > delay:
+            delay = min(retry_after, self.max_seconds)
+        return delay

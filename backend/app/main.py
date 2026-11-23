@@ -56,7 +56,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ttl=timedelta(hours=settings.upload_ttl_hours),
         )
         app.state.job_service = JobService(
-            session_factory, fault_injection_enabled=settings.enable_fault_injection
+            session_factory,
+            fault_injection_enabled=settings.enable_fault_injection,
+            pricing=settings.provider_pricing,
+            priced_model=(settings.provider, settings.provider_model),
         )
         if settings.enable_fault_injection:
             logger.warning(

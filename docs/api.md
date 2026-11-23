@@ -328,6 +328,20 @@ Returns the [job object](#job-object) plus:
 - `can_retry` / `retry_blocked_reason`: whether `POST .../retry` would be accepted; when not,
   `not_failed`, `input_error` or `retry_limit_reached`. Both pairs are decided by the server's
   state machine, so clients never have to guess from the status.
+- `usage` (Phase 11): summarization calls per provider and model, over **all** attempts (failed
+  ones included: what was actually used), in the order first used:
+
+  ```json
+  [{"provider": "openai_compatible", "model": "llama-3.1-8b-instant", "calls": 12,
+    "failed_calls": 1, "prompt_tokens": 14400, "completion_tokens": 3600, "total_tokens": 18000,
+    "estimated_cost": "0.001008", "estimated_cost_currency": "USD"}]
+  ```
+
+  Tokens are sums of what the provider reported (`null` when it reported none, e.g. the stub;
+  never estimated). `estimated_cost` (a decimal string) is set only when
+  `PROVIDER_INPUT_PRICE_PER_MILLION_TOKENS` and `..._OUTPUT_...` are configured, the tokens are
+  known, and the row's provider and model are the configured ones. See
+  [providers.md](providers.md#usage-and-estimated-cost).
 
 An unknown id, or one that isn't a UUID, returns `404 job_not_found`.
 
@@ -408,10 +422,19 @@ each stage gets a fixed share of the progress bar.
 | `summarize` | 55 % | Summarizes each chunk, then combines the chunk summaries (map-reduce) |
 | `write_artifacts` | 5 % | Writes `summary.md` and `manifest.json` and records them as artifacts |
 
-**The summarizer is a stub.** With `PROVIDER=stub` (the only option until Phase 11) "summaries"
-are the first sentences of each chunk plus frequent key terms. It needs no API key and gives the
-same output for the same input every time. `summary.md` says so at the top. Every summarizer
-call is recorded (provider, model, duration, success, sizes) in the `provider_calls` table.
+**The summarizer is a stub by default.** With `PROVIDER=stub` "summaries" are the first
+sentences of each chunk plus frequent key terms. It needs no API key and gives the same output for
+the same input every time. `summary.md` says so at the top. With `PROVIDER=openai_compatible`
+(Phase 11, [providers.md](providers.md)) the chunks are sent, with secrets replaced, to an
+OpenAI-compatible API, and `summary.md` carries an "AI-generated, may be inaccurate" notice.
+Every summarizer call is recorded (provider, model, duration, success, sizes, reported tokens) in
+the `provider_calls` table. Artifacts are written to `artifacts/{job_id}/attempt-{n}/`.
+
+Both workflows' `manifest.json` include `usage` (`provider_calls`, `prompt_tokens`,
+`completion_tokens`, `total_tokens`: the calls behind this summary, cached ones included;
+`estimated_cost {amount, currency, input/output price per million tokens}` or `null`) and
+`secret_scrubbing` (`null` with the stub; otherwise `{replaced, by_kind}`: how many secrets were
+replaced before sending, never which).
 
 **Limits** (settings in `.env`):
 
@@ -477,7 +500,8 @@ about 60 more, see `backend/app/workflows/repo/filters.py`) plus the names `READ
   folders), `totals` (files, included, skipped, bytes, lines), `skip_reasons` (count per
   reason), `languages` (files, lines, bytes per language), `included` (path, language, bytes,
   lines, sha256 per file), `skipped` (path and reason per file), `chunking`, `summary`
-  (provider and model), `usage` (provider calls, tokens if reported), `limits` (every limit
+  (provider and model), `usage` (provider calls, tokens if reported, estimated cost),
+  `secret_scrubbing` (counts only), `limits` (every limit
   that applied), and `artifacts`. No timestamps: the same input gives the same bytes.
   ASCII-only JSON.
 
@@ -536,6 +560,9 @@ Permanent:
 | `input_unavailable` | the first two stages | The uploaded file is no longer available. Upload it again and create a new job. |
 | `injected_permanent` | `summarize` | Injected permanent failure (fault injection test). |
 | `fault_injection_disabled` | (before any stage) | The job asks for fault injection, but fault injection is disabled on the worker. |
+| `provider_auth` | `summarize` (real provider: HTTP 401/403) | The summarization provider rejected the API key (not valid, or not allowed to use this model). Check PROVIDER_API_KEY and PROVIDER_MODEL. |
+| `provider_rejected` | `summarize` (real provider: other HTTP 4xx) | The summarization provider rejected the request (for example an unknown model, or text it refuses or can't accept). |
+| `provider_bad_response` | `summarize` (real provider: not JSON, no text, empty, over 1 MiB) | The summarization provider returned an empty or malformed response. |
 | `internal_error` | any | An unexpected error occurred while running the job. (Details are only in the worker logs.) Any error that isn't classified ends up here: retrying an unknown bug would only repeat it. |
 
 Transient (retried):
@@ -543,7 +570,7 @@ Transient (retried):
 | `error_class` | When | `error_summary` |
 |---|---|---|
 | `stage_timeout` | `summarize` ran past `SUMMARIZE_TIMEOUT_SECONDS` | Processing took longer than the N-second limit for this step. |
-| `provider_timeout`, `provider_unavailable`, `provider_rate_limited` | The summarizer timed out, was down, or refused for rate limiting (real providers arrive in Phase 11) | The summarization provider did not respond in time. / ... is temporarily unavailable. / ... is limiting requests right now. |
+| `provider_timeout`, `provider_unavailable`, `provider_rate_limited` | The summarizer timed out (or HTTP 408), was unreachable or answered 5xx, or answered 429 (the retry then waits at least its `Retry-After`, at most `RETRY_MAX_SECONDS`) | The summarization provider did not respond in time. / ... is temporarily unavailable. / ... is limiting requests right now. |
 | `database_unavailable` | The database connection failed during a stage | The database was temporarily unavailable. |
 | `database_conflict` | A deadlock or serialization failure (Postgres `40P01`, `40001`) | A temporary database conflict interrupted the job. |
 | `storage_unavailable` | The disk was full, read-only, or failed (`ENOSPC`, `EIO`, ...), also while reading a ZIP | File storage was temporarily unavailable. |
@@ -816,9 +843,16 @@ The rules the dashboard must not hardcode, read from the running server's settin
   "upload_ttl_hours": 24,
   "fault_injection_enabled": false,
   "max_fault_failures": 20,
-  "trace_viewer_url": "http://127.0.0.1:16686/trace/{trace_id}"
+  "trace_viewer_url": "http://127.0.0.1:16686/trace/{trace_id}",
+  "provider": {"name": "openai_compatible", "model": "llama-3.1-8b-instant", "remote": true,
+               "host": "api.groq.com", "estimated_cost": true}
 }
 ```
+
+`provider` (Phase 11): which summarizer the server uses. `remote: true` means document text is
+sent to `host` (the dashboard says so on the New job page before upload); with the stub it is
+`{"name": "stub", "model": "stub-extractive-v1", "remote": false, "host": null, ...}`.
+`estimated_cost` says whether token prices are configured.
 
 `trace_viewer_url` (Phase 10) is `TRACE_VIEWER_URL`: a link template for a job's trace, or `null`
 when no trace viewer is configured. The dashboard's "Open trace" link replaces `{trace_id}`.

@@ -177,10 +177,33 @@ class LeaseResponse(BaseModel):
     )
 
 
+class UsageResponse(BaseModel):
+    """Summarization calls with one provider and model, over all of the job's attempts."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    provider: str
+    model: str
+    calls: int
+    failed_calls: int
+    prompt_tokens: int | None = Field(description="As reported by the provider; never estimated.")
+    completion_tokens: int | None
+    total_tokens: int | None
+    estimated_cost: str | None = Field(
+        description="Estimated cost in estimated_cost_currency, from the configured prices per "
+        "million tokens; null when no prices are configured, the provider reported no tokens, "
+        "or the calls used another model than the configured one."
+    )
+    estimated_cost_currency: str | None
+
+
 class JobDetailResponse(JobResponse):
     upload: JobUploadSummary
     attempts: list[AttemptResponse]
     artifacts: list[ArtifactResponse]
+    usage: list[UsageResponse] = Field(
+        description="Summarization calls and reported tokens per provider and model."
+    )
     lease: LeaseResponse | None
     can_cancel: bool = Field(description="POST .../cancel would change something.")
     cancel_blocked_reason: str | None = Field(

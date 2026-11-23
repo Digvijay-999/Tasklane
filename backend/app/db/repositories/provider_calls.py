@@ -1,8 +1,9 @@
 """Provider call records. Functions never commit; the caller owns the transaction."""
 
 import uuid
+from dataclasses import dataclass
 
-from sqlalchemy import insert
+from sqlalchemy import func, insert, select
 from sqlalchemy.orm import Session
 
 from app.db.models import ProviderCall
@@ -46,3 +47,36 @@ def insert_provider_call(
             total_tokens=total_tokens,
         )
     )
+
+
+@dataclass(frozen=True)
+class ModelUsage:
+    """One job's provider calls with one provider and model (all attempts)."""
+
+    provider: str
+    model: str
+    calls: int
+    failed_calls: int
+    prompt_tokens: int | None  # sums of what the provider reported; None if it reported none
+    completion_tokens: int | None
+    total_tokens: int | None
+
+
+def usage_by_model(session: Session, job_id: uuid.UUID) -> list[ModelUsage]:
+    """Calls and reported tokens per provider and model, in the order they were first used."""
+    calls = ProviderCall.__table__.c
+    rows = session.execute(
+        select(
+            calls.provider,
+            calls.model,
+            func.count(),
+            func.count().filter(calls.success.is_(False)),
+            func.sum(calls.prompt_tokens),
+            func.sum(calls.completion_tokens),
+            func.sum(calls.total_tokens),
+        )
+        .where(calls.job_id == job_id)
+        .group_by(calls.provider, calls.model)
+        .order_by(func.min(calls.id))
+    )
+    return [ModelUsage(*row) for row in rows]

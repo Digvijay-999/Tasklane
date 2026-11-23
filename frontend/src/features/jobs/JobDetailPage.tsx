@@ -5,7 +5,7 @@ import { SafeText } from '../../components/SafeText';
 import { StatusBadge } from '../../components/Status';
 import { ErrorNotice, ProgressBar, Skeleton, StaleNote } from '../../components/ui';
 import { ApiError, api } from '../../lib/api/client';
-import { isTerminal, type Artifact, type JobDetail, type JobEvent } from '../../lib/api/types';
+import { isTerminal, type Artifact, type JobDetail, type JobEvent, type ModelUsage } from '../../lib/api/types';
 import { durationBetween, formatBytes, formatDateTime, formatDuration, formatTime, percent } from '../../lib/format';
 import { useMeta, useNow, useWorkflowMeta } from '../../lib/hooks';
 import { OUTCOME_LABEL, STATUS_LABEL, TRIGGER_LABEL, WORKFLOW_LABEL } from '../../lib/labels';
@@ -200,6 +200,67 @@ function Outputs({ job }: { job: JobDetail }) {
         </div>
       )}
     </>
+  );
+}
+
+const tokens = (value: number | null) => (value === null ? '—' : value.toLocaleString());
+
+/** Provider calls, tokens and the estimated cost, per provider and model (all attempts). */
+export function Usage({ usage }: { usage: ModelUsage[] }) {
+  if (usage.length === 0) return <p className="muted">No summarization calls yet.</p>;
+  return (
+    <div className="table-scroll">
+      <table className="table table-compact">
+        <caption className="visually-hidden">Summarization usage</caption>
+        <thead>
+          <tr>
+            <th scope="col">Provider / model</th>
+            <th scope="col" className="num">
+              Calls
+            </th>
+            <th scope="col" className="num">
+              Prompt tokens
+            </th>
+            <th scope="col" className="num">
+              Completion tokens
+            </th>
+            <th scope="col" className="num">
+              Total tokens
+            </th>
+            <th scope="col" className="num">
+              Estimated cost
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {usage.map((row) => (
+            <tr key={`${row.provider}/${row.model}`}>
+              <td className="mono">
+                <SafeText text={`${row.provider} / ${row.model}`} />
+              </td>
+              <td className="num">
+                {row.calls}
+                {row.failed_calls > 0 && <span className="muted"> ({row.failed_calls} failed)</span>}
+              </td>
+              <td className="num">{tokens(row.prompt_tokens)}</td>
+              <td className="num">{tokens(row.completion_tokens)}</td>
+              <td className="num">{tokens(row.total_tokens)}</td>
+              <td className="num">
+                {row.estimated_cost === null ? (
+                  <span className="muted">—</span>
+                ) : (
+                  `${row.estimated_cost} ${row.estimated_cost_currency ?? ''}`.trim()
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="muted">
+        Tokens as reported by the provider, over every attempt (failed ones included). The estimated cost uses the prices configured
+        on the server and is shown only when they are set.
+      </p>
+    </div>
   );
 }
 
@@ -415,6 +476,11 @@ function JobDetailView({ jobId }: { jobId: string }) {
       <section className="section" aria-labelledby="attempts-heading">
         <h2 id="attempts-heading">Attempts</h2>
         <Attempts job={data} now={now} />
+      </section>
+
+      <section className="section" aria-labelledby="usage-heading">
+        <h2 id="usage-heading">Summarization</h2>
+        <Usage usage={data.usage} />
       </section>
 
       <section className="section" aria-labelledby="outputs-heading">

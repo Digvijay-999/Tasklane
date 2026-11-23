@@ -2,7 +2,11 @@
 
 Layout (relative to the storage root, all names generated, never user-supplied):
     work/{job_id}/...        intermediate files written by stages (validate.json, pages.jsonl, ...)
-    artifacts/{job_id}/...   final outputs offered for download (summary.md, manifest.json)
+    artifacts/{job_id}/attempt-{n}/...   final outputs offered for download (summary.md, ...)
+
+Artifacts go into a folder per attempt: a fenced-out older attempt that is still finishing a
+file write can never replace a file a newer attempt registered (its SHA-256 is in the database).
+This matters once a provider's output isn't deterministic (Phase 11).
 
 Every write is atomic: the data goes to a temporary file in the same folder, is flushed and
 fsynced, then renamed over the final name. Readers therefore see either the old file or the
@@ -30,8 +34,8 @@ class JobWorkspace:
     def work(self, name: str) -> str:
         return f"work/{self.job_id}/{name}"
 
-    def artifact(self, name: str) -> str:
-        return f"artifacts/{self.job_id}/{name}"
+    def artifact(self, name: str, attempt_no: int) -> str:
+        return f"artifacts/{self.job_id}/attempt-{attempt_no}/{name}"
 
     def absolute(self, relative: str) -> Path:
         return self.storage.absolute(relative)

@@ -98,10 +98,13 @@ def test_the_pipeline_produces_the_expected_files(pipeline):
         "summary.md",
         "manifest.json",
     }  # no leftover temporary files
-    # One cached summary per chunk (what a retry reuses instead of calling the provider again).
+    # One cached summary per chunk and per combine call (what a retry reuses instead of calling
+    # the provider again).
     chunk_ids = {c["chunk_id"] for c in workspace.iter_jsonl(workspace.work("chunks.jsonl"))}
     cached = {p.rsplit("/", 1)[-1] for p in files if "/summaries/" in p}
-    assert cached == {f"{chunk_id}.json" for chunk_id in chunk_ids}
+    combines = {name for name in cached if name.startswith("combine-")}
+    assert cached - combines == {f"{chunk_id}.json" for chunk_id in chunk_ids}
+    assert len(combines) == sum(1 for c in context.calls if c.purpose == "combine")
     assert [a.artifact_type for a in context.artifacts] == ["summary", "manifest"]
     assert context.calls and all(c.success and c.provider == "stub" for c in context.calls)
 

@@ -28,6 +28,7 @@ export const META: Meta = {
   fault_injection_enabled: false,
   max_fault_failures: 20,
   trace_viewer_url: null,
+  provider: { name: 'stub', model: 'stub-extractive-v1', remote: false, host: null, estimated_cost: false },
 };
 
 export function jobDetail(overrides: Partial<JobDetail> = {}): JobDetail {
@@ -61,6 +62,7 @@ export function jobDetail(overrides: Partial<JobDetail> = {}): JobDetail {
     cancel_blocked_reason: null,
     can_retry: false,
     retry_blocked_reason: 'not_failed',
+    usage: [],
     ...overrides,
   };
 }

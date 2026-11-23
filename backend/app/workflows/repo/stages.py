@@ -9,8 +9,8 @@ run twice (same input -> byte-identical output).
     filter_files      archive + extracted     -> files.jsonl, filter.json
     chunk_sources     files.jsonl             -> chunks.jsonl
     summarize         chunks.jsonl            -> summary.json   (provider calls recorded)
-    write_artifacts   all of the above        -> artifacts/{job_id}/summary.md, chunks.jsonl,
-                                                 manifest.json
+    write_artifacts   all of the above        -> artifacts/{job_id}/attempt-{n}/: summary.md,
+                                                 chunks.jsonl, manifest.json
 
 Names from inside the archive are DATA: they are never used to build a filesystem path. The
 extracted bytes of all files live in ONE file, files.bin, at offsets recorded in extract.json.
@@ -24,6 +24,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
+from app.domain.costs import Pricing
 from app.domain.enums import ArtifactType
 from app.domain.errors import JobError
 from app.providers.base import Provider
@@ -72,6 +73,7 @@ class RepoConfig:
     chunking: ChunkingSettings
     summary: SummarySettings
     max_provider_calls: int
+    pricing: Pricing | None = None  # for the manifest's estimated cost (only when configured)
 
     @property
     def rules(self) -> FilterRules:
@@ -380,7 +382,8 @@ def planned_calls(chunks_per_file: list[int], settings: SummarySettings) -> int:
 class SummarizeStage:
     name = "summarize"
     weight = 65
-    stage_version = 1
+    # 2 (Phase 11): summary.json also holds prompt/completion tokens and secret-scrubbing counts.
+    stage_version = 2
 
     def __init__(self, config: RepoConfig, provider: Provider) -> None:
         self.config = config
@@ -395,6 +398,7 @@ class SummarizeStage:
         return {
             "provider": self.provider.name,
             "model": self.provider.model,
+            "cache_scope": getattr(self.provider, "cache_scope", None),
             "chunk_max_chars": settings.chunk_max_chars,
             "final_max_chars": settings.final_max_chars,
             "combine_max_input_chars": settings.combine_max_input_chars,
@@ -414,7 +418,6 @@ class SummarizeStage:
             context,
             self.provider,
             stage_version=self.stage_version,
-            chunk_sha256={c["chunk_id"]: c["sha256"] for c in chunks},
             expected_calls=planned,
             stage_timeout_seconds=self.config.summarize_timeout_seconds,
             provider_timeout_seconds=self.config.provider_timeout_seconds,
@@ -448,7 +451,7 @@ class SummarizeStage:
                 "provider": self.provider.name,
                 "model": self.provider.model,
                 "calls": caller.done,
-                "total_tokens": caller.total_tokens,
+                **caller.usage_record(),
             },
         )
         caller.log_reuse()
@@ -480,7 +483,7 @@ class WriteArtifactsStage:
             for c in workspace.iter_jsonl(workspace.work(CHUNKS_FILE))
         ]
 
-        summary_path = workspace.artifact(SUMMARY_ARTIFACT)
+        summary_path = workspace.artifact(SUMMARY_ARTIFACT, job.attempt_no)
         workspace.write_text(
             summary_path,
             build_summary_markdown(
@@ -499,7 +502,7 @@ class WriteArtifactsStage:
                 "text/markdown; charset=utf-8",
             )
         ]
-        chunks_path = workspace.artifact(CHUNKS_ARTIFACT)
+        chunks_path = workspace.artifact(CHUNKS_ARTIFACT, job.attempt_no)
         workspace.write_jsonl(chunks_path, chunks, ensure_ascii=True)
         written.append(
             register_artifact(
@@ -508,7 +511,7 @@ class WriteArtifactsStage:
         )
 
         settings = self.config.chunking
-        manifest_path = workspace.artifact(MANIFEST_ARTIFACT)
+        manifest_path = workspace.artifact(MANIFEST_ARTIFACT, job.attempt_no)
         workspace.write_json(
             manifest_path,
             build_manifest(
@@ -531,6 +534,7 @@ class WriteArtifactsStage:
                     "chunks": len(chunks),
                 },
                 summary=summary,
+                pricing=self.config.pricing,
                 limits={
                     **self.config.zip.to_record(),
                     "excluded_dirs": sorted(self.config.excluded_dirs),

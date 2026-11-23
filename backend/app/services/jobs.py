@@ -21,6 +21,7 @@ import uuid
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from opentelemetry.trace import Span
@@ -29,8 +30,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.models import Artifact, Job, JobAttempt, Upload
 from app.db.repositories import jobs as job_rows
+from app.db.repositories import provider_calls as provider_call_rows
 from app.db.repositories import uploads as upload_rows
 from app.db.repositories.outbox import delete_pending, enqueue_run_job
+from app.domain.costs import Pricing, estimate_cost
 from app.domain.enums import EventType, JobStatus, UploadStatus, WorkflowType
 from app.domain.idempotency import KEY_FORMAT_DESCRIPTION, is_valid_key, request_hash
 from app.domain.listing import JobListPosition
@@ -88,18 +91,43 @@ class JobDetail:
     database_now: datetime  # the database clock when this was read (lease expiry is judged by it)
     cancel: CancelDecision
     retry: ManualRetryDecision
+    usage: list["UsageRow"]
 
     @property
     def open_attempt(self) -> JobAttempt | None:
         return next((a for a in self.attempts if a.ended_at is None), None)
 
 
+@dataclass(frozen=True)
+class UsageRow:
+    """Summarization calls of one job with one provider and model, over all its attempts (what
+    was actually used, failed attempts included), with an estimated cost when possible."""
+
+    provider: str
+    model: str
+    calls: int
+    failed_calls: int
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    estimated_cost: Decimal | None  # only for the configured provider and model, with prices
+
+
 class JobService:
     def __init__(
-        self, session_factory: sessionmaker[Session], *, fault_injection_enabled: bool = False
+        self,
+        session_factory: sessionmaker[Session],
+        *,
+        fault_injection_enabled: bool = False,
+        pricing: Pricing | None = None,
+        priced_model: tuple[str, str | None] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.fault_injection_enabled = fault_injection_enabled
+        # The configured prices apply only to the configured (provider, model): calls made with
+        # another model (settings changed since) get no estimate rather than a wrong one.
+        self.pricing = pricing
+        self.priced_model = priced_model
 
     # --- Create ----------------------------------------------------------------------------------
 
@@ -199,6 +227,7 @@ class JobService:
     def detail(self, job_id: uuid.UUID) -> JobDetail:
         with self.session_factory() as session:
             found = job_rows.get_job_detail(session, job_id)
+            usage = provider_call_rows.usage_by_model(session, job_id) if found else []
             database_now = session.execute(select(func.now())).scalar_one()
         if found is None:
             raise ServiceError(ErrorCode.JOB_NOT_FOUND, "No job exists with this id.")
@@ -211,6 +240,24 @@ class JobService:
             database_now=database_now,
             cancel=cancel_decision(JobStatus(job.status)),
             retry=can_manual_retry(JobStatus(job.status), job.error_class, job.attempt_count),
+            usage=[self._usage_row(row) for row in usage],
+        )
+
+    def _usage_row(self, row: provider_call_rows.ModelUsage) -> UsageRow:
+        def number(value: object) -> int | None:
+            return None if value is None else int(value)  # SUM may come back as Decimal
+
+        prompt, completion = number(row.prompt_tokens), number(row.completion_tokens)
+        priced = self.priced_model == (row.provider, row.model)
+        return UsageRow(
+            provider=row.provider,
+            model=row.model,
+            calls=row.calls,
+            failed_calls=row.failed_calls,
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=number(row.total_tokens),
+            estimated_cost=estimate_cost(self.pricing, prompt, completion) if priced else None,
         )
 
     # --- Cancel and manual retry ------------------------------------------------------------------

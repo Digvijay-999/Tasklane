@@ -5,12 +5,15 @@ variable of the same name (case-insensitive), converted to the declared type, an
 to start with a clear error if a required value is missing or invalid.
 """
 
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.domain.costs import Pricing
 
 
 class Settings(BaseSettings):
@@ -90,8 +93,21 @@ class Settings(BaseSettings):
     chunk_target_chars: int = Field(default=4000, ge=200)
     chunk_max_chars: int = Field(default=6000, ge=200)
     chunk_overlap_chars: int = Field(default=400, ge=0)
-    # Summarization.
-    provider: Literal["stub"] = "stub"
+    # Summarization. "stub" (default) never leaves the machine; "openai_compatible" sends
+    # document text to the chat-completions API at PROVIDER_BASE_URL (Phase 11, docs/providers.md).
+    provider: Literal["stub", "openai_compatible"] = "stub"
+    provider_base_url: str | None = None  # e.g. https://api.groq.com/openai/v1
+    provider_model: str | None = Field(default=None, max_length=200)
+    # Only the worker container receives the key (compose.yaml); the API and dispatcher never
+    # need it. SecretStr prints as '**********'.
+    provider_api_key: SecretStr | None = None
+    provider_max_output_tokens: int = Field(default=1024, ge=16, le=32_768)
+    # Pacing per worker process (each one makes one call at a time): at most this many calls a
+    # minute. Unset = no pacing. Total rate = this x WORKER_CONCURRENCY x worker containers.
+    provider_max_calls_per_minute: int | None = Field(default=None, ge=1, le=10_000)
+    # Prices per million tokens (in USD) for the "estimated cost". Unset = no estimate shown.
+    provider_input_price_per_million_tokens: Decimal | None = Field(default=None, ge=0)
+    provider_output_price_per_million_tokens: Decimal | None = Field(default=None, ge=0)
     provider_timeout_seconds: float = Field(default=20, gt=0, le=600)
     summarize_timeout_seconds: float = Field(default=900, gt=0, le=7200)
     summary_chunk_max_chars: int = Field(default=600, ge=100)
@@ -175,6 +191,52 @@ class Settings(BaseSettings):
         if self.trace_viewer_url is not None and "{trace_id}" not in self.trace_viewer_url:
             raise ValueError("TRACE_VIEWER_URL must contain {trace_id}")
         return self
+
+    @model_validator(mode="after")
+    def _provider_settings(self) -> "Settings":
+        if self.provider == "openai_compatible":
+            if not self.provider_base_url or not self.provider_base_url.startswith(
+                ("http://", "https://")
+            ):
+                raise ValueError(
+                    "PROVIDER=openai_compatible needs PROVIDER_BASE_URL (http:// or https://), "
+                    "e.g. https://api.groq.com/openai/v1"
+                )
+            if not self.provider_model:
+                raise ValueError("PROVIDER=openai_compatible needs PROVIDER_MODEL")
+        prices = (
+            self.provider_input_price_per_million_tokens,
+            self.provider_output_price_per_million_tokens,
+        )
+        if (prices[0] is None) != (prices[1] is None):
+            raise ValueError(
+                "Set both PROVIDER_INPUT_PRICE_PER_MILLION_TOKENS and "
+                "PROVIDER_OUTPUT_PRICE_PER_MILLION_TOKENS, or neither"
+            )
+        return self
+
+    def provider_key_problem(self) -> str | None:
+        """Checked at worker startup only: the worker is the one process that holds the key."""
+        if self.provider == "openai_compatible" and not (
+            self.provider_api_key and self.provider_api_key.get_secret_value().strip()
+        ):
+            return (
+                "PROVIDER=openai_compatible needs PROVIDER_API_KEY in the worker's environment "
+                "(set it in your shell, e.g. $env:PROVIDER_API_KEY, never in a committed file)"
+            )
+        return None
+
+    @property
+    def provider_pricing(self) -> Pricing | None:
+        if (
+            self.provider_input_price_per_million_tokens is None
+            or self.provider_output_price_per_million_tokens is None
+        ):
+            return None
+        return Pricing(
+            input_per_million=self.provider_input_price_per_million_tokens,
+            output_per_million=self.provider_output_price_per_million_tokens,
+        )
 
     @property
     def worker_presence_stale_seconds(self) -> float:

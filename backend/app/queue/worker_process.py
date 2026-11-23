@@ -165,6 +165,7 @@ def workflow_config(settings: Settings) -> WorkflowConfig:
             keep_alive_interval_seconds=FENCE_CHECK_SECONDS,
             chunking=chunking,
             summary=summary,
+            pricing=settings.provider_pricing,
         ),
         repo=RepoConfig(
             zip=ZipLimits(
@@ -186,6 +187,7 @@ def workflow_config(settings: Settings) -> WorkflowConfig:
             chunking=chunking,
             summary=summary,
             max_provider_calls=settings.repo_max_provider_calls,
+            pricing=settings.provider_pricing,
         ),
-        provider=create_provider(settings.provider, stub_delay_seconds=settings.stub_delay_seconds),
+        provider=create_provider(settings),
     )

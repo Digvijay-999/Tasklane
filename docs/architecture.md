@@ -261,7 +261,8 @@ Locked in Phase 1 (checked against PyPI and Docker Hub on 2026-11-02):
 | Celery | 5.6.3 (kombu 5.6.2, billiard 4.3.2) | Added in Phase 4; kombu held `<5.7` |
 | PostgreSQL | 17.11 (`postgres:17.11-alpine`) | |
 | Redis server | 7.4.12 (`redis:7.4.12-alpine`) | |
-| pytest / httpx / ruff | 9.2.0 / 0.28.1 / 0.17.3 | Development only |
+| pytest / ruff | 9.2.0 / 0.17.3 | Development only |
+| httpx | 0.28.1 | Runtime since Phase 11 (the OpenAI-compatible provider; checked against PyPI on 2026-11-23); also FastAPI's TestClient |
 | Alembic | 1.20.1 | Added in Phase 2 (checked against PyPI on 2026-11-02) |
 | OpenTelemetry API / SDK / OTLP-HTTP exporter | 1.45.2 | Added in Phase 10 (checked against PyPI on 2026-11-17); no instrumentation packages |
 | opentelemetry-exporter-prometheus | 0.66b2 (prometheus-client 0.26.0) | Added in Phase 10 |
@@ -303,7 +304,7 @@ specific tags.
 | 8 | SSE with replay | Done: one loop for replay and live (`Last-Event-ID` or `?after=`), `stream.end`, keepalives, stream limit and lifetime, write timeout, paginated event history, `devtools.sse_client`; see `PHASE8_NOTES.md` |
 | 9 | Dashboard | Done: Overview, New job (XHR upload progress, limits from `GET /v1/meta`, idempotent retry), Jobs (URL filters, cursor paging), Job detail (live attempt × stage timeline, event history, attempts, artifacts, manifest viewer, server-driven Cancel/Retry); `GET /v1/overview`; Vite dev proxy; CSP; Playwright e2e and screenshots; see `DESIGN.md`, `PHASE9_NOTES.md` |
 | 10 | Observability | Done: one trace per job carried through `jobs.traceparent`, `outbox.traceparent` and a Celery header; spans for requests, dispatch, attempts, stages, provider calls, recovery, SSE streams and SQL; `GET /metrics` computed from the database (plus API-local stream metrics); `worker_heartbeats` presence table; trace ids and redaction in JSON logs; optional Jaeger + Prometheus profile; see [observability.md](observability.md), `PHASE10_NOTES.md` |
-| 11 | Optional LLM provider | OpenAI-compatible adapter behind config; timeouts; usage recording |
+| 11 | Optional LLM provider | Done: OpenAI-compatible adapter (httpx, hard per-call deadline, error classes incl. `provider_auth`/`provider_rejected`/`provider_bad_response`, `Retry-After`), key in the worker container only, secret scrubbing before sending, delimited data blocks against prompt injection, usage + estimated cost from configured prices, pacing, combine-summary cache, per-attempt artifact folders, provider notice on New job, usage table on job detail; see [providers.md](providers.md), `PHASE11_NOTES.md` |
 | 12 | Hardening, docs, demo | E2E tests, retention/cleanup command, measured timings, failure demo |
 
 ## 9. Decisions

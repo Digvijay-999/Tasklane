@@ -13,6 +13,9 @@ through `redact()`. It masks, in this order:
 6. the literal values of secrets registered at startup: the database password and every
    environment variable whose *name* looks sensitive (see register_environment_secrets).
 
+`scrub()` applies the same patterns to text that is about to be sent to a real summarization
+provider (Phase 11), without truncating, and counts what it replaced per kind.
+
 `redact_value()` also masks a whole value when its *key* looks sensitive (an `extra=` field
 called `api_key`), whatever the value looks like.
 
@@ -53,8 +56,9 @@ MAX_REDACT_CHARS = 64 * 1024
 # possessive quantifiers (`*+`, `++`, `{n,}+`) never give characters back, and the lookbehinds
 # let a match start only at the beginning of a run of name characters, not inside it. A test
 # times redaction on a hostile input.
-_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     (
+        "private_key",
         re.compile(
             r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----"
             r".*?(?:-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----|$)",
@@ -65,11 +69,17 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # scheme://userinfo@host: the whole userinfo goes (user names are often secrets too, e.g.
     # https://<token>@github.com).
     (
+        "url_credentials",
         re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z][a-z0-9+.\-]*+://)[^\s/@\"']++@"),
         rf"\1{REDACTED}@",
     ),
-    (re.compile(r"(?i)\b(bearer|basic)\s++[A-Za-z0-9._~+/=\-]{6,}+"), rf"\1 {REDACTED}"),
     (
+        "authorization",
+        re.compile(r"(?i)\b(bearer|basic)\s++[A-Za-z0-9._~+/=\-]{6,}+"),
+        rf"\1 {REDACTED}",
+    ),
+    (
+        "token",
         re.compile(
             r"\b(?:sk-[A-Za-z0-9_\-]{16,}+"
             r"|AKIA[0-9A-Z]{16}"
@@ -143,9 +153,41 @@ def redact(text: str) -> str:
     pattern = _literal_pattern
     if pattern is not None:
         text = pattern.sub(REDACTED, text)
-    for regex, replacement in _PATTERNS:
+    for _, regex, replacement in _PATTERNS:
         text = regex.sub(replacement, text)
     return _NAME_VALUE.sub(_mask_value, text)
+
+
+def scrub(text: str) -> tuple[str, dict[str, int]]:
+    """Replace secrets in text that is about to leave the machine (sent to a real provider):
+    the same patterns as redact(), and registered literal secrets, but never truncated, and with
+    a count per kind so a manifest can say how many were replaced (never what). Kinds:
+    known_secret, private_key, url_credentials, authorization, token, assignment (a sensitive
+    name = value, which covers .env-style lines like DB_PASSWORD=...)."""
+    counts: dict[str, int] = {}
+
+    def count(kind: str, n: int) -> None:
+        if n:
+            counts[kind] = counts.get(kind, 0) + n
+
+    pattern = _literal_pattern
+    if pattern is not None:
+        text, n = pattern.subn(REDACTED, text)
+        count("known_secret", n)
+    for kind, regex, replacement in _PATTERNS:
+        text, n = regex.subn(replacement, text)
+        count(kind, n)
+    masked = 0
+
+    def mask_and_count(match: re.Match[str]) -> str:
+        nonlocal masked
+        result = _mask_value(match)
+        masked += result != match.group(0)
+        return result
+
+    text = _NAME_VALUE.sub(mask_and_count, text)
+    count("assignment", masked)
+    return text, counts
 
 
 def redact_value(value: object, key: str | None = None) -> object:
