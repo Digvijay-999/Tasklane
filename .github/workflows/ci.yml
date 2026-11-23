@@ -44,13 +44,16 @@ jobs:
       POSTGRES_HOST: localhost
       POSTGRES_PORT: "5432"
       REDIS_URL: redis://localhost:6379/0
-      STORAGE_ROOT: ${{ runner.temp }}/storage
-      UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/venv
     defaults:
       run:
         working-directory: backend
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The `runner` context isn't allowed in job-level `env`, so set these paths from a step.
+      - name: Storage and virtualenv under the runner's temp folder
+        run: |
+          echo "STORAGE_ROOT=$RUNNER_TEMP/storage" >> "$GITHUB_ENV"
+          echo "UV_PROJECT_ENVIRONMENT=$RUNNER_TEMP/venv" >> "$GITHUB_ENV"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13.18"
